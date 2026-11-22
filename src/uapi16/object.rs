@@ -666,10 +666,10 @@ impl FlagSet for InodeFlags {
 flag_set!(InodeFlags);
 
 /// What an object says about the flags of one kind, [`DosFlags`] or
-/// [`InodeFlags`]: which of them it states, and which of those are set.
-/// Nothing is known about the others. The objects give one getter and one
-/// setter for each flag, which go through [`FlagStates::get`] and
-/// [`FlagStates::put`].
+/// [`InodeFlags`]: which of them it states, which of those are set, and
+/// which a reader filled in. Nothing is known about the others. The
+/// objects give one getter and one setter for each flag, which go through
+/// [`FlagStates::get`] and [`FlagStates::put`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct FlagStates<F> {
     /// The flags the object states.
@@ -677,6 +677,9 @@ pub(crate) struct FlagStates<F> {
     /// Of those, the flags that are set. [`FlagStates::put`] keeps them
     /// among those it states.
     pub(crate) set: F,
+    /// Of those stated, the flags a reader filled in, see [`FilledIn`].
+    /// They are cleared, and the record of the object does not have them.
+    pub(crate) filled: F,
 }
 
 impl<F: FlagSet> FlagStates<F> {
@@ -685,10 +688,12 @@ impl<F: FlagSet> FlagStates<F> {
         ((self.stated & flag) == flag).then_some((self.set & flag) == flag)
     }
 
-    /// States `flag` as set or cleared, or as not known.
+    /// States `flag` as set or cleared, or as not known. A flag a reader
+    /// filled in is one the object states from then on.
     pub(crate) fn put(&mut self, flag: F, state: Option<bool>) {
         self.stated = self.stated & !flag;
         self.set = self.set & !flag;
+        self.filled = self.filled & !flag;
         if let Some(set) = state {
             self.stated = self.stated | flag;
             if set {
@@ -697,21 +702,28 @@ impl<F: FlagSet> FlagStates<F> {
         }
     }
 
-    /// The fields of the flags the object states, each with the feature
-    /// that records it.
+    /// The flags the record of the object gives: those it states but a
+    /// reader did not fill in.
+    fn given(&self) -> F {
+        self.stated & !self.filled
+    }
+
+    /// The fields of the flags the record of the object gives, each with
+    /// the feature that records it.
     pub(crate) fn feature_fields(&self) -> impl Iterator<Item = (Field, Features)> + '_ {
+        let given = self.given();
         F::FIELDS
             .iter()
-            .filter(move |(flag, _, _)| (self.stated & *flag) == *flag)
+            .filter(move |(flag, _, _)| (given & *flag) == *flag)
             .map(|&(_, field, feature)| (field, feature))
     }
 
-    /// The field of the first flag stated that an object of the type
-    /// `inode_type` cannot have. The flags stated are held against those
+    /// The field of the first flag the record gives that an object of the
+    /// type `inode_type` cannot have. The flags given are held against those
     /// the type permits all at once, and the fields are only looked through
     /// to name the first flag that is not permitted.
     pub(crate) fn unpermitted_field(&self, inode_type: InodeType) -> Option<Field> {
-        let unpermitted = self.stated & !F::permitted(inode_type);
+        let unpermitted = self.given() & !F::permitted(inode_type);
         if unpermitted == F::default() {
             return None;
         }
@@ -723,20 +735,36 @@ impl<F: FlagSet> FlagStates<F> {
 
     /// Fills in what `features`, which a manifest records, say about the
     /// flags an object of the type `inode_type` does not state: a flag the
-    /// manifest records is cleared.
+    /// manifest records is cleared, and noted as filled in.
     pub(crate) fn fill_in(&mut self, features: Features, inode_type: InodeType) {
-        self.stated = self.stated | (F::recorded_by(features) & F::permitted(inode_type));
+        let filled = F::recorded_by(features) & F::permitted(inode_type) & !self.stated;
+        self.stated = self.stated | filled;
+        self.filled = self.filled | filled;
+    }
+
+    /// The fields of the flags a reader filled in.
+    pub(crate) fn filled_in(&self) -> FilledIn {
+        F::FIELDS
+            .iter()
+            .filter(|&&(flag, _, _)| (self.filled & flag) == flag)
+            .fold(FilledIn::default(), |mut filled_in, &(_, field, _)| {
+                filled_in.insert(field);
+                filled_in
+            })
     }
 }
 
 /// The fields of an object of a manifest that a reader filled in, which
 /// the record of the object does not have: the sizes and hashes that
-/// follow from other fields, and `readOnly`, which is false where the
-/// manifest lists `read-only`. A writer leaves them out, and the checks of
-/// an object take a filled-in `readOnly` for one that is not there.
+/// follow from other fields, `readOnly` and the flags, which are false
+/// where the manifest records their features, and `extendedAttributes`,
+/// which lists none where the manifest records `user-xattr`. A writer
+/// leaves them out, and the checks of an object take a filled-in
+/// `readOnly`, flag or `extendedAttributes` for one that is not there.
 ///
-/// The `size` and the `sha256` of a [`FileObject`], the sizes and hashes
-/// of a [`ContentsObject`] and the `readOnly` of [`InodeAttributes`] can be
+/// The `size`, the `sha256` and the DOS attributes of a [`FileObject`],
+/// the sizes and hashes of a [`ContentsObject`] and the `readOnly`, the
+/// inode flags and the `extendedAttributes` of [`InodeAttributes`] can be
 /// filled in. [`FileObject::filled_in()`], [`ContentsObject::filled_in()`]
 /// and [`InodeAttributes::filled_in()`] say which were.
 ///
@@ -747,11 +775,11 @@ impl<F: FlagSet> FlagStates<F> {
 /// the hashes, the encoding and the source of a contents object. The next
 /// reader of the manifest fills them in again.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct FilledIn(u8);
+pub struct FilledIn(u16);
 
 impl FilledIn {
     /// The fields that can be filled in, in the order of their bits.
-    const FIELDS: [Field; 7] = [
+    const FIELDS: [Field; 16] = [
         Field::Size,
         Field::Sha256,
         Field::EncodedSize,
@@ -759,10 +787,19 @@ impl FilledIn {
         Field::OriginalSize,
         Field::OriginalSha256,
         Field::ReadOnly,
+        Field::ExtendedAttributes,
+        Field::FlagAppendOnly,
+        Field::FlagArchive,
+        Field::FlagHidden,
+        Field::FlagImmutable,
+        Field::FlagNoAtime,
+        Field::FlagNoCow,
+        Field::FlagNoDump,
+        Field::FlagSystem,
     ];
 
     /// The bit of `field`, none for one that cannot be filled in.
-    fn bit(field: Field) -> u8 {
+    fn bit(field: Field) -> u16 {
         FilledIn::FIELDS
             .iter()
             .position(|&fillable| fillable == field)
@@ -1199,7 +1236,8 @@ pub struct InodeAttributes {
     /// `flagAppendOnly` and the other fields of the inode flags: the
     /// flags the object states.
     pub(crate) flags: FlagStates<InodeFlags>,
-    /// `readOnly`, if a reader filled it in.
+    /// `readOnly` and `extendedAttributes`, where a reader filled them in.
+    /// `flags` notes the inode flags a reader filled in.
     pub(crate) filled_in: FilledIn,
 }
 
@@ -1222,7 +1260,7 @@ impl InodeAttributes {
     /// [`InodeAttributes::FEATURE_FIELDS`].
     fn has_feature_field(&self, field: Field) -> bool {
         match field {
-            Field::ExtendedAttributes => self.user_xattrs.is_some(),
+            Field::ExtendedAttributes => self.user_xattrs.is_some() && !self.filled_in.contains(field),
             Field::Gid => self.gid.is_some(),
             Field::GroupName => self.group_name.is_some(),
             Field::MTimeNSec => self.mtime_nsec.is_some(),
@@ -1252,8 +1290,8 @@ impl InodeAttributes {
     /// Fills in what `features`, which the manifest records, say about the
     /// attributes a file of the type `inode_type` does not have: an inode
     /// flag the manifest records is cleared, the file is not read-only if
-    /// the manifest records `readOnly`, which is noted in `filled_in`, and
-    /// it has no extended attributes if the manifest records them.
+    /// the manifest records `readOnly`, and it has no extended attributes
+    /// if the manifest records them. Each is noted as filled in.
     fn fill_in(&mut self, features: Features, inode_type: InodeType) {
         self.flags.fill_in(features, inode_type);
         if features.contains(Features::READ_ONLY) && self.read_only.is_none() {
@@ -1262,6 +1300,7 @@ impl InodeAttributes {
         }
         if features.contains(Features::USER_XATTR) && self.user_xattrs.is_none() {
             self.user_xattrs = Some(Box::default());
+            self.filled_in.insert(Field::ExtendedAttributes);
         }
     }
 
@@ -1345,6 +1384,7 @@ impl InodeAttributes {
 
     /// Sets `extendedAttributes`, see [`InodeAttributes::user_xattrs`].
     pub fn set_user_xattrs(&mut self, xattrs: Option<BTreeMap<String, Vec<u8>>>) {
+        self.filled_in.remove(Field::ExtendedAttributes);
         self.user_xattrs = xattrs.map(Box::new);
     }
 
@@ -1361,9 +1401,10 @@ impl InodeAttributes {
         self.read_only = read_only;
     }
 
-    /// `readOnly`, if a reader filled it in, see [`FilledIn`].
+    /// `readOnly`, the inode flags and `extendedAttributes`, where a reader
+    /// filled them in, see [`FilledIn`].
     pub fn filled_in(&self) -> FilledIn {
-        self.filled_in
+        self.filled_in.union(self.flags.filled_in())
     }
 
     /// The modification time, if the attributes have one.
@@ -1408,6 +1449,9 @@ impl InodeAttributes {
 
     /// Sets `flagAppendOnly`: the inode flag `FS_APPEND_FL` is set, cleared, or
     /// not known.
+    /// `Some(false)` needs a manifest that records `flag-append-only` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_append_only(&mut self, append_only: Option<bool>) {
         self.flags.put(InodeFlags::APPEND_ONLY, append_only);
     }
@@ -1420,6 +1464,9 @@ impl InodeAttributes {
 
     /// Sets `flagImmutable`: the inode flag `FS_IMMUTABLE_FL` is set, cleared,
     /// or not known.
+    /// `Some(false)` needs a manifest that records `flag-immutable` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_immutable(&mut self, immutable: Option<bool>) {
         self.flags.put(InodeFlags::IMMUTABLE, immutable);
     }
@@ -1432,6 +1479,9 @@ impl InodeAttributes {
 
     /// Sets `flagNoAtime`: the inode flag `FS_NOATIME_FL` is set, cleared, or
     /// not known.
+    /// `Some(false)` needs a manifest that records `flag-no-atime` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_no_atime(&mut self, no_atime: Option<bool>) {
         self.flags.put(InodeFlags::NO_ATIME, no_atime);
     }
@@ -1444,6 +1494,9 @@ impl InodeAttributes {
 
     /// Sets `flagNoCow`: the inode flag `FS_NOCOW_FL` is set, cleared, or not
     /// known.
+    /// `Some(false)` needs a manifest that records `flag-no-cow` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_no_cow(&mut self, no_cow: Option<bool>) {
         self.flags.put(InodeFlags::NO_COW, no_cow);
     }
@@ -1456,6 +1509,9 @@ impl InodeAttributes {
 
     /// Sets `flagNoDump`: the inode flag `FS_NODUMP_FL` is set, cleared, or not
     /// known.
+    /// `Some(false)` needs a manifest that records `flag-no-dump` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_no_dump(&mut self, no_dump: Option<bool>) {
         self.flags.put(InodeFlags::NO_DUMP, no_dump);
     }
@@ -1496,7 +1552,8 @@ pub struct FileObject {
     pub(crate) dos_flags: FlagStates<DosFlags>,
     pub(crate) inode: InodeAttributes,
     pub(crate) validity: ValidityWindow,
-    /// The size and the hash, if a reader filled them in.
+    /// The size and the hash, where a reader filled them in. `dos_flags`
+    /// notes the DOS attributes a reader filled in.
     pub(crate) filled_in: FilledIn,
 }
 
@@ -1668,11 +1725,13 @@ impl FileObject {
         self.validity = validity;
     }
 
-    /// What a reader filled in of the object: its size and its hash, and
-    /// the `readOnly` of its inode attributes, see [`FilledIn`]. A writer
-    /// leaves these out.
+    /// What a reader filled in of the object: its size, its hash and its
+    /// DOS attributes, and what [`InodeAttributes::filled_in()`] says of its
+    /// inode attributes, see [`FilledIn`]. A writer leaves these out.
     pub fn filled_in(&self) -> FilledIn {
-        self.filled_in.union(self.inode.filled_in)
+        self.filled_in
+            .union(self.dos_flags.filled_in())
+            .union(self.inode.filled_in())
     }
 
     /// Drops the size and the hash a reader filled in, which follow from
@@ -1767,6 +1826,9 @@ impl FileObject {
 
     /// Sets `flagArchive`: the DOS attribute `ATTR_ARCHIVE` is set, cleared, or
     /// not known.
+    /// `Some(false)` needs a manifest that records `flag-archive` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_archive(&mut self, archive: Option<bool>) {
         self.dos_flags.put(DosFlags::ARCHIVE, archive);
     }
@@ -1779,6 +1841,9 @@ impl FileObject {
 
     /// Sets `flagHidden`: the DOS attribute `ATTR_HIDDEN` is set, cleared, or
     /// not known.
+    /// `Some(false)` needs a manifest that records `flag-hidden` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_hidden(&mut self, hidden: Option<bool>) {
         self.dos_flags.put(DosFlags::HIDDEN, hidden);
     }
@@ -1791,6 +1856,9 @@ impl FileObject {
 
     /// Sets `flagSystem`: the DOS attribute `ATTR_SYSTEM` is set, cleared, or
     /// not known.
+    /// `Some(false)` needs a manifest that records `flag-system` just as
+    /// `Some(true)` does: a writer leaves a cleared flag out, and only the
+    /// feature makes a missing field mean cleared.
     pub fn set_flag_system(&mut self, system: Option<bool>) {
         self.dos_flags.put(DosFlags::SYSTEM, system);
     }
@@ -1916,8 +1984,8 @@ impl RootObject {
     }
 
     /// The features whose fields the object has, see [`Features`]. A
-    /// manifest records them all or this is not its root file object. A
-    /// `readOnly` a reader filled in, see [`FilledIn`], does not count.
+    /// manifest records them all or this is not its root file object. What
+    /// a reader filled in, see [`FilledIn`], does not count.
     pub fn stated_features(&self) -> Features {
         self.feature_fields()
             .fold(Features::NONE, |features, (_, feature)| features | feature)
@@ -2575,5 +2643,22 @@ mod tests {
         object.inode_mut().set_read_only(Some(false));
         assert_eq!(object.inode().read_only(), Some(false));
         assert!(!object.filled_in().contains(Field::ReadOnly));
+        // The flags and the extended attributes as well.
+        let root = concat!(
+            r#"{"features":["flag-hidden","flag-no-dump","user-xattr"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest"}"#
+        );
+        let whole = read_whole(&sequence(&[root, r#"{"name":"a"}"#, TRAILER])).unwrap();
+        let mut object = whole.objects.into_iter().next().unwrap();
+        let fields = [Field::FlagHidden, Field::FlagNoDump, Field::ExtendedAttributes];
+        assert!(fields.into_iter().all(|field| object.filled_in().contains(field)));
+        object.set_flag_hidden(Some(false));
+        object.inode_mut().set_flag_no_dump(Some(false));
+        object.inode_mut().set_user_xattrs(Some(BTreeMap::new()));
+        assert_eq!(object.filled_in(), none);
+        assert_eq!(
+            object.stated_features(),
+            Features::FLAG_HIDDEN | Features::FLAG_NO_DUMP | Features::USER_XATTR
+        );
     }
 }

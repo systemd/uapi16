@@ -404,7 +404,7 @@ impl RootObject {
 /// name nor a type: it is a directory.
 impl Fields for RootObject {
     fn filled_in(&self) -> FilledIn {
-        self.inode.filled_in
+        self.inode.filled_in()
     }
 
     fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
@@ -1154,6 +1154,10 @@ mod tests {
         literal.filled_in.insert(Field::OriginalSize);
         expected[1].contents[1].http_headers.sort();
         for object in &mut expected {
+            // A flag that is cleared goes out as no field at all, and the
+            // reader fills it in.
+            object.dos_flags.stated = object.dos_flags.set;
+            object.inode.flags.stated = object.inode.flags.set;
             object.fill_in(Features::ALL);
         }
         assert_eq!(m.objects, expected);
@@ -1395,6 +1399,61 @@ mod tests {
         let mut root = m.root.clone();
         root.inode.filled_in.remove(Field::ReadOnly);
         assert_eq!(contradiction(Writer::begin(Vec::new(), &root).unwrap_err()), expected);
+    }
+
+    /// The flags and the extended attributes a reader filled in are, like
+    /// a readOnly it filled in, no fields the object has: they state no
+    /// feature, the writer leaves them out, and its checks hold them
+    /// neither against the features of the manifest nor against the type
+    /// of the object. A flag a caller sets is stated, cleared or not.
+    #[test]
+    fn writes_back_flags_and_attributes_a_reader_filled_in() {
+        let root = concat!(
+            r#"{"features":["flag-hidden","flag-no-dump","read-only","user-xattr"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest"}"#
+        );
+        let bytes = sequence(&[root, r#"{"name":"x"}"#, TRAILER]);
+        let m = read_whole(&bytes).unwrap();
+        let object = &m.objects[0];
+        assert_eq!(object.flag_hidden(), Some(false));
+        assert_eq!(object.inode().flag_no_dump(), Some(false));
+        assert_eq!(object.inode().user_xattrs().map(|xattrs| xattrs.len()), Some(0));
+        for filled_in in [object.filled_in(), m.root.inode().filled_in()] {
+            for field in [Field::ExtendedAttributes, Field::FlagNoDump, Field::ReadOnly] {
+                assert!(filled_in.contains(field), "{:?}", field);
+            }
+        }
+        assert!(object.filled_in().contains(Field::FlagHidden));
+        assert_eq!(
+            (m.root.stated_features(), object.stated_features()),
+            (Features::NONE, Features::NONE)
+        );
+        assert_eq!(write_whole(&m).unwrap(), bytes);
+        // Under a manifest that records none of the features, on a fifo,
+        // and for the root file object.
+        let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
+        writer.file(object).unwrap();
+        let mut fifo = object.clone();
+        fifo.set_inode_type(InodeType::Fifo);
+        let mut writer = Writer::begin(Vec::new(), &m.root).unwrap();
+        writer.file(&fifo).unwrap();
+        let mut root = m.root.clone();
+        root.set_features(None);
+        Writer::begin(Vec::new(), &root).unwrap();
+        // Set by a caller, the cleared flag is stated and needs its
+        // feature, so the manifest says it is cleared.
+        let mut set = object.clone();
+        set.set_flag_hidden(Some(false));
+        assert!(!set.filled_in().contains(Field::FlagHidden));
+        assert_eq!(set.stated_features(), Features::FLAG_HIDDEN);
+        let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
+        let e = writer.file(&set).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.field()),
+            (ErrorKind::Manifest(Problem::UnlistedFeature), Some(Field::FlagHidden))
+        );
+        let mut writer = Writer::begin(Vec::new(), &m.root).unwrap();
+        writer.file(&set).unwrap();
     }
 
     /// The writer leaves out what the specification recommends to leave

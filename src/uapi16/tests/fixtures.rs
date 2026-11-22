@@ -3,9 +3,10 @@
 //! are copies of the fixtures of ufat, whose tests/fixtures/README.md says
 //! how they were made.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use uapi16::{Error, FileObject, InodeType, Object, Order, Reader, RootObject, SignatureObject, Writer};
+use uapi16::{Error, Field, FileObject, InodeType, Object, Order, Reader, RootObject, SignatureObject, Writer};
 
 /// A manifest read to its end: its root file object, its file objects and
 /// its signature objects.
@@ -40,6 +41,19 @@ impl Manifest {
         let path = fixture(case, name);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
         Manifest::read(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+    }
+
+    /// The manifest with the extended attributes a reader filled in taken
+    /// as ones the objects state. systemd-manifest states the empty ones,
+    /// which the writer leaves out and a reader fills in again.
+    fn with_stated_xattrs(mut self) -> Manifest {
+        let files = self.files.iter_mut().map(FileObject::inode_mut);
+        for inode in std::iter::once(self.root.inode_mut()).chain(files) {
+            if inode.filled_in().contains(Field::ExtendedAttributes) {
+                inode.set_user_xattrs(Some(BTreeMap::new()));
+            }
+        }
+        self
     }
 
     /// The manifest the writer writes for the objects.
@@ -180,6 +194,11 @@ fn reads_and_writes_back_every_fixture() {
         );
         assert_eq!(read.root.order(), Some(Order::CodePoint), "{}", path.display());
         let written = read.write().unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
-        assert_eq!(Manifest::read(&written).unwrap(), read, "{}", path.display());
+        assert_eq!(
+            Manifest::read(&written).unwrap().with_stated_xattrs(),
+            read.with_stated_xattrs(),
+            "{}",
+            path.display()
+        );
     }
 }
