@@ -20,7 +20,8 @@ libc = "0.2.191"
 # directory, for PinnedDirectory. It builds on Linux only.
 pathrs = "0.2.6"
 # Tells what pathrs resolved apart before it is opened, and reopens it
-# through O_EMPTYPATH.
+# through O_EMPTYPATH. Splits the device number of a file into its major
+# and minor numbers, for FileObject::from_metadata().
 rustix = "1.1.6"
 # Reads and writes JSON. What a manifest asks for beyond JSON is checked
 # by src/uapi16/strict.rs. Never turn on arbitrary_precision: serde_json

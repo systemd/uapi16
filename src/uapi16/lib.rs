@@ -111,6 +111,7 @@ mod directory;
 mod error;
 mod features;
 mod hex;
+mod metadata;
 mod name;
 mod object;
 mod reader;

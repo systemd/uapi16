@@ -168,6 +168,13 @@ impl Mode {
     /// the owner, of the group and of everybody else.
     const WRITE: u32 = 0o222;
 
+    /// The mode of the file mode `st_mode`: its permission bits with the
+    /// set-user-ID, the set-group-ID and the sticky bit, without the bits
+    /// of the file type.
+    pub(crate) const fn from_st_mode(st_mode: u32) -> Mode {
+        Mode(st_mode & Mode::ALL)
+    }
+
     /// The mode with the bits `bits`. Bits that a mode does not have, such
     /// as those of the file type in an `st_mode`, fail.
     pub const fn new(bits: u32) -> Result<Mode, InvalidMode> {
