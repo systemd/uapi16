@@ -264,6 +264,31 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
+/// A copy of a manifest writes back what a reader returns, one object at
+/// a time. The writer takes the root file object by reference, so it
+/// starts before the loop and needs no copy of it:
+///
+/// ```
+/// use uapi16::{Object, Reader, Writer};
+///
+/// let manifest = concat!(
+///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
+///     "\x1e{\"name\":\"a\",\"size\":3}\n",
+///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+/// );
+/// let mut reader = Reader::open(manifest.as_bytes())?;
+/// let mut writer = Writer::begin(Vec::new(), reader.root())?;
+/// for object in &mut reader {
+///     match object? {
+///         Object::File(file) => writer.file(&file)?,
+///         Object::Signature(signature) => writer.signature(&signature)?,
+///         _ => {}
+///     }
+/// }
+/// assert_eq!(writer.finish()?, manifest.as_bytes());
+/// # Ok::<(), uapi16::Error>(())
+/// ```
+///
 /// [`FilledIn`]: crate::FilledIn
 /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
 /// [`MAX_RECORD_SIZE`]: crate::MAX_RECORD_SIZE

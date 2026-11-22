@@ -813,6 +813,16 @@ impl FilledIn {
         self.0 & FilledIn::bit(field) != 0
     }
 
+    /// Whether no field was filled in.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The fields that were filled in.
+    pub fn iter(self) -> impl Iterator<Item = Field> {
+        FilledIn::FIELDS.into_iter().filter(move |&field| self.contains(field))
+    }
+
     /// Notes that `field` was filled in, if it is one that can be.
     pub(crate) fn insert(&mut self, field: Field) {
         self.0 |= FilledIn::bit(field);
@@ -834,8 +844,7 @@ impl FilledIn {
 impl fmt::Debug for FilledIn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("FilledIn(")?;
-        let filled = FilledIn::FIELDS.into_iter().filter(|&field| self.contains(field));
-        for (i, field) in filled.enumerate() {
+        for (i, field) in self.iter().enumerate() {
             if i > 0 {
                 f.write_str(" | ")?;
             }
@@ -2729,12 +2738,15 @@ mod tests {
         );
         let whole = read_whole(&sequence(&[root, r#"{"name":"a"}"#, TRAILER])).unwrap();
         let mut object = whole.objects.into_iter().next().unwrap();
-        let fields = [Field::FlagHidden, Field::FlagNoDump, Field::ExtendedAttributes];
-        assert!(fields.into_iter().all(|field| object.filled_in().contains(field)));
+        let filled_in: Vec<Field> = object.filled_in().iter().collect();
+        assert_eq!(
+            filled_in,
+            [Field::ExtendedAttributes, Field::FlagHidden, Field::FlagNoDump]
+        );
         object.set_flag_hidden(Some(false));
         object.inode_mut().set_flag_no_dump(Some(false));
         object.inode_mut().set_user_xattrs(Some(BTreeMap::new()));
-        assert_eq!(object.filled_in(), none);
+        assert!(object.filled_in().is_empty());
         assert_eq!(
             object.stated_features(),
             Features::FLAG_HIDDEN | Features::FLAG_NO_DUMP | Features::USER_XATTR

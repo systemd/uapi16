@@ -111,7 +111,7 @@ impl FromStr for Sha256 {
 /// use std::io::Write;
 /// use uapi16::{Sha256, Sha256Context};
 ///
-/// let mut context = Sha256Context::default();
+/// let mut context = Sha256Context::new();
 /// context.update(b"hel");
 /// context.write_all(b"lo")?;
 /// assert_eq!(context.finalize(), Sha256::digest(b"hello"));
@@ -121,6 +121,12 @@ impl FromStr for Sha256 {
 pub struct Sha256Context(sha2::Sha256);
 
 impl Sha256Context {
+    /// A computation that has taken no data yet, the same as the default
+    /// one.
+    pub fn new() -> Sha256Context {
+        Sha256Context::default()
+    }
+
     /// Takes more of the data.
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data);
