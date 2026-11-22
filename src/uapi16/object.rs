@@ -741,12 +741,13 @@ impl fmt::Debug for FilledIn {
 /// use uapi16::FatSerial;
 ///
 /// let serial: FatSerial = "1234-abcd".parse()?;
-/// assert_eq!(serial, FatSerial(0x1234_abcd));
+/// assert_eq!(serial, FatSerial::new(0x1234_abcd));
+/// assert_eq!(serial.get(), 0x1234_abcd);
 /// assert_eq!(serial.to_string(), "1234-ABCD");
 /// # Ok::<(), uapi16::InvalidFatSerial>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FatSerial(pub u32);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FatSerial(pub(crate) u32);
 
 /// A string that is not a FAT volume serial number, see [`FatSerial`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -770,11 +771,27 @@ impl FatSerial {
     /// The radix of the digits.
     const HEX: u32 = 16;
 
+    /// The serial number with the 32 bits `serial`.
+    pub const fn new(serial: u32) -> FatSerial {
+        FatSerial(serial)
+    }
+
+    /// The 32 bits of the serial number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
     /// The serial number the specification derives from a file system
     /// UUID: its first four bytes.
     pub fn from_uuid(uuid: &Uuid) -> FatSerial {
         let [a, b, c, d, ..] = *uuid.as_bytes();
         FatSerial(u32::from_be_bytes([a, b, c, d]))
+    }
+}
+
+impl fmt::Debug for FatSerial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FatSerial({:#x})", self.0)
     }
 }
 
@@ -852,9 +869,9 @@ impl FileSystemIdentity {
     ///
     /// let mut identity = FileSystemIdentity::default();
     /// identity.uuid = "1234abcd-5678-4ef0-9abc-def012345678".parse().ok();
-    /// assert_eq!(identity.volume_serial(), Some(FatSerial(0x1234_abcd)));
-    /// identity.fat_serial = Some(FatSerial(0x5678_9abc));
-    /// assert_eq!(identity.volume_serial(), Some(FatSerial(0x5678_9abc)));
+    /// assert_eq!(identity.volume_serial(), Some(FatSerial::new(0x1234_abcd)));
+    /// identity.fat_serial = Some(FatSerial::new(0x5678_9abc));
+    /// assert_eq!(identity.volume_serial(), Some(FatSerial::new(0x5678_9abc)));
     /// ```
     pub fn volume_serial(&self) -> Option<FatSerial> {
         self.fat_serial.or_else(|| self.uuid.as_ref().map(FatSerial::from_uuid))
@@ -1495,6 +1512,11 @@ mod tests {
         ] {
             assert!(bad.parse::<Uuid>().is_err(), "{:?}", bad);
         }
+    }
+
+    #[test]
+    fn fat_serials() {
+        assert_eq!(format!("{:?}", FatSerial::new(0x1234_abcd)), "FatSerial(0x1234abcd)");
     }
 
     #[test]
