@@ -13,9 +13,15 @@ license = "LGPL-2.1-or-later"
 publish = false
 
 [workspace.dependencies]
-# Stay on 0.2 like sha2's cpufeatures on aarch64 and loongarch64, so
-# that the tests never build two versions of libc there.
+# Stay on 0.2 like pathrs, errno, getrandom and sha2's cpufeatures, so
+# that the tests never build two versions of libc.
 libc = "0.2.191"
+# Resolves the names of the files next to a manifest below their
+# directory, for PinnedDirectory. It builds on Linux only.
+pathrs = "0.2.6"
+# Tells what pathrs resolved apart before it is opened, and reopens it
+# through O_EMPTYPATH.
+rustix = "1.1.6"
 # Reads and writes JSON. What a manifest asks for beyond JSON is checked
 # by src/uapi16/strict.rs. Never turn on arbitrary_precision: serde_json
 # then hands numbers to the visitors of uapi16 as objects, see the crate

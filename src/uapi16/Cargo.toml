@@ -17,6 +17,11 @@ serde_core.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 
+# PinnedDirectory, which only Linux has.
+[target.'cfg(target_os = "linux")'.dependencies]
+pathrs.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 # The errno values of the errors the tests make.
 libc.workspace = true
