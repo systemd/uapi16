@@ -70,6 +70,15 @@
 //! grows with the manifest. Writing one keeps the record it puts together,
 //! its separator included, and the name of the file object before it.
 //!
+//! Two checks are up to the caller: whether a manifest declares the order
+//! of its file objects, [`RootObject::require_order`], and whether an
+//! object may be used at a given time, [`RootObject::check_validity`] and
+//! [`FileObject::check_validity`]. What is true of a directory is true of
+//! everything in it, but the validity of a directory does not carry over
+//! to its entries: [`FileObject::check_validity`] looks at the object
+//! alone. A caller that uses an entry checks the objects of the
+//! directories it is in as well, which come before it in the manifest.
+//!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
 //! manifest they sign. Data that is stored in an encoding or that has to

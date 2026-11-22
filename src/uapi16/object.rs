@@ -1913,7 +1913,9 @@ impl FileObject {
     /// Checks that the object may be used at the time `now_usec`, in
     /// microseconds since the epoch: that it is not revoked and that the
     /// time is inside its validity window. What is true of a directory is
-    /// true of everything in it.
+    /// true of everything in it, but the check looks at the object alone. A
+    /// caller that uses an entry checks the objects of the directories it
+    /// is in as well, which come before it in the manifest.
     pub fn check_validity(&self, now_usec: u64) -> Result<(), Error> {
         self.validity
             .check(now_usec, self.name.as_str().escape_debug())
