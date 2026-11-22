@@ -12,6 +12,8 @@ use std::io::{Seek, SeekFrom};
 use std::ops::Range;
 
 use crate::digest::Sha256Context;
+#[cfg(target_os = "linux")]
+use crate::directory::PinnedDirectory;
 use crate::error::{DataProblem, Error, ErrorKind, Field, SourceProblem, UnsupportedData};
 use crate::object::{ContentsObject, ContentsSource, FileObject, InodeType};
 use crate::{Name, Sha256};
@@ -493,6 +495,13 @@ impl Write for CheckedSink<'_, '_> {
     }
 }
 
+/// What keeps [`DataProvider`] to the types of this crate: a supertrait
+/// that no other crate can name.
+pub(crate) mod sealed {
+    /// Implemented by the providers of this crate, and by no other type.
+    pub trait Sealed {}
+}
+
 /// Has the data of the file objects whose data is outside of the
 /// manifest.
 ///
@@ -507,7 +516,10 @@ impl Write for CheckedSink<'_, '_> {
 /// which calls [`DataProvider::copy`], and the others to
 /// [`DataProvider::skip`]. After the last one it calls
 /// [`DataProvider::end`].
-pub trait DataProvider {
+///
+/// The trait is sealed: the providers of this crate implement it, and it
+/// is not meant to be implemented anywhere else.
+pub trait DataProvider: sealed::Sealed {
     /// Writes the data of `object`, which is in `file`, to `sink`: exactly
     /// `object.size()` bytes when the object has a size. An error of the
     /// sink comes back as it was, and one of the provider names the
@@ -530,12 +542,9 @@ pub trait DataProvider {
 }
 
 /// Why a [`Directory`] does not hand out a file.
-///
-/// It exists on Linux only, not on Android.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-#[non_exhaustive]
-pub enum OpenError {
+pub(crate) enum OpenError {
     /// What the name names is not a regular file.
     NotRegular,
     /// The file could not be reached. An error of the kind `NotFound` or
@@ -555,12 +564,14 @@ impl From<io::Error> for OpenError {
 ///
 /// A manifest is not to be trusted to stay inside that directory. The
 /// names it gives are normalized relative paths, see [`Name`], but a
-/// symbolic link in the directory can still lead out of it. It is on the
-/// implementation to resolve a name below the directory and nowhere else.
+/// symbolic link in the directory can still lead out of it. A name has to
+/// be resolved below the directory and nowhere else, which
+/// [`PinnedDirectory`] does.
 ///
-/// It exists on Linux only, not on Android.
+/// The trait is the crate's own: [`PinnedDirectory`] is the one directory
+/// a caller has, and the tests have one in memory.
 #[cfg(target_os = "linux")]
-pub trait Directory {
+pub(crate) trait Directory {
     /// A file of the directory, open for reading.
     type File: Read + Seek;
 
@@ -570,7 +581,7 @@ pub trait Directory {
 }
 
 /// Takes the data of file objects from the files next to the manifest,
-/// in a [`Directory`].
+/// in a [`PinnedDirectory`].
 ///
 /// The data of an object is the part of its file that starts at the
 /// offset its contents object gives and is as long as the object says,
@@ -599,7 +610,35 @@ pub trait Directory {
 ///
 /// It exists on Linux only, not on Android.
 #[cfg(target_os = "linux")]
-pub struct DirectoryProvider<D> {
+#[derive(Debug)]
+pub struct DirectoryProvider {
+    inner: Provider<PinnedDirectory>,
+}
+
+#[cfg(target_os = "linux")]
+impl sealed::Sealed for DirectoryProvider {}
+
+#[cfg(target_os = "linux")]
+impl DirectoryProvider {
+    /// A provider that takes the files from `directory`.
+    pub fn new(directory: PinnedDirectory) -> DirectoryProvider {
+        DirectoryProvider {
+            inner: Provider::new(directory),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DataProvider for DirectoryProvider {
+    fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
+        self.inner.copy(object, file, sink)
+    }
+}
+
+/// What a [`DirectoryProvider`] is, over any [`Directory`], so that the
+/// tests can give it one in memory.
+#[cfg(target_os = "linux")]
+struct Provider<D> {
     directory: D,
     /// What a copy goes through, made when the first file is copied.
     buffer: Vec<u8>,
@@ -608,10 +647,10 @@ pub struct DirectoryProvider<D> {
 }
 
 #[cfg(target_os = "linux")]
-impl<D: Directory> DirectoryProvider<D> {
+impl<D: Directory> Provider<D> {
     /// A provider that takes the files from `directory`.
-    pub fn new(directory: D) -> DirectoryProvider<D> {
-        DirectoryProvider {
+    fn new(directory: D) -> Provider<D> {
+        Provider {
             directory,
             buffer: Vec::new(),
             hashes: PieceHashes::default(),
@@ -620,9 +659,9 @@ impl<D: Directory> DirectoryProvider<D> {
 }
 
 #[cfg(target_os = "linux")]
-impl<D: fmt::Debug> fmt::Debug for DirectoryProvider<D> {
+impl<D: fmt::Debug> fmt::Debug for Provider<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DirectoryProvider")
+        f.debug_struct("Provider")
             .field("directory", &self.directory)
             .field(
                 "buffer",
@@ -939,7 +978,9 @@ impl<F: Read + Seek> Pieces<'_, F> {
 }
 
 #[cfg(target_os = "linux")]
-impl<D: Directory> DataProvider for DirectoryProvider<D> {
+impl<D: Directory> Provider<D> {
+    /// Copies the data of `object`, which is in `file`, to `sink`, see
+    /// [`DataProvider::copy`].
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
         let (opened, len) = self
             .directory
@@ -1011,6 +1052,8 @@ pub struct StreamProvider<R> {
     /// about.
     last: Option<(String, u64)>,
 }
+
+impl<R> sealed::Sealed for StreamProvider<R> {}
 
 impl<R: Read> StreamProvider<R> {
     /// A provider that takes the data from `reader`.
@@ -1252,6 +1295,16 @@ mod tests {
         }
     }
 
+    impl sealed::Sealed for Provider<&Files> {}
+
+    /// The tests copy through a provider over the files in memory, which
+    /// does what a [`DirectoryProvider`] does.
+    impl DataProvider for Provider<&Files> {
+        fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
+            Provider::copy(self, object, file, sink)
+        }
+    }
+
     /// A provider over a reference to the files, so that a test can look
     /// at them and change them while the provider has them.
     impl Directory for &Files {
@@ -1455,7 +1508,7 @@ mod tests {
         assert!(some[0].has_external_data());
         assert_eq!(some[1].data_location().unwrap(), DataLocation::Literal(b"x"));
         let files = Files::of(&[("d.Uapi16Manifest", b"abc")]);
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         assert_eq!(copy(&some[0], &mut provider).unwrap(), b"abc");
         assert_eq!(copy(&some[1], &mut provider).unwrap(), b"x");
     }
@@ -1463,7 +1516,7 @@ mod tests {
     #[test]
     fn copies_from_a_directory() {
         let files = Files::of(&[("a", b"hello world"), ("empty", b""), ("dir/b", b"hello")]);
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         for (record, data) in [
             // A whole file, by the name of the object and by a file external.
             (format!(r#"{{"name":"dir/b","size":5,"sha256":"{}"}}"#, HELLO), "hello"),
@@ -1531,7 +1584,7 @@ mod tests {
     #[test]
     fn files_that_are_not_what_the_manifest_says() {
         let files = Files::of(&[("a", b"hello world"), ("dir/b", b"hello")]);
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         let size = ErrorKind::Data(DataProblem::SizeMismatch);
         let hash = ErrorKind::Data(DataProblem::HashMismatch);
         for (record, expected) in [
@@ -1697,7 +1750,7 @@ mod tests {
     #[test]
     fn files_that_change_while_they_are_read() {
         let files = Files::default();
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         let changed = |file: &str| {
             (
                 ErrorKind::Data(DataProblem::SourceChanged),
@@ -1800,7 +1853,7 @@ mod tests {
             trouble: Trouble::Stall,
         };
         let files = Files::default();
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         let changed = (
             ErrorKind::Data(DataProblem::SourceChanged),
             Some("x"),
@@ -1859,7 +1912,7 @@ mod tests {
                 trouble: Trouble::FailRead(libc::EIO),
             },
         );
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         let o = object(r#"{"name":"x","size":11,"contents":[{"file":"bad"}]}"#);
         let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(
@@ -1946,7 +1999,7 @@ mod tests {
         let whole = Sha256::digest(&blob);
         let files = Files::default();
         files.put("blob", Entry::File(blob[..].into()));
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         let part = |offset: usize, size: usize, total: usize, sha256: Option<Sha256>| {
             let sha256 = sha256.map(|sha256| format!(r#","originalSha256":"{}""#, sha256));
             object(&format!(
@@ -2052,7 +2105,7 @@ mod tests {
                 HELLO
             ),
         ] {
-            let mut provider = DirectoryProvider::new(&small);
+            let mut provider = Provider::new(&small);
             for _ in 0..2 {
                 assert_eq!(copy(&object(&record), &mut provider).unwrap(), b"hello", "{}", record);
                 assert_eq!(small.read(), 5);
@@ -2189,7 +2242,7 @@ mod tests {
         // file, and nothing is kept of it.
         let names = ["a", "b", "c", "d"];
         let files = Files::of(&names.map(|name| (name, &b"ab"[..])));
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         for name in names {
             let o = object(&format!(
                 r#"{{"name":"x","size":1,"contents":[{{"file":"{}","offset":1,"originalSize":2,"originalSha256":"{}"}}]}}"#,
@@ -2224,7 +2277,7 @@ mod tests {
         files.put("odd", Entry::Fails(libc::EINVAL));
         files.put("link", Entry::Fails(libc::ELOOP));
         files.put("secret", Entry::Fails(libc::EACCES));
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         for (file, problem, errno, text) in [
             (
                 "missing",
@@ -2473,7 +2526,7 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::NoSize));
         // A directory has nothing to read past.
         let files = Files::of(&[("a", b"hello")]);
-        DirectoryProvider::new(&files).skip(&all[0]).unwrap();
+        Provider::new(&files).skip(&all[0]).unwrap();
         assert_eq!(files.read(), 0);
     }
 
@@ -2482,6 +2535,8 @@ mod tests {
         /// Whether a write that fails fails the copy.
         careful: bool,
     }
+
+    impl sealed::Sealed for Babbler {}
 
     impl DataProvider for Babbler {
         fn copy(&mut self, _: &FileObject, _: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
@@ -2603,10 +2658,10 @@ mod tests {
         let literal = object(r#"{"name":"l","contents":[{"literal":"aGVsbG8="}]}"#);
         let files = Files::of(&[("a", b"hello")]);
         let nothing = Files::default();
-        let mut directory = DirectoryProvider::new(&files);
+        let mut directory = Provider::new(&files);
         let mut stream = &b"hello"[..];
         let mut stream = StreamProvider::new(&mut stream);
-        let mut empty = DirectoryProvider::new(&nothing);
+        let mut empty = Provider::new(&nothing);
         let sources: [(&FileObject, &mut dyn DataProvider); 3] =
             [(&o, &mut directory), (&o, &mut stream), (&literal, &mut empty)];
         for (object, provider) in sources {
@@ -2621,7 +2676,7 @@ mod tests {
     #[test]
     fn debug_shows_no_buffers() {
         let files = Files::of(&[("a", b"hello")]);
-        let mut provider = DirectoryProvider::new(&files);
+        let mut provider = Provider::new(&files);
         copy(&object(r#"{"name":"a","size":5}"#), &mut provider).unwrap();
         let text = format!("{:?}", provider);
         assert!(text.len() < 500, "{}", text);

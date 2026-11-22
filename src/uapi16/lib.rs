@@ -116,9 +116,9 @@ mod strict;
 mod writer;
 
 pub use blocking::{Reader, Writer};
-pub use content::{DataCheck, DataLocation, DataProvider, ExternalFile, StreamProvider};
 #[cfg(target_os = "linux")]
-pub use content::{Directory, DirectoryProvider, OpenError};
+pub use content::DirectoryProvider;
+pub use content::{DataCheck, DataLocation, DataProvider, ExternalFile, StreamProvider};
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
 #[cfg(target_os = "linux")]
 pub use directory::PinnedDirectory;
