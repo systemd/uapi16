@@ -8,7 +8,7 @@ use std::iter::FusedIterator;
 
 use crate::decode::ROOT_RECORD;
 use crate::error::Error;
-use crate::object::{FileObject, RootObject, Signature};
+use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::reader::{Decoder, Object, Step};
 use crate::writer::Encoder;
 
@@ -131,7 +131,7 @@ impl<R: Read> Reader<R> {
     /// its record separator. None as long as no signature object was read.
     ///
     /// This crate does not verify signatures. With this number and the
-    /// [`Signature`] objects a caller can.
+    /// signature objects, see [`SignatureObject`], a caller can.
     pub fn signed_len(&self) -> Option<u64> {
         self.decoder.signed_len()
     }
@@ -289,7 +289,7 @@ impl<W: Write> Writer<W> {
 
     /// Writes a signature object. No file object can follow it: it would
     /// be one the signature does not cover.
-    pub fn signature(&mut self, signature: &Signature) -> Result<(), Error> {
+    pub fn signature(&mut self, signature: &SignatureObject) -> Result<(), Error> {
         self.send_record(|encoder| encoder.encode_signature(signature))
     }
 
@@ -623,7 +623,7 @@ mod tests {
         writer.file(&largest).unwrap();
         assert_eq!(writer.get_ref().len() - before, MAX_RECORD_SIZE);
         assert!(writer.encoder.record.capacity() <= RECORD_CAPACITY);
-        let mut signature = Signature::new("pkcs7");
+        let mut signature = SignatureObject::new("pkcs7");
         signature.data = Some(vec![0; MAX_RECORD_SIZE]);
         let e = writer.signature(&signature).unwrap_err();
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
         writer.file(&FileObject::new(name("a"))).unwrap();
         let signed = writer.get_ref().len();
         let hash = Sha256::digest(writer.get_ref());
-        let mut signature = Signature::new("pkcs7");
+        let mut signature = SignatureObject::new("pkcs7");
         signature.data = Some(hash.as_bytes().to_vec());
         writer.signature(&signature).unwrap();
         let bytes = writer.finish().unwrap();

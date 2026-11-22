@@ -671,7 +671,7 @@ impl<F: FlagSet> FlagStates<F> {
 /// an object take a filled-in `readOnly` for one that is not there.
 ///
 /// The `size` and the `sha256` of a [`FileObject`], the sizes and hashes
-/// of a [`Contents`] and the `readOnly` of [`InodeAttributes`] can be
+/// of a [`ContentsObject`] and the `readOnly` of [`InodeAttributes`] can be
 /// filled in. Each of them notes it in its own `filled_in`.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FilledIn(u8);
@@ -861,10 +861,11 @@ impl FileSystemIdentity {
     }
 }
 
-/// Where a contents object says the data is. It names at most one place.
+/// The source of a contents object: where it says the data is. It names
+/// at most one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Location {
+pub enum ContentsSource {
     /// Neither `file`, `url` nor `literal` is given: the data is in the
     /// file of the object's own name, next to the manifest.
     #[default]
@@ -886,9 +887,9 @@ pub enum Location {
 /// decoded data that starts at `offset`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Contents {
+pub struct ContentsObject {
     /// `file`, `url` or `literal`: where the data is.
-    pub location: Location,
+    pub source: ContentsSource,
     /// `httpHeaders`: the header fields of the HTTP requests for the data
     /// at `url`, by name, in the order the manifest lists them.
     pub http_headers: Vec<(String, String)>,
@@ -910,37 +911,37 @@ pub struct Contents {
     pub filled_in: FilledIn,
 }
 
-impl Contents {
-    /// A contents object for data in the place `location`, stored as it
+impl ContentsObject {
+    /// A contents object for data from the source `source`, stored as it
     /// is.
-    pub fn new(location: Location) -> Contents {
-        Contents {
-            location,
-            ..Contents::default()
+    pub fn new(source: ContentsSource) -> ContentsObject {
+        ContentsObject {
+            source,
+            ..ContentsObject::default()
         }
     }
 
     /// The data the manifest carries itself, if this is where the data
     /// is.
     pub fn literal(&self) -> Option<&[u8]> {
-        match &self.location {
-            Location::Literal(data) => Some(data),
+        match &self.source {
+            ContentsSource::Literal(data) => Some(data),
             _ => None,
         }
     }
 
     /// The file next to the manifest the data is in, if `file` names one.
     pub fn file(&self) -> Option<&Name> {
-        match &self.location {
-            Location::File(name) => Some(name),
+        match &self.source {
+            ContentsSource::File(name) => Some(name),
             _ => None,
         }
     }
 
     /// The URL the data is at, if this is where the data is.
     pub fn url(&self) -> Option<&str> {
-        match &self.location {
-            Location::Url(url) => Some(url),
+        match &self.source {
+            ContentsSource::Url(url) => Some(url),
             _ => None,
         }
     }
@@ -1111,7 +1112,7 @@ pub struct FileObject {
     pub sha256: Option<Sha256>,
     /// `contents`: where the contents can be taken from. Without any they
     /// are in the file of the object's name next to the manifest.
-    pub contents: Vec<Contents>,
+    pub contents: Vec<ContentsObject>,
     /// `inodeToken`: the objects that carry the same token are hard links
     /// to one file. None is a file of its own.
     pub inode_token: Option<NonZeroU64>,
@@ -1368,7 +1369,7 @@ impl RootObject {
 /// verify them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Signature {
+pub struct SignatureObject {
     /// `mechanism`: how the signature was made. The specification has
     /// `openpgp` and `pkcs7`.
     pub mechanism: String,
@@ -1378,11 +1379,11 @@ pub struct Signature {
     pub data: Option<Vec<u8>>,
 }
 
-impl Signature {
+impl SignatureObject {
     /// A signature object of the mechanism `mechanism`, without a key
     /// and without data.
-    pub fn new(mechanism: impl Into<String>) -> Signature {
-        Signature {
+    pub fn new(mechanism: impl Into<String>) -> SignatureObject {
+        SignatureObject {
             mechanism: mechanism.into(),
             key: None,
             data: None,
@@ -1720,7 +1721,7 @@ mod tests {
         // The contents of a symbolic link are its target, which a feature
         // records. Those of other files are not.
         let mut object = FileObject::new(Name::new("f").unwrap());
-        object.contents = vec![Contents::new(Location::Literal(b"t".to_vec()))];
+        object.contents = vec![ContentsObject::new(ContentsSource::Literal(b"t".to_vec()))];
         assert_eq!(object.stated_features(), Features::NONE);
         object.inode_type = InodeType::Symlink;
         assert_eq!(object.stated_features(), Features::SYMLINK);
@@ -1759,18 +1760,18 @@ mod tests {
 
     #[test]
     fn contents_objects() {
-        let contents = Contents::default();
-        assert_eq!(contents.location, Location::Implied);
+        let contents = ContentsObject::default();
+        assert_eq!(contents.source, ContentsSource::Implied);
         assert_eq!(
             (contents.literal(), contents.file(), contents.url()),
             (None, None, None)
         );
-        let literal = Contents::new(Location::Literal(b"data".to_vec()));
+        let literal = ContentsObject::new(ContentsSource::Literal(b"data".to_vec()));
         assert_eq!(literal.literal(), Some(&b"data"[..]));
         assert_eq!((literal.file(), literal.url(), literal.offset), (None, None, 0));
-        let file = Contents::new(Location::File(Name::new("blob").unwrap()));
+        let file = ContentsObject::new(ContentsSource::File(Name::new("blob").unwrap()));
         assert_eq!(file.file().map(Name::as_str), Some("blob"));
-        let url = Contents::new(Location::Url("https://example.com/x".to_string()));
+        let url = ContentsObject::new(ContentsSource::Url("https://example.com/x".to_string()));
         assert_eq!(url.url(), Some("https://example.com/x"));
     }
 }

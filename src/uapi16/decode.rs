@@ -23,8 +23,8 @@ use crate::base64::Base64;
 use crate::error::{Error, Field, Problem};
 use crate::hex::Hex;
 use crate::object::{
-    Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FlagSet, GptPartition, InodeAttributes, InodeFlags,
-    InodeType, Location, Mode, RootObject, Signature, Uuid, Validity,
+    ContentsObject, ContentsSource, DosFlags, FatSerial, FileObject, FileSystemIdentity, FlagSet, GptPartition,
+    InodeAttributes, InodeFlags, InodeType, Mode, RootObject, SignatureObject, Uuid, Validity,
 };
 use crate::strict::{FieldTable, Key, Members, Skip, Strict};
 use crate::{
@@ -53,7 +53,7 @@ pub(crate) enum DecodedObject {
     /// A file object, or what is wrong with it.
     File(Result<Box<FileObject>, Error>),
     /// A signature object.
-    Signature(Signature),
+    Signature(SignatureObject),
     /// The trailer object.
     Trailer,
     /// An object of a media type this crate does not know.
@@ -462,7 +462,7 @@ impl FileObject {
     /// specification requires: `readOnly` and `mode`, and the size and the
     /// hash of the object and those of its contents objects. `contents_data`
     /// gives what each contents object says of its data: what
-    /// [`Contents::check_consistency`] returns for it, or what its fields
+    /// [`ContentsObject::check_consistency`] returns for it, or what its fields
     /// hold once a reader checked and filled it in. Returns the size and the
     /// hash of the data of the object: those it gives, and those that follow
     /// from its contents objects and from each other. Whether `gptFlags`
@@ -471,7 +471,7 @@ impl FileObject {
     pub(crate) fn check_consistency(
         &self,
         subject: Subject<'_>,
-        contents_data: impl Fn(&Contents) -> Result<ContentsData, Error>,
+        contents_data: impl Fn(&ContentsObject) -> Result<ContentsData, Error>,
     ) -> Result<SizeAndHash, Error> {
         self.inode.check_read_only(subject)?;
         // The size and the hash of the object and those of its contents
@@ -490,7 +490,7 @@ impl FileObject {
             let Some(total) = original.size else {
                 continue;
             };
-            // Contents::check_consistency found the offset inside the data.
+            // ContentsObject::check_consistency found the offset inside the data.
             let rest = total - contents.offset;
             match (self.size, data.size) {
                 (Some(stated), _) => {
@@ -676,7 +676,7 @@ impl InodeAttributes {
     }
 }
 
-impl Contents {
+impl ContentsObject {
     /// Checks that the fields of the contents object agree with each
     /// other, as the specification requires, and returns what they say of
     /// its data with what follows from them: a literal gives the size of
@@ -695,7 +695,7 @@ impl Contents {
         let mut data = self.data();
         // A literal is as large as the data as it is stored, and without
         // an encoding that is the data.
-        if let Location::Literal(literal) = &self.location {
+        if let ContentsSource::Literal(literal) = &self.source {
             let len = literal.len() as u64;
             let original = data.original.size.filter(|_| self.encoding.is_none());
             if let Some(size) = [data.encoded.size, original]
@@ -778,7 +778,7 @@ impl Contents {
     }
 
     /// Fills in what follows from the fields of the contents object, `data`
-    /// from [`Contents::check_consistency`], and notes what it filled in.
+    /// from [`ContentsObject::check_consistency`], and notes what it filled in.
     fn fill_in(&mut self, data: ContentsData) {
         let given = [
             self.encoded_size.is_some(),
@@ -1189,7 +1189,7 @@ impl<'a> RecordDecoder<'a> {
         let (media_type, candidate) = RecordDecoder::read(text, record_number)?;
         Ok(match media_type {
             MediaType::Trailer => DecodedObject::Trailer,
-            MediaType::Signature => DecodedObject::Signature(Signature::decode(text, record_number)?),
+            MediaType::Signature => DecodedObject::Signature(SignatureObject::decode(text, record_number)?),
             MediaType::Other => DecodedObject::Other,
             MediaType::Absent | MediaType::Manifest => DecodedObject::File(candidate.into_file_object()),
         })
@@ -1697,21 +1697,21 @@ impl<'a> Part<'a> for XattrValue {
 struct ContentsArray;
 
 impl<'a> Part<'a> for ContentsArray {
-    type Value = Vec<Contents>;
+    type Value = Vec<ContentsObject>;
 
     fn array<A: SeqAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, mut seq: A) -> Parsed<'a, Self::Value, A::Error> {
         let subject = decoder.subject();
         let mut list = Vec::new();
         let error_before = decoder.first_error.is_some();
         let mut count = 0usize;
-        while let Some(value) = seq.next_element_seed(decoder.seed(ContentsObject))? {
+        while let Some(value) = seq.next_element_seed(decoder.seed(ContentsElement))? {
             let contents = match value {
                 Value::Part(contents) => contents,
                 _ => {
                     decoder.note_error(Problem::InvalidContents, Field::Contents, || {
                         format!("{}: contents entry is not an object", subject)
                     });
-                    Contents::default()
+                    ContentsObject::default()
                 }
             };
             count += 1;
@@ -1729,14 +1729,14 @@ impl<'a> Part<'a> for ContentsArray {
 }
 
 /// A contents object.
-struct ContentsObject;
+struct ContentsElement;
 
-impl<'a> Part<'a> for ContentsObject {
-    type Value = Contents;
+impl<'a> Part<'a> for ContentsElement {
+    type Value = ContentsObject;
 
     fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
         let subject = decoder.subject();
-        let mut contents = Contents::default();
+        let mut contents = ContentsObject::default();
         // How many of file, url and literal the object has.
         let mut places = 0;
         let mut members = Members::new(map, &Field::CONTENTS, &mut decoder.json);
@@ -1763,7 +1763,7 @@ impl<'a> Part<'a> for ContentsObject {
                     if let Some(file) = decoder.string(field, value) {
                         match Name::new(file.as_ref()) {
                             Ok(file) => {
-                                contents.location = Location::File(file);
+                                contents.source = ContentsSource::File(file);
                                 places += 1;
                             }
                             Err(reason) => decoder.note_error(Problem::InvalidContents, field, || {
@@ -1779,8 +1779,8 @@ impl<'a> Part<'a> for ContentsObject {
                 }
                 Field::Url => {
                     if let Some(url) = decoder.string(field, value) {
-                        if decoder.note_err(Contents::check_url(&url, subject)).is_some() {
-                            contents.location = Location::Url(url.into_owned());
+                        if decoder.note_err(ContentsObject::check_url(&url, subject)).is_some() {
+                            contents.source = ContentsSource::Url(url.into_owned());
                             places += 1;
                         }
                     }
@@ -1789,7 +1789,7 @@ impl<'a> Part<'a> for ContentsObject {
                     if let Some(literal) = decoder.string(field, value) {
                         match Base64::decode(&literal) {
                             Some(literal) => {
-                                contents.location = Location::Literal(literal);
+                                contents.source = ContentsSource::Literal(literal);
                                 places += 1;
                             }
                             None => decoder.note_error(Problem::InvalidContents, field, || {
@@ -1801,7 +1801,10 @@ impl<'a> Part<'a> for ContentsObject {
                 Field::Encoding => {
                     if let Some(encoding) = decoder.string(field, value) {
                         let encoding = encoding.to_ascii_lowercase();
-                        if decoder.note_err(Contents::check_encoding(&encoding, subject)).is_some() {
+                        if decoder
+                            .note_err(ContentsObject::check_encoding(&encoding, subject))
+                            .is_some()
+                        {
                             contents.encoding = Some(encoding);
                         }
                     }
@@ -1835,7 +1838,7 @@ impl<'a> Part<'a> for ContentsObject {
 }
 
 /// `httpHeaders`: an object that maps the names of HTTP header fields to
-/// their values, see [`Contents::check_headers`].
+/// their values, see [`ContentsObject::check_headers`].
 struct HeaderFields;
 
 impl<'a> Part<'a> for HeaderFields {
@@ -1860,7 +1863,7 @@ impl<'a> Part<'a> for HeaderFields {
                 }),
             }
         }
-        decoder.note_err(Contents::check_headers(&headers, subject));
+        decoder.note_err(ContentsObject::check_headers(&headers, subject));
         Ok(Value::Part(headers))
     }
 }
@@ -1902,12 +1905,12 @@ impl<'a> Part<'a> for SignatureRecord {
     }
 }
 
-impl Signature {
+impl SignatureObject {
     /// Reads the signature object the record `text` holds, the one with the
     /// number `record_number`, which is known to be a JSON object. The
     /// signature is not verified, but a manifest whose signature objects
     /// are malformed is refused like systemd refuses it.
-    fn decode(text: &str, record_number: u64) -> Result<Signature, Error> {
+    fn decode(text: &str, record_number: u64) -> Result<SignatureObject, Error> {
         RecordDecoder::new(record_number)
             .object(text, SignatureRecord)?
             .into_signature(record_number)
@@ -1918,7 +1921,7 @@ impl Signature {
 impl SignatureMembers<'_> {
     /// The signature object of the record with the number `record_number`
     /// that has these members.
-    fn into_signature(self, record_number: u64) -> Result<Signature, Error> {
+    fn into_signature(self, record_number: u64) -> Result<SignatureObject, Error> {
         let not_a_string = |field: Field| {
             Error::manifest(
                 Problem::WrongFieldType,
@@ -1961,7 +1964,7 @@ impl SignatureMembers<'_> {
                 }
             },
         };
-        let mut signature = Signature::new(mechanism);
+        let mut signature = SignatureObject::new(mechanism);
         signature.key = key;
         signature.data = data;
         Ok(signature)
@@ -2396,13 +2399,13 @@ mod tests {
             let subject = Subject::new(object, 1);
             object.check_consistency(subject, |contents| contents.check_consistency(subject))
         };
-        let file = |size: Option<u64>, contents: Contents| {
+        let file = |size: Option<u64>, contents: ContentsObject| {
             let mut object = FileObject::new(Name::new("x").unwrap());
             object.size = size;
             object.contents = vec![contents];
             object
         };
-        let hello = || Contents::new(Location::Literal(b"hello".to_vec()));
+        let hello = || ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()));
         assert_eq!(
             check(&file(None, hello())).unwrap(),
             SizeAndHash {
@@ -2412,7 +2415,7 @@ mod tests {
         );
         let mut beyond = hello();
         beyond.offset = 7;
-        let mut headers = Contents::new(Location::File(Name::new("a").unwrap()));
+        let mut headers = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
         headers.http_headers = vec![("A".to_string(), "b".to_string())];
         let mut empty = file(Some(3), hello());
         empty.contents.clear();
@@ -2792,10 +2795,10 @@ mod tests {
                 .contents
                 .remove(0)
         };
-        assert_eq!(contents("{}"), Contents::default());
+        assert_eq!(contents("{}"), ContentsObject::default());
         assert_eq!(
             contents(r#"{"file":null,"url":null,"literal":null,"offset":null,"xHeaders":{"A":"b"}}"#),
-            Contents::default()
+            ContentsObject::default()
         );
         // The header fields of a request for a URL, sorted by nothing but
         // the manifest.

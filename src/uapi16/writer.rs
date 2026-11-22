@@ -15,8 +15,8 @@ use crate::decode::{Subject, ROOT_RECORD};
 use crate::error::{Error, Field, Problem};
 use crate::hex::Hex;
 use crate::object::{
-    Contents, FileObject, FileSystemIdentity, FilledIn, FlagSet, FlagStates, GptPartition, InodeAttributes, InodeType,
-    RootObject, Signature, Validity, ValidityWindow,
+    ContentsObject, FileObject, FileSystemIdentity, FilledIn, FlagSet, FlagStates, GptPartition, InodeAttributes,
+    InodeType, RootObject, SignatureObject, Validity, ValidityWindow,
 };
 use crate::sequence::SequenceCheck;
 use crate::{
@@ -113,7 +113,7 @@ impl Encoder {
     /// Appends the record of the signature object `signature` to `text`.
     /// No file object can follow it: it would be one the signature does
     /// not cover.
-    pub fn signature(&mut self, signature: &Signature, text: &mut String) -> Result<(), Error> {
+    pub fn signature(&mut self, signature: &SignatureObject, text: &mut String) -> Result<(), Error> {
         self.encode_signature(signature)?;
         self.append_to(text);
         Ok(())
@@ -189,7 +189,7 @@ impl Encoder {
     }
 
     /// Puts together the record of the signature object `signature`.
-    pub(crate) fn encode_signature(&mut self, signature: &Signature) -> Result<(), Error> {
+    pub(crate) fn encode_signature(&mut self, signature: &SignatureObject) -> Result<(), Error> {
         let record_number = self.next_record;
         if self.stage == Stage::Done {
             return Err(Error::data_after_trailer(record_number));
@@ -575,7 +575,7 @@ impl Fields for FileObject {
 }
 
 /// The contents objects of a file object, as `contents` has them.
-struct ContentsList<'a>(&'a [Contents]);
+struct ContentsList<'a>(&'a [ContentsObject]);
 
 impl Serialize for ContentsList<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -683,7 +683,7 @@ impl ValidityWindow {
     }
 }
 
-impl Contents {
+impl ContentsObject {
     /// Checks every string of the contents object, one of those of the
     /// file object `subject` names, in the order of the keys, for what the
     /// strings of a manifest may not hold, and its header fields for two of
@@ -719,18 +719,18 @@ impl Contents {
 
     /// Checks the contents object, one of those of the file object
     /// `subject` names, as a reader does: the value of every field, in the
-    /// order of the keys. [`Contents::check_consistency`] checks the fields
-    /// against each other.
+    /// order of the keys. [`ContentsObject::check_consistency`] checks the
+    /// fields against each other.
     fn check(&self, subject: Subject<'_>) -> Result<(), Error> {
         if let Some(encoding) = &self.encoding {
-            Contents::check_encoding(encoding, subject)?;
+            ContentsObject::check_encoding(encoding, subject)?;
         }
         // A reader checks the header fields in the order they are written.
         if !self.http_headers.is_empty() {
-            Contents::check_headers(self.sorted_headers(), subject)?;
+            ContentsObject::check_headers(self.sorted_headers(), subject)?;
         }
         match self.url() {
-            Some(url) => Contents::check_url(url, subject),
+            Some(url) => ContentsObject::check_url(url, subject),
             None => Ok(()),
         }
     }
@@ -748,7 +748,7 @@ impl Contents {
 /// filled in, the hash of no data next to the size 0, and without an
 /// encoding the encoded size and hash where the original ones say the
 /// same. A reader fills them in again.
-impl Fields for Contents {
+impl Fields for ContentsObject {
     fn filled_in(&self) -> FilledIn {
         self.filled_in
     }
@@ -796,7 +796,7 @@ impl Sha256 {
     }
 }
 
-impl Fields for Signature {
+impl Fields for SignatureObject {
     fn filled_in(&self) -> FilledIn {
         FilledIn::default()
     }
@@ -826,7 +826,7 @@ impl Fields for Trailer {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
-    use crate::object::{DosFlags, FatSerial, InodeFlags, Location, Mode, Uuid};
+    use crate::object::{ContentsSource, DosFlags, FatSerial, InodeFlags, Mode, Uuid};
     use crate::testing::{
         directory, everything, json, name, read_whole, record, recording_all, sequence, write_whole, written, Whole,
         EMPTY, HELLO, ROOT, SIGNATURE, TRAILER,
@@ -916,7 +916,7 @@ mod tests {
         // names of one hard-linked file.
         let mut link = FileObject::new(name("link"));
         link.inode_type = InodeType::Symlink;
-        link.contents = vec![Contents::new(Location::Literal(b"a.txt".to_vec()))];
+        link.contents = vec![ContentsObject::new(ContentsSource::Literal(b"a.txt".to_vec()))];
         link.inode.gid = Some(1000);
         link.inode.group_name = Some("brauner".into());
         link.size = Some(5);
@@ -1026,7 +1026,7 @@ mod tests {
             fat_serial: Some(FatSerial(0x1234_abcd)),
         };
         root.inode.mtime_nsec = Some(0);
-        let mut signature = Signature::new("pkcs7");
+        let mut signature = SignatureObject::new("pkcs7");
         signature.key = Some(vec![0xde, 0xad]);
         signature.data = Some(vec![1, 2, 3, 4]);
         let objects = [directory("a"), object.clone(), directory("dev"), device.clone()];
@@ -1035,7 +1035,7 @@ mod tests {
                 writer.file(object).unwrap();
             }
             writer.signature(&signature).unwrap();
-            writer.signature(&Signature::new("openpgp")).unwrap();
+            writer.signature(&SignatureObject::new("openpgp")).unwrap();
         });
         // No whitespace but the one in the name and in a header, and every
         // key in its place.
@@ -1157,7 +1157,7 @@ mod tests {
             object.fill_in(Features::ALL);
         }
         assert_eq!(m.objects, expected);
-        assert_eq!(m.signatures, [signature, Signature::new("openpgp")]);
+        assert_eq!(m.signatures, [signature, SignatureObject::new("openpgp")]);
         assert_eq!(read_whole(&write_whole(&m).unwrap()).unwrap(), m);
     }
 
@@ -1185,13 +1185,13 @@ mod tests {
         let e = writer.file(&FileObject::new(Name::ROOT)).unwrap_err();
         assert_eq!(kind(e), (Problem::NoName, Some(1), Some(Field::Name)));
         writer.file(&FileObject::new(name("a"))).unwrap();
-        writer.signature(&Signature::new("pkcs7")).unwrap();
+        writer.signature(&SignatureObject::new("pkcs7")).unwrap();
         let e = writer.file(&FileObject::new(name("b"))).unwrap_err();
         assert_eq!(kind(e), (Problem::FileAfterSignature, Some(3), None));
         // As for a reader, that comes before a missing name.
         let e = writer.file(&FileObject::new(Name::ROOT)).unwrap_err();
         assert_eq!(kind(e), (Problem::FileAfterSignature, Some(3), None));
-        writer.signature(&Signature::new("openpgp")).unwrap();
+        writer.signature(&SignatureObject::new("openpgp")).unwrap();
         let bytes = writer.finish().unwrap();
         let m = read_whole(&bytes).unwrap();
         assert_eq!((m.objects.len(), m.signatures.len()), (1, 2));
@@ -1406,13 +1406,13 @@ mod tests {
         let mut object = FileObject::new(name("x"));
         (object.size, object.sha256) = (Some(0), Some(empty));
         // With an encoding, that of the encoded and of the original data.
-        let mut encoded = Contents::new(Location::File(name("x.gz")));
+        let mut encoded = ContentsObject::new(ContentsSource::File(name("x.gz")));
         encoded.encoding = Some("gzip".into());
         (encoded.encoded_size, encoded.encoded_sha256) = (Some(0), Some(empty));
         (encoded.original_size, encoded.original_sha256) = (Some(0), Some(empty));
         // Without an encoding, the encoded size and hash next to the
         // original ones, which say the same.
-        let mut plain = Contents::new(Location::File(name("x")));
+        let mut plain = ContentsObject::new(ContentsSource::File(name("x")));
         (plain.encoded_size, plain.encoded_sha256) = (Some(0), Some(empty));
         (plain.original_size, plain.original_sha256) = (Some(0), Some(empty));
         object.contents = vec![encoded, plain];
@@ -1436,9 +1436,9 @@ mod tests {
         }
         // Where only the encoded size says it, it stays.
         let mut only = FileObject::new(name("y"));
-        only.contents = vec![Contents {
+        only.contents = vec![ContentsObject {
             encoded_size: Some(5),
-            ..Contents::new(Location::File(name("y")))
+            ..ContentsObject::new(ContentsSource::File(name("y")))
         }];
         assert_eq!(
             record(&only),
@@ -1501,7 +1501,7 @@ mod tests {
                     noncharacter()
                 ),
                 |o| {
-                    o.contents = vec![Contents::new(Location::Literal(vec![0; MAX_RECORD_SIZE / 4 * 3]))];
+                    o.contents = vec![ContentsObject::new(ContentsSource::Literal(vec![0; MAX_RECORD_SIZE / 4 * 3]))];
                     o.inode.user_name = Some(format!("u{}", noncharacter()).into());
                 },
                 Problem::RecordTooLarge,
@@ -1518,9 +1518,9 @@ mod tests {
                 r#"{"contents":[{"httpHeaders":{"A":"b","A":"c"},"url":"https://example.com/x"}],"name":"x","uid":65535}"#
                     .into(),
                 |o| {
-                    o.contents = vec![Contents {
+                    o.contents = vec![ContentsObject {
                         http_headers: vec![("A".into(), "b".into()), ("A".into(), "c".into())],
-                        ..Contents::new(Location::Url("https://example.com/x".into()))
+                        ..ContentsObject::new(ContentsSource::Url("https://example.com/x".into()))
                     }];
                     o.inode.uid = Some(65535);
                 },
@@ -1535,7 +1535,7 @@ mod tests {
                 ),
                 |o| {
                     o.contents = (0..=MAX_CONTENTS)
-                        .map(|_| Contents::new(Location::Literal(b"a".to_vec())))
+                        .map(|_| ContentsObject::new(ContentsSource::Literal(b"a".to_vec())))
                         .collect();
                     o.contents[0].original_size = Some(5);
                 },
@@ -1546,9 +1546,9 @@ mod tests {
             (
                 r#"{"contents":[{"file":"a","httpHeaders":{"A":"b"}}],"name":"x","uid":65535}"#.into(),
                 |o| {
-                    o.contents = vec![Contents {
+                    o.contents = vec![ContentsObject {
                         http_headers: vec![("A".into(), "b".into())],
-                        ..Contents::new(Location::File(name("a")))
+                        ..ContentsObject::new(ContentsSource::File(name("a")))
                     }];
                     o.inode.uid = Some(65535);
                 },
@@ -1623,7 +1623,7 @@ mod tests {
             (ErrorKind::Manifest(Problem::InvalidString), Some(2))
         );
         let mut writer = Writer::begin(Vec::new(), &root).unwrap();
-        writer.signature(&Signature::new("pkcs7")).unwrap();
+        writer.signature(&SignatureObject::new("pkcs7")).unwrap();
         let mut object = FileObject::new(name("x"));
         object.inode.user_name = Some(format!("u{}", noncharacter()).into());
         let w = writer.file(&object).unwrap_err();
@@ -1632,7 +1632,7 @@ mod tests {
         let e = read_whole(&sequence(&[root_text, SIGNATURE, r#"{"uid":65535}"#, TRAILER])).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::FileAfterSignature));
         let mut writer = Writer::begin(Vec::new(), &root).unwrap();
-        writer.signature(&Signature::new("pkcs7")).unwrap();
+        writer.signature(&SignatureObject::new("pkcs7")).unwrap();
         let mut nameless = FileObject::new(Name::ROOT);
         nameless.inode.uid = Some(65535);
         let w = writer.file(&nameless).unwrap_err();
@@ -1669,20 +1669,20 @@ mod tests {
         /// Gives an object a value.
         type Give = fn(&mut FileObject);
         /// Contents at a URL, with the header fields `headers`.
-        fn headers(headers: &[(&str, &str)]) -> Contents {
-            Contents {
+        fn headers(headers: &[(&str, &str)]) -> ContentsObject {
+            ContentsObject {
                 http_headers: headers
                     .iter()
                     .map(|&(name, value)| (name.into(), value.into()))
                     .collect(),
-                ..Contents::new(Location::Url("https://example.com/x".into()))
+                ..ContentsObject::new(ContentsSource::Url("https://example.com/x".into()))
             }
         }
         /// Contents in the encoding `encoding`.
-        fn encoded(encoding: &str) -> Contents {
-            Contents {
+        fn encoded(encoding: &str) -> ContentsObject {
+            ContentsObject {
                 encoding: Some(encoding.into()),
-                ..Contents::new(Location::File(name("x.gz")))
+                ..ContentsObject::new(ContentsSource::File(name("x.gz")))
             }
         }
         /// Gives `object` the extended attribute `name`, without a value.
@@ -1726,7 +1726,7 @@ mod tests {
             (|o| o.gpt = gpt("x\0"), Problem::InvalidString, Field::GptLabel),
             (|o| o.gpt = gpt("a\tb"), Problem::WrongFieldType, Field::GptLabel),
             (
-                |o| o.contents = vec![Contents::new(Location::Url("ftp://example.com/x".into()))],
+                |o| o.contents = vec![ContentsObject::new(ContentsSource::Url("ftp://example.com/x".into()))],
                 Problem::InvalidContents,
                 Field::Url,
             ),
@@ -1763,7 +1763,7 @@ mod tests {
                 Field::HttpHeaders,
             ),
             (
-                |o| o.contents = vec![Contents::default(); MAX_CONTENTS + 1],
+                |o| o.contents = vec![ContentsObject::default(); MAX_CONTENTS + 1],
                 Problem::InvalidContents,
                 Field::Contents,
             ),
@@ -1812,7 +1812,7 @@ mod tests {
         }
         // The mechanism of a signature.
         let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
-        let e = writer.signature(&Signature::new("pkcs7\u{fffe}")).unwrap_err();
+        let e = writer.signature(&SignatureObject::new("pkcs7\u{fffe}")).unwrap_err();
         assert_eq!(
             (e.kind(), e.field(), e.record_number()),
             (
@@ -1850,8 +1850,8 @@ mod tests {
             }))
         }
         /// Contents in the file "x".
-        fn file() -> Contents {
-            Contents::new(Location::File(name("x")))
+        fn file() -> ContentsObject {
+            ContentsObject::new(ContentsSource::File(name("x")))
         }
         let cases: [(Give, Problem, Option<Field>); 17] = [
             // Fields the inode type does not permit.
@@ -1939,7 +1939,7 @@ mod tests {
             // httpHeaders without a URL, and a part beyond the data.
             (
                 |o| {
-                    o.contents = vec![Contents {
+                    o.contents = vec![ContentsObject {
                         http_headers: vec![("A".into(), "b".into())],
                         ..file()
                     }];
@@ -1950,7 +1950,7 @@ mod tests {
             (
                 |o| {
                     o.size = Some(5);
-                    o.contents = vec![Contents {
+                    o.contents = vec![ContentsObject {
                         original_size: Some(6),
                         offset: 2,
                         ..file()
@@ -1985,7 +1985,7 @@ mod tests {
         let whole = Whole {
             root: root.clone(),
             objects: vec![directory("a"), everything()],
-            signatures: vec![Signature::new("pkcs7")],
+            signatures: vec![SignatureObject::new("pkcs7")],
         };
         let mut text = String::new();
         let mut encoder = Encoder::begin(&root, &mut text).unwrap();
@@ -2011,7 +2011,9 @@ mod tests {
         for e in [
             encoder.file(&FileObject::new(name("z")), &mut text).unwrap_err(),
             encoder.file(&FileObject::new(Name::ROOT), &mut text).unwrap_err(),
-            encoder.signature(&Signature::new("pkcs7"), &mut text).unwrap_err(),
+            encoder
+                .signature(&SignatureObject::new("pkcs7"), &mut text)
+                .unwrap_err(),
             encoder.finish(&mut text).unwrap_err(),
         ] {
             assert_eq!(

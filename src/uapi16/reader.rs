@@ -6,7 +6,7 @@ use std::io::{self, BufRead};
 
 use crate::decode::{DecodedObject, RecordDecoder, ROOT_RECORD};
 use crate::error::{Error, Problem};
-use crate::object::{FileObject, RootObject, Signature};
+use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::sequence::SequenceCheck;
 use crate::strict::is_whitespace;
 use crate::{MAX_RECORD_SIZE, RECORD_END, RECORD_SEPARATOR};
@@ -232,7 +232,7 @@ pub enum Object {
     /// A file object.
     File(Box<FileObject>),
     /// A signature object. It comes after the last file object.
-    Signature(Signature),
+    Signature(SignatureObject),
 }
 
 /// How far a decoder has got in the manifest.

@@ -158,7 +158,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::testing::full_tree_names;
-    use crate::{Contents, DosFlags, FatSerial, InodeFlags, Location, Mode, Name, Uuid};
+    use crate::{ContentsObject, ContentsSource, DosFlags, FatSerial, InodeFlags, Mode, Name, Uuid};
     use std::num::NonZeroU64;
 
     /// Gives an object a field.
@@ -351,7 +351,7 @@ mod tests {
             ),
             (
                 InodeType::Symlink,
-                |o| o.contents = vec![Contents::new(Location::Literal(b"t".to_vec()))],
+                |o| o.contents = vec![ContentsObject::new(ContentsSource::Literal(b"t".to_vec()))],
                 Field::Contents,
             ),
         ];

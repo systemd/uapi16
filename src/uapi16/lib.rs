@@ -19,14 +19,14 @@
 //!   checks it the way the reader does. [`Encoder`] does the same into a
 //!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
 //!   while it is read, and [`Sha256Context::finalize`] returns it.
-//! - [`RootObject`], [`FileObject`], [`Contents`] and [`Signature`] are the
-//!   objects, and [`Name`], [`InodeType`], [`Mode`], [`DosFlags`],
-//!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
-//!   the root file object and a file object both have is in
-//!   [`InodeAttributes`] and [`ValidityWindow`].
-//! - [`ContentSource`] is where the data of the files comes from when a
-//!   manifest is applied: [`DirectorySource`] for the files next to the
-//!   manifest and [`StreamSource`] for one stream with all of them.
+//! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
+//!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
+//!   [`Mode`], [`DosFlags`], [`InodeFlags`], [`Sha256`] and [`Uuid`] what
+//!   their fields hold. What the root file object and a file object both
+//!   have is in [`InodeAttributes`] and [`ValidityWindow`].
+//! - [`DataProvider`] is where the data of the files comes from when a
+//!   manifest is applied: [`DirectoryProvider`] for the files next to the
+//!   manifest and [`StreamProvider`] for one stream with all of them.
 //!   [`FileObject::copy_data`] copies the data of a file and checks it
 //!   against the manifest with a [`DataCheck`].
 //!
@@ -105,16 +105,16 @@ mod writer;
 
 pub use blocking::{Reader, Writer};
 pub use content::{
-    ContentSource, DataCheck, DataLocation, Directory, DirectorySource, ExternalFile, OpenError, StreamSource,
+    DataCheck, DataLocation, DataProvider, Directory, DirectoryProvider, ExternalFile, OpenError, StreamProvider,
 };
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
 pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};
 pub use object::{
-    Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates, GptPartition, InodeAttributes,
-    InodeFlags, InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Location, Mode, RootObject, Signature,
-    UnknownInodeType, Uuid, Validity, ValidityWindow,
+    ContentsObject, ContentsSource, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates,
+    GptPartition, InodeAttributes, InodeFlags, InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject,
+    SignatureObject, UnknownInodeType, Uuid, Validity, ValidityWindow,
 };
 pub use reader::{Decoder, Object, Step};
 pub use writer::Encoder;
@@ -155,8 +155,9 @@ pub(crate) const STRING_RULES: strict::StringRules =
 pub(crate) mod testing {
     use super::blocking::READ_SIZE;
     use super::{
-        Contents, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType, Location, Mode, Name,
-        Object, Reader, RootObject, Sha256, Signature, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
+        ContentsObject, ContentsSource, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType,
+        Mode, Name, Object, Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END,
+        RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
     use serde_core::de::DeserializeSeed;
@@ -203,7 +204,7 @@ pub(crate) mod testing {
     pub(crate) struct Whole {
         pub(crate) root: RootObject,
         pub(crate) objects: Vec<FileObject>,
-        pub(crate) signatures: Vec<Signature>,
+        pub(crate) signatures: Vec<SignatureObject>,
     }
 
     /// How many arrays and objects serde_json reads inside each other.
@@ -347,7 +348,7 @@ pub(crate) mod testing {
             bytes[Uuid::SIZE - 1] = last;
             Uuid::new(bytes)
         };
-        let mut encoded = Contents::new(Location::File(name("blob.gz")));
+        let mut encoded = ContentsObject::new(ContentsSource::File(name("blob.gz")));
         encoded.encoding = Some("gzip".into());
         encoded.encoded_size = Some(3);
         encoded.encoded_sha256 = Some(Sha256::digest(b"gz"));
@@ -392,15 +393,15 @@ pub(crate) mod testing {
         object.inode.read_only = Some(true);
         object.contents = vec![
             encoded,
-            Contents {
+            ContentsObject {
                 http_headers: vec![
                     ("X-Foo".into(), "bar".into()),
                     ("Authorization".into(), "Bearer x".into()),
                 ],
-                ..Contents::new(Location::Url("https://example.com/blob".into()))
+                ..ContentsObject::new(ContentsSource::Url("https://example.com/blob".into()))
             },
-            Contents::new(Location::Literal(b"hello".to_vec())),
-            Contents::default(),
+            ContentsObject::new(ContentsSource::Literal(b"hello".to_vec())),
+            ContentsObject::default(),
         ];
         object.sha256 = HELLO.parse().ok();
         object.validity.since_usec = 6;

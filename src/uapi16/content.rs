@@ -9,13 +9,13 @@ use std::ops::Range;
 
 use crate::digest::Sha256Context;
 use crate::error::{DataProblem, Error, ErrorKind, Field, SourceProblem, UnsupportedData};
-use crate::object::{Contents, FileObject, InodeType, Location};
+use crate::object::{ContentsObject, ContentsSource, FileObject, InodeType};
 use crate::{Name, Sha256};
 
-/// How much a source copies at a time. It is also the smallest piece a
+/// How much a provider copies at a time. It is also the smallest piece a
 /// file is hashed in.
 const COPY_SIZE: usize = 1024 * 1024;
-/// How many bytes the hashes a [`DirectorySource`] keeps of the pieces of
+/// How many bytes the hashes a [`DirectoryProvider`] keeps of the pieces of
 /// files take at most: 32 bytes for every piece of a file, and what the
 /// file takes besides, see [`PieceHashes::stored_bytes`]. The map that
 /// holds them adds up to about half a MiB, with many small files, which
@@ -36,7 +36,7 @@ const MAX_PIECES: u64 = ((PIECE_HASH_BYTES - FILE_ENTRY_BYTES) / size_of::<Sha25
 pub enum DataLocation<'a> {
     /// In the manifest itself. This is the data.
     Literal(&'a [u8]),
-    /// Outside of the manifest. A [`ContentSource`] has it.
+    /// Outside of the manifest. A [`DataProvider`] has it.
     External(ExternalFile<'a>),
 }
 
@@ -70,7 +70,7 @@ enum DataExtent {
 impl<'a> ExternalFile<'a> {
     /// The file `name` an object has its data in, by way of the contents
     /// object `contents` if one names it.
-    fn new(name: &'a Name, contents: Option<&'a Contents>) -> ExternalFile<'a> {
+    fn new(name: &'a Name, contents: Option<&'a ContentsObject>) -> ExternalFile<'a> {
         ExternalFile {
             name,
             offset: contents.map_or(0, |contents| contents.offset),
@@ -208,25 +208,25 @@ impl FileObject {
     /// literal, else in the file of the first contents object that names
     /// one. The specification implies a contents object for a regular file
     /// that has none, with the file of its own name.
-    fn unencoded_data(&self) -> Option<(DataLocation<'_>, Option<&Contents>)> {
+    fn unencoded_data(&self) -> Option<(DataLocation<'_>, Option<&ContentsObject>)> {
         if self.contents.is_empty() {
             let implied = DataLocation::External(ExternalFile::new(&self.name, None));
             return (self.inode_type == InodeType::Regular).then_some((implied, None));
         }
         let mut file = None;
         for contents in self.contents.iter().filter(|contents| contents.encoding.is_none()) {
-            match &contents.location {
-                Location::Literal(literal) => {
+            match &contents.source {
+                ContentsSource::Literal(literal) => {
                     let data = self.data_in_literal(literal, contents.offset);
                     return Some((DataLocation::Literal(data), Some(contents)));
                 }
-                Location::File(name) => {
+                ContentsSource::File(name) => {
                     file.get_or_insert((name, contents));
                 }
-                Location::Implied => {
+                ContentsSource::Implied => {
                     file.get_or_insert((&self.name, contents));
                 }
-                Location::Url(_) => {}
+                ContentsSource::Url(_) => {}
             }
         }
         file.map(|(name, contents)| {
@@ -250,7 +250,7 @@ impl FileObject {
     }
 
     /// Whether the data of the file is outside of the manifest, where a
-    /// [`ContentSource`] has it.
+    /// [`DataProvider`] has it.
     pub fn has_external_data(&self) -> bool {
         matches!(self.unencoded_data(), Some((DataLocation::External(_), _)))
     }
@@ -271,15 +271,15 @@ impl FileObject {
     }
 
     /// Writes the data of the file to `sink`: the literal of the manifest,
-    /// or what `source` has. Checks the data against the size and the hash
+    /// or what `provider` has. Checks the data against the size and the hash
     /// the object gives with a [`DataCheck`], and returns how many bytes
     /// it is. An object whose data this crate cannot take fails as
-    /// [`FileObject::data_location`] does, and the source is not asked for
+    /// [`FileObject::data_location`] does, and the provider is not asked for
     /// it. An error of the sink comes back as it was.
     ///
     /// What was written to the sink when this fails is not the data of
     /// the file.
-    pub fn copy_data(&self, source: &mut dyn ContentSource, sink: &mut dyn Write) -> Result<u64, Error> {
+    pub fn copy_data(&self, provider: &mut dyn DataProvider, sink: &mut dyn Write) -> Result<u64, Error> {
         let (data, contents) = self.unencoded_data().ok_or_else(|| self.unsupported())?;
         let mut checked = CheckedSink {
             sink,
@@ -290,11 +290,11 @@ impl FileObject {
             DataLocation::Literal(data) => contents
                 .map_or(Ok(()), |contents| contents.check_literal(self, data))
                 .and_then(|()| checked.write_all(data).map_err(Error::from)),
-            DataLocation::External(file) => source.copy(self, &file, &mut checked),
+            DataLocation::External(file) => provider.copy(self, &file, &mut checked),
         };
         let CheckedSink { check, failure, .. } = checked;
         // What the check refused and what the sink failed to take reached
-        // the source as I/O errors. These are the errors to report.
+        // the provider as I/O errors. These are the errors to report.
         if let Some(failure) = failure {
             return Err(failure);
         }
@@ -303,7 +303,7 @@ impl FileObject {
     }
 }
 
-impl Contents {
+impl ContentsObject {
     /// Checks the literal of the contents object, which `data`, the data
     /// of `object`, is all of or a part of, against the hash the manifest
     /// gives for all of it, where the data is to be checked against that.
@@ -337,7 +337,7 @@ impl Contents {
 /// It checks what the object says of its data, the check the
 /// specification has for the data of every file. What its contents
 /// objects say of the files the data is in, their sizes and hashes, is
-/// for whoever reads those files to check, such as a [`DirectorySource`].
+/// for whoever reads those files to check, such as a [`DirectoryProvider`].
 ///
 /// [`FileObject::copy_data`] checks what it copies with one. A caller
 /// that moves the data itself, such as a copy in an async runtime, hands
@@ -470,28 +470,28 @@ impl Write for CheckedSink<'_, '_> {
 /// Has the data of the file objects whose data is outside of the
 /// manifest.
 ///
-/// [`DirectorySource`] takes it from the files next to the manifest and
-/// [`StreamSource`] from one stream that carries it all, in the order of
-/// the manifest. A consumer hands a source every file object, in the
+/// [`DirectoryProvider`] takes it from the files next to the manifest and
+/// [`StreamProvider`] from one stream that carries it all, in the order of
+/// the manifest. A consumer hands a provider every file object, in the
 /// order of the manifest: those whose data it takes to
-/// [`FileObject::copy_data`], which calls [`ContentSource::copy`], and
-/// the others to [`ContentSource::skip`]. After the last one it calls
-/// [`ContentSource::end`].
-pub trait ContentSource {
+/// [`FileObject::copy_data`], which calls [`DataProvider::copy`], and
+/// the others to [`DataProvider::skip`]. After the last one it calls
+/// [`DataProvider::end`].
+pub trait DataProvider {
     /// Writes the data of `object`, which is in `file`, to `sink`: exactly
     /// `object.size` bytes when the object has a size. An error of the sink
-    /// comes back as it was, and one of the source names the object.
+    /// comes back as it was, and one of the provider names the object.
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error>;
 
     /// Passes over the data of `object`, which the consumer does not take.
-    /// A source that hands out the data in the order of the manifest reads
+    /// A provider that hands out the data in the order of the manifest reads
     /// past it, and fails where a copy of it would.
     fn skip(&mut self, _object: &FileObject) -> Result<(), Error> {
         Ok(())
     }
 
     /// Called after the last file object of the manifest, whether the
-    /// source had the data of any or not. A source that has data the file
+    /// provider had the data of any or not. A provider that has data the file
     /// objects do not account for fails here.
     fn end(&mut self) -> Result<(), Error> {
         Ok(())
@@ -547,7 +547,7 @@ pub trait Directory {
 /// that one, as every object is, and the specification lets a consumer
 /// that takes a part of a file skip the checks of all of it. So only a
 /// part without a hash of its own is checked against the hash of the whole
-/// file. The source reads the file whole for the first of these parts and
+/// file. The provider reads the file whole for the first of these parts and
 /// keeps the hash of every piece of it, if they fit into what is left of
 /// the 1 MiB the hashes it keeps take at most. The parts after that are
 /// checked against those, and only the pieces they are in are read. A
@@ -555,10 +555,10 @@ pub trait Directory {
 /// the hashes of a file of any size fit into 1 MiB, and those of a file of
 /// about 32 GiB or more take all of it. A part of a file whose hashes do
 /// not fit is not checked against the hash of the whole file, as the
-/// specification allows. So the memory the source takes does not grow
+/// specification allows. So the memory the provider takes does not grow
 /// with the manifest, and while copies succeed, a file of more than one
 /// piece is read whole once at most for its parts.
-pub struct DirectorySource<D> {
+pub struct DirectoryProvider<D> {
     directory: D,
     /// What a copy goes through, made when the first file is copied.
     buffer: Vec<u8>,
@@ -566,10 +566,10 @@ pub struct DirectorySource<D> {
     hashes: PieceHashes,
 }
 
-impl<D: Directory> DirectorySource<D> {
-    /// A source that takes the files from `directory`.
-    pub fn new(directory: D) -> DirectorySource<D> {
-        DirectorySource {
+impl<D: Directory> DirectoryProvider<D> {
+    /// A provider that takes the files from `directory`.
+    pub fn new(directory: D) -> DirectoryProvider<D> {
+        DirectoryProvider {
             directory,
             buffer: Vec::new(),
             hashes: PieceHashes::default(),
@@ -577,9 +577,9 @@ impl<D: Directory> DirectorySource<D> {
     }
 }
 
-impl<D: fmt::Debug> fmt::Debug for DirectorySource<D> {
+impl<D: fmt::Debug> fmt::Debug for DirectoryProvider<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DirectorySource")
+        f.debug_struct("DirectoryProvider")
             .field("directory", &self.directory)
             .field(
                 "buffer",
@@ -590,7 +590,7 @@ impl<D: fmt::Debug> fmt::Debug for DirectorySource<D> {
     }
 }
 
-/// The files a [`DirectorySource`] read whole for a part of them, which
+/// The files a [`DirectoryProvider`] read whole for a part of them, which
 /// have the hash the manifest gives for them, with the hash of every piece
 /// of each. A file is known by its hash and its length: a part of it is
 /// checked against the hashes of the pieces of the file of that hash,
@@ -750,7 +750,7 @@ trait ReadSome: Read {
 
 impl<R: Read + ?Sized> ReadSome for R {}
 
-/// A file a [`DirectorySource`] copies the data of an object from, in
+/// A file a [`DirectoryProvider`] copies the data of an object from, in
 /// pieces where it checks them.
 struct Pieces<'a, F> {
     file: F,
@@ -886,7 +886,7 @@ impl<F: Read + Seek> Pieces<'_, F> {
     }
 }
 
-impl<D: Directory> ContentSource for DirectorySource<D> {
+impl<D: Directory> DataProvider for DirectoryProvider<D> {
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
         let (opened, len) = self
             .directory
@@ -949,7 +949,7 @@ impl<D: Directory> ContentSource for DirectorySource<D> {
 /// that is the size of the object. A part of a file is checked against the
 /// hash of its object, and is taken unchecked where the object gives none,
 /// as the specification permits a consumer that takes a part of a file.
-pub struct StreamSource<R> {
+pub struct StreamProvider<R> {
     reader: R,
     /// What a copy goes through, made when the first file is copied.
     buffer: Vec<u8>,
@@ -959,10 +959,10 @@ pub struct StreamSource<R> {
     last: Option<(String, u64)>,
 }
 
-impl<R: Read> StreamSource<R> {
-    /// A source that takes the data from `reader`.
-    pub fn new(reader: R) -> StreamSource<R> {
-        StreamSource {
+impl<R: Read> StreamProvider<R> {
+    /// A provider that takes the data from `reader`.
+    pub fn new(reader: R) -> StreamProvider<R> {
+        StreamProvider {
             reader,
             buffer: Vec::new(),
             last: None,
@@ -979,9 +979,9 @@ impl<R: Read> StreamSource<R> {
     }
 }
 
-impl<R: fmt::Debug> fmt::Debug for StreamSource<R> {
+impl<R: fmt::Debug> fmt::Debug for StreamProvider<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamSource")
+        f.debug_struct("StreamProvider")
             .field("reader", &self.reader)
             .field(
                 "buffer",
@@ -992,7 +992,7 @@ impl<R: fmt::Debug> fmt::Debug for StreamSource<R> {
     }
 }
 
-impl<R: Read> ContentSource for StreamSource<R> {
+impl<R: Read> DataProvider for StreamProvider<R> {
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
         let name = &object.name;
         if file.offset != 0 {
@@ -1197,8 +1197,8 @@ mod tests {
         }
     }
 
-    /// A source over a reference to the files, so that a test can look
-    /// at them and change them while the source has them.
+    /// A provider over a reference to the files, so that a test can look
+    /// at them and change them while the provider has them.
     impl Directory for &Files {
         type File = Counted;
 
@@ -1249,10 +1249,10 @@ mod tests {
         objects(&records).pop().unwrap()
     }
 
-    /// Copies the data of `object` from `source`.
-    fn copy(object: &FileObject, source: &mut dyn ContentSource) -> Result<Vec<u8>, Error> {
+    /// Copies the data of `object` from `provider`.
+    fn copy(object: &FileObject, provider: &mut dyn DataProvider) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
-        let written = object.copy_data(source, &mut out)?;
+        let written = object.copy_data(provider, &mut out)?;
         assert_eq!(written, out.len() as u64);
         Ok(out)
     }
@@ -1359,7 +1359,7 @@ mod tests {
 
     /// Only a regular file has a contents object implied. Any other object
     /// without one has no data, and a copy of it fails without a look at
-    /// the source.
+    /// the provider.
     #[test]
     fn objects_without_data() {
         // A manifest that does not record the targets of symbolic links.
@@ -1375,7 +1375,7 @@ mod tests {
         .unwrap()
         .objects;
         let mut stream = &b"hello"[..];
-        let mut source = StreamSource::new(&mut stream);
+        let mut provider = StreamProvider::new(&mut stream);
         for (o, kind) in none.iter().zip(["dir", "fifo", "lnk"]) {
             let e = o.data_location().unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::Absent));
@@ -1385,12 +1385,12 @@ mod tests {
                 format!("'{}' is a {} without contents objects, which has no data", o.name, kind)
             );
             assert!(!o.has_external_data());
-            let e = copy(o, &mut source).unwrap_err();
+            let e = copy(o, &mut provider).unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::Absent));
-            source.skip(o).unwrap();
+            provider.skip(o).unwrap();
         }
-        assert_eq!(copy(&none[3], &mut source).unwrap(), b"hello");
-        source.end().unwrap();
+        assert_eq!(copy(&none[3], &mut provider).unwrap(), b"hello");
+        provider.end().unwrap();
         // A symbolic link with its target in the manifest, and a directory
         // that refers to a manifest of its own in a file.
         let some = objects(&[
@@ -1400,15 +1400,15 @@ mod tests {
         assert!(some[0].has_external_data());
         assert_eq!(some[1].data_location().unwrap(), DataLocation::Literal(b"x"));
         let files = Files::of(&[("d.Uapi16Manifest", b"abc")]);
-        let mut source = DirectorySource::new(&files);
-        assert_eq!(copy(&some[0], &mut source).unwrap(), b"abc");
-        assert_eq!(copy(&some[1], &mut source).unwrap(), b"x");
+        let mut provider = DirectoryProvider::new(&files);
+        assert_eq!(copy(&some[0], &mut provider).unwrap(), b"abc");
+        assert_eq!(copy(&some[1], &mut provider).unwrap(), b"x");
     }
 
     #[test]
     fn copies_from_a_directory() {
         let files = Files::of(&[("a", b"hello world"), ("empty", b""), ("dir/b", b"hello")]);
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         for (record, data) in [
             // A whole file, by the name of the object and by a file external.
             (format!(r#"{{"name":"dir/b","size":5,"sha256":"{}"}}"#, HELLO), "hello"),
@@ -1462,21 +1462,21 @@ mod tests {
                 ),
                 "world",
             ),
-            // A literal needs no source.
+            // A literal needs no provider.
             (
                 r#"{"name":"missing","contents":[{"literal":"aGVsbG8="}]}"#.to_string(),
                 "hello",
             ),
         ] {
             let o = object(&record);
-            assert_eq!(copy(&o, &mut source).unwrap(), data.as_bytes(), "{}", record);
+            assert_eq!(copy(&o, &mut provider).unwrap(), data.as_bytes(), "{}", record);
         }
     }
 
     #[test]
     fn files_that_are_not_what_the_manifest_says() {
         let files = Files::of(&[("a", b"hello world"), ("dir/b", b"hello")]);
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         let size = ErrorKind::Data(DataProblem::SizeMismatch);
         let hash = ErrorKind::Data(DataProblem::HashMismatch);
         for (record, expected) in [
@@ -1565,7 +1565,7 @@ mod tests {
             ),
         ] {
             let o = object(&record);
-            let e = copy(&o, &mut source).unwrap_err();
+            let e = copy(&o, &mut provider).unwrap_err();
             let (kind, name, found, expected_size, text) = expected;
             assert_eq!(
                 facts(&e),
@@ -1581,7 +1581,7 @@ mod tests {
             r#"{{"name":"x","size":5,"sha256":"{}","contents":[{{"file":"a","originalSize":11,"originalSha256":"{}"}}]}}"#,
             HELLO, WORLD
         ));
-        assert_eq!(copy(&o, &mut source).unwrap(), b"hello");
+        assert_eq!(copy(&o, &mut provider).unwrap(), b"hello");
         assert_eq!(files.read(), 5);
         // A part of a literal is held against the hash of all of the
         // literal the manifest gives, as a part of a file is, unless the
@@ -1597,9 +1597,9 @@ mod tests {
             ),
         ] {
             let o = object(&format!(r#"{}"{}"}}]}}"#, record, HELLO));
-            assert_eq!(copy(&o, &mut source).unwrap(), data.as_bytes());
+            assert_eq!(copy(&o, &mut provider).unwrap(), data.as_bytes());
             let o = object(&format!(r#"{}"{}"}}]}}"#, record, WORLD));
-            let e = copy(&o, &mut source).unwrap_err();
+            let e = copy(&o, &mut provider).unwrap_err();
             assert_eq!(
                 facts(&e),
                 (
@@ -1616,15 +1616,15 @@ mod tests {
             Sha256::digest(b"he"),
             WORLD
         ));
-        assert_eq!(copy(&o, &mut source).unwrap(), b"he");
+        assert_eq!(copy(&o, &mut provider).unwrap(), b"he");
         // A literal that is not what the object says.
         let o = object(
             r#"{"name":"x","size":5,"contents":[{"literal":"aGVsbG8="}],"sha256":"486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"}"#,
         );
-        assert_eq!(copy(&o, &mut source).unwrap_err().kind(), hash);
+        assert_eq!(copy(&o, &mut provider).unwrap_err().kind(), hash);
         let mut o = object(r#"{"name":"x","contents":[{"literal":"aGVsbG8="}]}"#);
         o.size = Some(6);
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(
             facts(&e),
             (
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn files_that_change_while_they_are_read() {
         let files = Files::default();
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         let changed = |file: &str| {
             (
                 ErrorKind::Data(DataProblem::SourceChanged),
@@ -1665,7 +1665,7 @@ mod tests {
                     len: 5,
                 },
             );
-            let e = copy(&object(&part), &mut source).unwrap_err();
+            let e = copy(&object(&part), &mut provider).unwrap_err();
             assert_eq!(facts(&e), changed("g"));
             assert_eq!(files.read(), read);
         }
@@ -1685,15 +1685,15 @@ mod tests {
             len,
             Sha256::digest(&blob[..len])
         ));
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(facts(&e), changed("p"));
         assert_eq!(files.read(), len as u64 + 1);
-        assert!(source.hashes.files.is_empty());
+        assert!(provider.hashes.files.is_empty());
         // Once it is as long as it was, it is taken.
         files.put("p", Entry::File(blob[..len].into()));
-        assert_eq!(copy(&o, &mut source).unwrap(), &blob[1..4]);
+        assert_eq!(copy(&o, &mut provider).unwrap(), &blob[1..4]);
         assert_eq!(files.read(), len as u64);
-        assert_eq!(source.hashes.files.len(), 1);
+        assert_eq!(provider.hashes.files.len(), 1);
         // The data of an object that is checked against its own hash only
         // is taken from a file that grew.
         files.put(
@@ -1707,7 +1707,7 @@ mod tests {
             r#"{{"name":"x","size":5,"sha256":"{}","contents":[{{"file":"g"}}]}}"#,
             HELLO
         ));
-        assert_eq!(copy(&o, &mut source).unwrap(), b"hello");
+        assert_eq!(copy(&o, &mut provider).unwrap(), b"hello");
         assert_eq!(files.read(), 5);
         // A file that is shorter than when it was opened, for an object
         // that says nothing about its size or its hash and for one that
@@ -1723,7 +1723,7 @@ mod tests {
             r#"{"name":"x","contents":[{"file":"g"}]}"#,
             r#"{"name":"x","size":5,"contents":[{"file":"g"}]}"#,
         ] {
-            let e = copy(&object(record), &mut source).unwrap_err();
+            let e = copy(&object(record), &mut provider).unwrap_err();
             assert_eq!(facts(&e), changed("g"), "{}", record);
             assert_eq!(files.read(), 3);
         }
@@ -1745,7 +1745,7 @@ mod tests {
             trouble: Trouble::Stall,
         };
         let files = Files::default();
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         let changed = (
             ErrorKind::Data(DataProblem::SourceChanged),
             Some("x"),
@@ -1774,17 +1774,17 @@ mod tests {
             (object(r#"{"name":"x","contents":[{"file":"blob","offset":1}]}"#), 1),
         ] {
             files.put("blob", stalling());
-            let e = copy(&o, &mut source).unwrap_err();
+            let e = copy(&o, &mut provider).unwrap_err();
             assert_eq!(facts(&e), changed, "{:?}", o);
             assert_eq!(files.read(), (at - from) as u64, "{:?}", o);
-            assert!(source.hashes.files.is_empty());
+            assert!(provider.hashes.files.is_empty());
         }
         // A part checked against the hashes of the pieces of the file.
         files.put("blob", Entry::File(Rc::clone(&blob)));
-        assert_eq!(copy(&part(5, 10), &mut source).unwrap(), &blob[5..15]);
+        assert_eq!(copy(&part(5, 10), &mut provider).unwrap(), &blob[5..15]);
         assert_eq!(files.read(), len as u64);
         files.put("blob", stalling());
-        let e = copy(&part(COPY_SIZE + 7, 10), &mut source).unwrap_err();
+        let e = copy(&part(COPY_SIZE + 7, 10), &mut provider).unwrap_err();
         assert_eq!(facts(&e), changed);
         assert_eq!(files.read(), (at - COPY_SIZE) as u64);
     }
@@ -1804,9 +1804,9 @@ mod tests {
                 trouble: Trouble::FailRead(libc::EIO),
             },
         );
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         let o = object(r#"{"name":"x","size":11,"contents":[{"file":"bad"}]}"#);
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(
             (e.kind(), e.name(), e.to_string()),
             (
@@ -1824,7 +1824,7 @@ mod tests {
             }
         }
         let o = object(r#"{"name":"x","size":5}"#);
-        let e = copy(&o, &mut StreamSource::new(Failing)).unwrap_err();
+        let e = copy(&o, &mut StreamProvider::new(Failing)).unwrap_err();
         assert_eq!(
             (e.kind(), e.name(), e.to_string()),
             (
@@ -1834,7 +1834,7 @@ mod tests {
             )
         );
         assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::EIO));
-        let e = StreamSource::new(Failing).end().unwrap_err();
+        let e = StreamProvider::new(Failing).end().unwrap_err();
         assert_eq!(
             (e.kind(), e.name(), e.to_string()),
             (
@@ -1853,7 +1853,7 @@ mod tests {
         };
         files.put("blob", unseekable());
         let o = object(r#"{"name":"x","size":3,"contents":[{"file":"blob","offset":2}]}"#);
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(
             (e.kind(), e.name(), e.to_string()),
             (
@@ -1871,9 +1871,9 @@ mod tests {
             ))
         };
         files.put("blob", Entry::File(Rc::clone(&blob)));
-        assert_eq!(copy(&part(0), &mut source).unwrap(), &blob[..3]);
+        assert_eq!(copy(&part(0), &mut provider).unwrap(), &blob[..3]);
         files.put("blob", unseekable());
-        let e = copy(&part(COPY_SIZE + 1), &mut source).unwrap_err();
+        let e = copy(&part(COPY_SIZE + 1), &mut provider).unwrap_err();
         assert_eq!(
             (e.kind(), e.to_string()),
             (
@@ -1891,7 +1891,7 @@ mod tests {
         let whole = Sha256::digest(&blob);
         let files = Files::default();
         files.put("blob", Entry::File(blob[..].into()));
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         let part = |offset: usize, size: usize, total: usize, sha256: Option<Sha256>| {
             let sha256 = sha256.map(|sha256| format!(r#","originalSha256":"{}""#, sha256));
             object(&format!(
@@ -1918,7 +1918,7 @@ mod tests {
         // Without the hash of the file a part is all that is read.
         for (offset, size) in parts {
             let o = part(offset, size, len, None);
-            assert_eq!(copy(&o, &mut source).unwrap(), &blob[offset..offset + size]);
+            assert_eq!(copy(&o, &mut provider).unwrap(), &blob[offset..offset + size]);
             assert_eq!(files.read(), size as u64);
         }
         // With it the file is read whole for the first part. For the
@@ -1929,7 +1929,7 @@ mod tests {
         let mut first = true;
         for (offset, size) in parts {
             let o = part(offset, size, len, Some(whole));
-            assert_eq!(copy(&o, &mut source).unwrap(), &blob[offset..offset + size]);
+            assert_eq!(copy(&o, &mut provider).unwrap(), &blob[offset..offset + size]);
             let from = offset / COPY_SIZE * COPY_SIZE;
             let to = (offset + size).next_multiple_of(COPY_SIZE).min(len);
             let read = match (size, first) {
@@ -1942,7 +1942,7 @@ mod tests {
         }
         // Another hash for the same file is not taken on trust.
         let o = part(5, 10, len, Some(Sha256::digest(b"another file")));
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(
             facts(&e),
             (
@@ -1970,7 +1970,7 @@ mod tests {
             (1, len - 1, false),
             (0, len, false),
         ] {
-            let copied = copy(&part(offset, size, len, Some(whole)), &mut source);
+            let copied = copy(&part(offset, size, len, Some(whole)), &mut provider);
             match copied {
                 Ok(data) => assert!(good && data == changed[offset..offset + size], "{} at {}", size, offset),
                 Err(e) => assert!(!good && e.kind() == hash, "{} at {}: {}", size, offset, e),
@@ -1978,13 +1978,13 @@ mod tests {
         }
         files.read();
         files.put("blob", Entry::File(blob[..len - 1].into()));
-        let e = copy(&part(5, 10, len - 1, Some(whole)), &mut source).unwrap_err();
+        let e = copy(&part(5, 10, len - 1, Some(whole)), &mut provider).unwrap_err();
         assert_eq!(e.kind(), hash);
         assert_eq!(files.read(), len as u64 - 1);
         let shorter = Sha256::digest(&blob[..len - 1]);
         for _ in 0..2 {
             let o = part(len - 11, 10, len - 1, Some(shorter));
-            assert_eq!(copy(&o, &mut source).unwrap(), &blob[len - 11..len - 1]);
+            assert_eq!(copy(&o, &mut provider).unwrap(), &blob[len - 11..len - 1]);
         }
         assert_eq!(files.read(), (len - 1 + COPY_SIZE / 2 - 1) as u64);
         // A file that is one object is read once, hash or no hash.
@@ -1997,9 +1997,9 @@ mod tests {
                 HELLO
             ),
         ] {
-            let mut source = DirectorySource::new(&small);
+            let mut provider = DirectoryProvider::new(&small);
             for _ in 0..2 {
-                assert_eq!(copy(&object(&record), &mut source).unwrap(), b"hello", "{}", record);
+                assert_eq!(copy(&object(&record), &mut provider).unwrap(), b"hello", "{}", record);
                 assert_eq!(small.read(), 5);
             }
         }
@@ -2077,14 +2077,14 @@ mod tests {
         }
     }
 
-    /// What a source keeps of the files it read whole does not grow with
+    /// What a provider keeps of the files it read whole does not grow with
     /// the manifest, and what it decides to keep it keeps.
     #[test]
     fn keeps_hashes_up_to_the_bound() {
         let mib = COPY_SIZE as u64;
         // A file is cut into pieces of 1 MiB, and of more where it would
         // have more than MAX_PIECES of them. The hashes of the pieces of a
-        // file of any length fit into what a source keeps.
+        // file of any length fit into what a provider keeps.
         assert_eq!(PieceHashes::piece_size(MAX_PIECES * mib), mib);
         assert_eq!(PieceHashes::piece_size(MAX_PIECES * mib + 1), mib + 1);
         assert_eq!(PieceHashes::piece_count(MAX_PIECES * mib + 1), MAX_PIECES);
@@ -2108,7 +2108,7 @@ mod tests {
             );
             assert!(PieceHashes::stored_bytes(count) <= PIECE_HASH_BYTES, "{}", len);
         }
-        // So a source that holds no hashes keeps those of any file of more
+        // So a provider that holds no hashes keeps those of any file of more
         // than one piece.
         let empty = PieceHashes::default();
         assert!(empty.is_keepable(u64::MAX) && empty.is_keepable(mib + 1));
@@ -2134,31 +2134,31 @@ mod tests {
         // file, and nothing is kept of it.
         let names = ["a", "b", "c", "d"];
         let files = Files::of(&names.map(|name| (name, &b"ab"[..])));
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         for name in names {
             let o = object(&format!(
                 r#"{{"name":"x","size":1,"contents":[{{"file":"{}","offset":1,"originalSize":2,"originalSha256":"{}"}}]}}"#,
                 name,
                 Sha256::digest(b"ab")
             ));
-            assert_eq!(copy(&o, &mut source).unwrap(), b"b");
+            assert_eq!(copy(&o, &mut provider).unwrap(), b"b");
             assert_eq!(files.read(), 2);
         }
-        assert_eq!((source.hashes.files.len(), source.hashes.bytes), (0, 0));
-        // A part of a file whose hashes the source cannot keep any more is
+        assert_eq!((provider.hashes.files.len(), provider.hashes.bytes), (0, 0));
+        // A part of a file whose hashes the provider cannot keep any more is
         // copied without the check of the whole file: the hash the
         // manifest gives for that is not looked at.
         let blob: Vec<u8> = (0..2 * COPY_SIZE).map(|i| (i >> 3) as u8).collect();
         files.put("blob", Entry::File(blob[..].into()));
-        source.hashes = kept;
+        provider.hashes = kept;
         let o = object(&format!(
             r#"{{"name":"x","size":3,"contents":[{{"file":"blob","offset":5,"originalSize":{},"originalSha256":"{}"}}]}}"#,
             blob.len(),
             hash_of(3)
         ));
-        assert_eq!(copy(&o, &mut source).unwrap(), &blob[5..8]);
+        assert_eq!(copy(&o, &mut provider).unwrap(), &blob[5..8]);
         assert_eq!(files.read(), 3);
-        assert_eq!(source.hashes.files.len(), 2);
+        assert_eq!(provider.hashes.files.len(), 2);
     }
 
     #[test]
@@ -2169,7 +2169,7 @@ mod tests {
         files.put("odd", Entry::Fails(libc::EINVAL));
         files.put("link", Entry::Fails(libc::ELOOP));
         files.put("secret", Entry::Fails(libc::EACCES));
-        let mut source = DirectorySource::new(&files);
+        let mut provider = DirectoryProvider::new(&files);
         for (file, problem, errno, text) in [
             (
                 "missing",
@@ -2207,7 +2207,7 @@ mod tests {
                 r#"{{"name":"x","size":5,"contents":[{{"file":"{}"}}]}}"#,
                 file
             ));
-            let e = copy(&o, &mut source).unwrap_err();
+            let e = copy(&o, &mut provider).unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Source(problem), "{}", file);
             assert_eq!(e.name(), Some("x"));
             assert_eq!(e.io_error().and_then(io::Error::raw_os_error), errno, "{}", file);
@@ -2217,7 +2217,7 @@ mod tests {
         // A name is quoted with its control characters escaped: one of C1
         // is a control sequence on a terminal.
         let o = object(r#"{"name":"x\u009b2J","size":5}"#);
-        let e = copy(&o, &mut source).unwrap_err();
+        let e = copy(&o, &mut provider).unwrap_err();
         assert_eq!(e.name(), Some("x\u{9b}2J"));
         assert!(
             e.to_string().starts_with(r"x\u{9b}2J: failed to open x\u{9b}2J: "),
@@ -2241,19 +2241,19 @@ mod tests {
         let streamed: Vec<&FileObject> = all.iter().filter(|o| o.has_external_data()).collect();
         assert_eq!(streamed.len(), 3);
         let mut stream = &b"helloworld"[..];
-        let mut source = StreamSource::new(&mut stream);
-        assert_eq!(copy(streamed[0], &mut source).unwrap(), b"hello");
-        assert_eq!(copy(&all[2], &mut source).unwrap(), b"hello");
-        assert_eq!(copy(streamed[1], &mut source).unwrap(), b"");
-        assert_eq!(copy(streamed[2], &mut source).unwrap(), b"world");
-        source.end().unwrap();
+        let mut provider = StreamProvider::new(&mut stream);
+        assert_eq!(copy(streamed[0], &mut provider).unwrap(), b"hello");
+        assert_eq!(copy(&all[2], &mut provider).unwrap(), b"hello");
+        assert_eq!(copy(streamed[1], &mut provider).unwrap(), b"");
+        assert_eq!(copy(streamed[2], &mut provider).unwrap(), b"world");
+        provider.end().unwrap();
         assert!(stream.is_empty());
 
         // A stream that ends early, and one that goes on after the last file.
         let mut stream = &b"hellowo"[..];
-        let mut source = StreamSource::new(&mut stream);
-        copy(streamed[0], &mut source).unwrap();
-        let e = copy(streamed[2], &mut source).unwrap_err();
+        let mut provider = StreamProvider::new(&mut stream);
+        copy(streamed[0], &mut provider).unwrap();
+        let e = copy(streamed[2], &mut provider).unwrap_err();
         assert_eq!(
             facts(&e),
             (
@@ -2265,10 +2265,10 @@ mod tests {
             )
         );
         let mut stream = &b"helloworldmore"[..];
-        let mut source = StreamSource::new(&mut stream);
-        copy(streamed[0], &mut source).unwrap();
-        copy(streamed[2], &mut source).unwrap();
-        let e = source.end().unwrap_err();
+        let mut provider = StreamProvider::new(&mut stream);
+        copy(streamed[0], &mut provider).unwrap();
+        copy(streamed[2], &mut provider).unwrap();
+        let e = provider.end().unwrap_err();
         assert_eq!(
             facts(&e),
             (
@@ -2282,7 +2282,7 @@ mod tests {
         // A stream that has data when it had none of a file, and one that
         // has none.
         let mut stream = &b"junk"[..];
-        let e = StreamSource::new(&mut stream).end().unwrap_err();
+        let e = StreamProvider::new(&mut stream).end().unwrap_err();
         assert_eq!(
             facts(&e),
             (
@@ -2294,10 +2294,10 @@ mod tests {
             )
         );
         let mut stream = &b""[..];
-        StreamSource::new(&mut stream).end().unwrap();
+        StreamProvider::new(&mut stream).end().unwrap();
         // Contents that are not the ones the manifest describes.
         let mut stream = &b"hellp"[..];
-        let e = copy(streamed[0], &mut StreamSource::new(&mut stream)).unwrap_err();
+        let e = copy(streamed[0], &mut StreamProvider::new(&mut stream)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Data(DataProblem::HashMismatch));
     }
 
@@ -2309,7 +2309,7 @@ mod tests {
         let hash = ErrorKind::Data(DataProblem::HashMismatch);
         let check = |o: &FileObject, data: &'static [u8]| {
             let mut stream = data;
-            let copied = copy(o, &mut StreamSource::new(&mut stream));
+            let copied = copy(o, &mut StreamProvider::new(&mut stream));
             assert!(stream.is_empty());
             copied
         };
@@ -2325,7 +2325,7 @@ mod tests {
         // An object that is all of its file without a hash of its own.
         let mut whole = FileObject::new(Name::new("x").unwrap());
         whole.size = Some(5);
-        let mut contents = Contents::new(Location::Implied);
+        let mut contents = ContentsObject::new(ContentsSource::Implied);
         contents.original_size = Some(5);
         contents.original_sha256 = HELLO.parse().ok();
         whole.contents.push(contents);
@@ -2368,14 +2368,14 @@ mod tests {
         }
         // A stream has no place for a file without a size or at an offset.
         let mut stream = &b"hello"[..];
-        let mut source = StreamSource::new(&mut stream);
-        let e = copy(&object(r#"{"name":"x"}"#), &mut source).unwrap_err();
+        let mut provider = StreamProvider::new(&mut stream);
+        let e = copy(&object(r#"{"name":"x"}"#), &mut provider).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::NoSize));
         assert_eq!((e.name(), e.field()), (Some("x"), Some(Field::Size)));
         assert_eq!(e.to_string(), "x: streamed contents need a known size");
         let e = copy(
             &object(r#"{"name":"x","size":2,"contents":[{"offset":1}]}"#),
-            &mut source,
+            &mut provider,
         )
         .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::OffsetInStream));
@@ -2395,30 +2395,30 @@ mod tests {
             r#"{"name":"remote","contents":[{"url":"https://example.com/x"}]}"#,
         ]);
         let mut stream = &b"helloworld"[..];
-        let mut source = StreamSource::new(&mut stream);
+        let mut provider = StreamProvider::new(&mut stream);
         for o in [&all[0], &all[1]] {
-            source.skip(o).unwrap();
+            provider.skip(o).unwrap();
         }
-        assert_eq!(copy(&all[2], &mut source).unwrap(), b"world");
+        assert_eq!(copy(&all[2], &mut provider).unwrap(), b"world");
         for o in &all[3..] {
-            source.skip(o).unwrap();
+            provider.skip(o).unwrap();
         }
-        source.end().unwrap();
+        provider.end().unwrap();
         // A skip fails where a copy would.
         let mut stream = &b"hellp"[..];
-        let e = StreamSource::new(&mut stream).skip(&all[0]).unwrap_err();
+        let e = StreamProvider::new(&mut stream).skip(&all[0]).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Data(DataProblem::HashMismatch));
         let mut stream = &b"hel"[..];
-        let e = StreamSource::new(&mut stream).skip(&all[0]).unwrap_err();
+        let e = StreamProvider::new(&mut stream).skip(&all[0]).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Data(DataProblem::StreamEnded));
         let mut stream = &b"hello"[..];
-        let e = StreamSource::new(&mut stream)
+        let e = StreamProvider::new(&mut stream)
             .skip(&object(r#"{"name":"x"}"#))
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Unsupported(UnsupportedData::NoSize));
         // A directory has nothing to read past.
         let files = Files::of(&[("a", b"hello")]);
-        DirectorySource::new(&files).skip(&all[0]).unwrap();
+        DirectoryProvider::new(&files).skip(&all[0]).unwrap();
         assert_eq!(files.read(), 0);
     }
 
@@ -2428,7 +2428,7 @@ mod tests {
         careful: bool,
     }
 
-    impl ContentSource for Babbler {
+    impl DataProvider for Babbler {
         fn copy(&mut self, _: &FileObject, _: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
             let written = sink.write_all(b"hello world");
             if self.careful {
@@ -2488,7 +2488,7 @@ mod tests {
         check.update(b"any").unwrap();
         check.update(b"thing").unwrap();
         assert_eq!(check.finish().unwrap(), 8);
-        // A source that writes more than the size of the object is stopped
+        // A provider that writes more than the size of the object is stopped
         // before the sink gets any of it, and fails the copy with what the
         // check says, also when it passes over the error of the write.
         let o = object(r#"{"name":"x","size":5}"#);
@@ -2525,36 +2525,36 @@ mod tests {
         let literal = object(r#"{"name":"l","contents":[{"literal":"aGVsbG8="}]}"#);
         let files = Files::of(&[("a", b"hello")]);
         let nothing = Files::default();
-        let mut directory = DirectorySource::new(&files);
+        let mut directory = DirectoryProvider::new(&files);
         let mut stream = &b"hello"[..];
-        let mut stream = StreamSource::new(&mut stream);
-        let mut empty = DirectorySource::new(&nothing);
-        let sources: [(&FileObject, &mut dyn ContentSource); 3] =
+        let mut stream = StreamProvider::new(&mut stream);
+        let mut empty = DirectoryProvider::new(&nothing);
+        let sources: [(&FileObject, &mut dyn DataProvider); 3] =
             [(&o, &mut directory), (&o, &mut stream), (&literal, &mut empty)];
-        for (object, source) in sources {
-            let e = object.copy_data(source, &mut Full(4)).unwrap_err();
+        for (object, provider) in sources {
+            let e = object.copy_data(provider, &mut Full(4)).unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Io);
             assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOSPC));
         }
     }
 
-    /// What a source prints for debugging says how large its buffer is,
+    /// What a provider prints for debugging says how large its buffer is,
     /// and does not hold it.
     #[test]
     fn debug_shows_no_buffers() {
         let files = Files::of(&[("a", b"hello")]);
-        let mut source = DirectorySource::new(&files);
-        copy(&object(r#"{"name":"a","size":5}"#), &mut source).unwrap();
-        let text = format!("{:?}", source);
+        let mut provider = DirectoryProvider::new(&files);
+        copy(&object(r#"{"name":"a","size":5}"#), &mut provider).unwrap();
+        let text = format!("{:?}", provider);
         assert!(text.len() < 500, "{}", text);
         assert!(
             text.contains("buffer: 1048576/1048576, hashes: PieceHashes { files: 0, bytes: 0/1048576 }"),
             "{}",
             text
         );
-        let mut source = StreamSource::new(io::repeat(7).take(2 * COPY_SIZE as u64));
-        copy(&object(r#"{"name":"a","size":5}"#), &mut source).unwrap();
-        let text = format!("{:?}", source);
+        let mut provider = StreamProvider::new(io::repeat(7).take(2 * COPY_SIZE as u64));
+        copy(&object(r#"{"name":"a","size":5}"#), &mut provider).unwrap();
+        let text = format!("{:?}", provider);
         assert!(text.len() < 200, "{}", text);
         assert!(
             text.ends_with(r#"buffer: 1048576/1048576, last: Some(("a", 5)) }"#),

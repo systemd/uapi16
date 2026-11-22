@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use uapi16::{Error, FileObject, InodeType, Object, Order, Reader, RootObject, Signature, Writer};
+use uapi16::{Error, FileObject, InodeType, Object, Order, Reader, RootObject, SignatureObject, Writer};
 
 /// A manifest read to its end: its root file object, its file objects and
 /// its signature objects.
@@ -13,7 +13,7 @@ use uapi16::{Error, FileObject, InodeType, Object, Order, Reader, RootObject, Si
 struct Manifest {
     root: RootObject,
     files: Vec<FileObject>,
-    signatures: Vec<Signature>,
+    signatures: Vec<SignatureObject>,
 }
 
 impl Manifest {

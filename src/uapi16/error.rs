@@ -208,13 +208,13 @@ pub enum DataProblem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnsupportedData {
-    /// It starts at an offset in its file, and the source is a
-    /// [`StreamSource`](crate::StreamSource), which has it and nothing else
-    /// of the file.
+    /// It starts at an offset in its file, and the provider is a
+    /// [`StreamProvider`](crate::StreamProvider), which has it and nothing
+    /// else of the file.
     OffsetInStream,
-    /// The object gives no size, and the source is a
-    /// [`StreamSource`](crate::StreamSource), which needs it to know where
-    /// the data ends.
+    /// The object gives no size, and the provider is a
+    /// [`StreamProvider`](crate::StreamProvider), which needs it to know
+    /// where the data ends.
     NoSize,
     /// Every contents object of the file has it at a URL or in an
     /// encoding, and it would have to be fetched or decoded.
