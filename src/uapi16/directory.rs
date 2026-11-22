@@ -195,32 +195,11 @@ impl Directory for PinnedDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
     use rustix::fs::CWD;
     use std::fs;
     use std::io::Read;
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
-
-    /// A directory of its own below the temporary directory, removed with
-    /// everything in it when the test ends.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> TempDir {
-            let path = std::env::temp_dir().join(format!("uapi16-{}-{}", name, std::process::id()));
-            // What a test of the same name in a process of the same number
-            // left behind.
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir(&path).unwrap();
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// What `dir` has under `name`: the text of a regular file, or why it
     /// has none.

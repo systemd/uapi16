@@ -3,8 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
 use std::num::NonZeroU64;
 use std::ops::{BitAnd, BitOr, Not};
+use std::os::unix::fs::FileTypeExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +35,7 @@ pub enum InodeType {
     Socket,
 }
 
-/// A string that is not the name of an inode type.
+/// A string or a file type that is not an inode type, see [`InodeType`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownInodeType(());
 
@@ -93,6 +95,39 @@ impl FromStr for InodeType {
             "blk" => InodeType::BlockDevice,
             "sock" => InodeType::Socket,
             _ => return Err(UnknownInodeType(())),
+        })
+    }
+}
+
+/// The inode type of a file, from the file type its metadata gives.
+///
+/// ```
+/// use uapi16::InodeType;
+///
+/// let metadata = std::fs::symlink_metadata("/")?;
+/// assert_eq!(InodeType::try_from(metadata.file_type()), Ok(InodeType::Directory));
+/// # Ok::<(), std::io::Error>(())
+/// ```
+impl TryFrom<fs::FileType> for InodeType {
+    type Error = UnknownInodeType;
+
+    fn try_from(file_type: fs::FileType) -> Result<InodeType, UnknownInodeType> {
+        Ok(if file_type.is_file() {
+            InodeType::Regular
+        } else if file_type.is_dir() {
+            InodeType::Directory
+        } else if file_type.is_symlink() {
+            InodeType::Symlink
+        } else if file_type.is_fifo() {
+            InodeType::Fifo
+        } else if file_type.is_char_device() {
+            InodeType::CharDevice
+        } else if file_type.is_block_device() {
+            InodeType::BlockDevice
+        } else if file_type.is_socket() {
+            InodeType::Socket
+        } else {
+            return Err(UnknownInodeType(()));
         })
     }
 }
@@ -2175,6 +2210,32 @@ mod tests {
         }
         for name in ["", "REG", "file", "symlink", "reg "] {
             assert!(name.parse::<InodeType>().is_err(), "{:?}", name);
+        }
+    }
+
+    /// The types of file a test makes without help, and a device node every
+    /// system has. FileObject::from_metadata() is tested with a FIFO as well.
+    #[test]
+    fn inode_types_of_files() {
+        use crate::testing::TempDir;
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TempDir::new("inode-types");
+        let dir = &tmp.0;
+        fs::write(dir.join("file"), b"").unwrap();
+        fs::create_dir(dir.join("dir")).unwrap();
+        symlink("file", dir.join("link")).unwrap();
+        let _socket = UnixListener::bind(dir.join("socket")).unwrap();
+        for (path, inode_type) in [
+            (dir.join("file"), InodeType::Regular),
+            (dir.join("dir"), InodeType::Directory),
+            (dir.join("link"), InodeType::Symlink),
+            (dir.join("socket"), InodeType::Socket),
+            ("/dev/null".into(), InodeType::CharDevice),
+        ] {
+            let file_type = fs::symlink_metadata(&path).unwrap().file_type();
+            assert_eq!(InodeType::try_from(file_type), Ok(inode_type), "{}", path.display());
         }
     }
 

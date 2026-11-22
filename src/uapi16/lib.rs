@@ -179,7 +179,30 @@ pub(crate) mod testing {
     use crate::strict::{ParseError, Skip, Strict};
     use serde_core::de::DeserializeSeed;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::num::NonZeroU64;
+    use std::path::PathBuf;
+
+    /// A directory of its own below the temporary directory, removed with
+    /// everything in it when the test ends.
+    pub(crate) struct TempDir(pub(crate) PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(name: &str) -> TempDir {
+            let path = std::env::temp_dir().join(format!("uapi16-{}-{}", name, std::process::id()));
+            // What a test of the same name in a process of the same number
+            // left behind.
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// The root file object that says nothing but that this is a manifest.
     pub(crate) const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#;
