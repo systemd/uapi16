@@ -111,8 +111,8 @@ pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};
 pub use object::{
     Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates, GptPartition, InodeAttributes,
-    InodeFlags, InodeType, InvalidFatSerial, InvalidUuid, Location, Mode, RootObject, Signature, UnknownInodeType,
-    Uuid, Validity, ValidityWindow,
+    InodeFlags, InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Location, Mode, RootObject, Signature,
+    UnknownInodeType, Uuid, Validity, ValidityWindow,
 };
 pub use reader::{Decoder, Object, Step};
 pub use writer::Encoder;
@@ -353,7 +353,7 @@ pub(crate) mod testing {
         encoded.offset = 4;
         let mut object = FileObject::new(name("a/\u{e9} \"quoted\"\\"));
         object.size = Some(5);
-        object.inode.mode = Mode::new(0o440);
+        object.inode.mode = Some(Mode::new(0o440).unwrap());
         object.inode.uid = Some(1);
         object.inode.gid = Some(2);
         object.inode.user_name = Some("user".into());

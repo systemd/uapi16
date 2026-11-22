@@ -102,13 +102,26 @@ impl FromStr for InodeType {
 /// ```
 /// use uapi16::Mode;
 ///
-/// let mode = Mode::new(0o644).unwrap();
+/// let mode = Mode::new(0o644)?;
 /// assert!(mode.is_writable());
-/// assert!(!Mode::new(0o444).unwrap().is_writable());
-/// assert_eq!(Mode::new(0o10000), None);
+/// assert!(!Mode::new(0o444)?.is_writable());
+/// assert!(Mode::new(0o100644).is_err());
+/// # Ok::<(), uapi16::InvalidMode>(())
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Mode(u32);
+
+/// Bits that are not a mode, see [`Mode::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidMode(());
+
+impl fmt::Display for InvalidMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not the bits of a mode")
+    }
+}
+
+impl std::error::Error for InvalidMode {}
 
 impl Mode {
     /// Every bit a mode can have. The specification gives `mode` the range
@@ -119,13 +132,13 @@ impl Mode {
     /// the owner, of the group and of everybody else.
     const WRITE: u32 = 0o222;
 
-    /// The mode with the bits `bits`, unless there are others among them
-    /// than a mode has.
-    pub const fn new(bits: u32) -> Option<Mode> {
+    /// The mode with the bits `bits`. Bits that a mode does not have, such
+    /// as those of the file type in an `st_mode`, fail.
+    pub const fn new(bits: u32) -> Result<Mode, InvalidMode> {
         if bits & !Mode::ALL == 0 {
-            Some(Mode(bits))
+            Ok(Mode(bits))
         } else {
-            None
+            Err(InvalidMode(()))
         }
     }
 
@@ -1423,9 +1436,9 @@ mod tests {
             assert_eq!(mode.bits(), bits);
             assert_eq!(u32::from(mode), bits);
         }
-        assert_eq!(Mode::new(0o10000), None);
-        assert_eq!(Mode::new(0o100644), None);
-        assert_eq!(Mode::new(u32::MAX), None);
+        assert_eq!(Mode::new(0o10000), Err(InvalidMode(())));
+        assert_eq!(Mode::new(0o100644), Err(InvalidMode(())));
+        assert_eq!(Mode::new(u32::MAX), Err(InvalidMode(())));
         for (bits, writable) in [
             (0o644, true),
             (0o444, false),
@@ -1518,9 +1531,9 @@ mod tests {
     fn read_only() {
         let mut inode = InodeAttributes::default();
         assert!(!inode.is_read_only());
-        inode.mode = Mode::new(0o444);
+        inode.mode = Some(Mode::new(0o444).unwrap());
         assert!(inode.is_read_only());
-        inode.mode = Mode::new(0o464);
+        inode.mode = Some(Mode::new(0o464).unwrap());
         assert!(!inode.is_read_only());
         inode.read_only = Some(true);
         assert!(inode.is_read_only());
@@ -1529,7 +1542,7 @@ mod tests {
         inode.read_only = Some(false);
         assert!(!inode.is_read_only());
         // What readOnly says counts, the false a reader fills in too.
-        inode.mode = Mode::new(0o444);
+        inode.mode = Some(Mode::new(0o444).unwrap());
         assert!(!inode.is_read_only());
     }
 
@@ -1678,7 +1691,7 @@ mod tests {
                 |o| o.dos_flags.put(DosFlags::ARCHIVE, Some(true)),
                 Features::FLAG_ARCHIVE,
             ),
-            (|o| o.inode.mode = Mode::new(0o644), Features::MODE),
+            (|o| o.inode.mode = Some(Mode::new(0o644).unwrap()), Features::MODE),
             (|o| o.inode.uid = Some(0), Features::UID),
             (|o| o.inode.user_name = Some("u".into()), Features::USER_NAME),
             (|o| o.inode.mtime_nsec = Some(0), Features::MTIME),

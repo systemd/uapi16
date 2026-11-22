@@ -1299,7 +1299,7 @@ impl<'a> RecordDecoder<'a> {
     /// one.
     fn mode<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Mode> {
         let bits = self.unsigned(field, value)?;
-        let mode = u32::try_from(bits).ok().and_then(Mode::new);
+        let mode = u32::try_from(bits).ok().and_then(|bits| Mode::new(bits).ok());
         if mode.is_none() {
             self.note_error(Problem::FieldOutOfRange, field, || {
                 format!("manifest field '{}' is out of range: {}", field, bits)
@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!(o.name, "dir/file");
         assert_eq!(o.inode_type, InodeType::Regular);
         assert_eq!(o.size, Some(5));
-        assert_eq!(o.inode.mode, Mode::new(0o644));
+        assert_eq!(o.inode.mode, Some(Mode::new(0o644).unwrap()));
         assert_eq!((o.inode.uid, o.inode.gid), (Some(1000), Some(100)));
         assert_eq!(o.inode.user_name.as_deref(), Some("Domain Users"));
         assert_eq!(o.inode.group_name.as_deref(), Some("users"));
@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(root.inode.user_xattrs.as_deref().map(BTreeMap::len), Some(0));
         assert_eq!(
             (root.inode.uid, root.inode.gid, root.inode.mode),
-            (Some(1000), Some(1000), Mode::new(0o775))
+            (Some(1000), Some(1000), Some(Mode::new(0o775).unwrap()))
         );
         assert_eq!(root.inode.read_only, Some(false));
         assert_eq!(root.gpt_disk_uuid, Some(uuid));
@@ -2245,7 +2245,7 @@ mod tests {
         for (text, mode) in [("420", 0o644), ("4095", 0o7777), ("0", 0)] {
             assert_eq!(
                 object(&format!(r#"{{"name":"x","mode":{}}}"#, text)).inode.mode,
-                Mode::new(mode),
+                Some(Mode::new(mode).unwrap()),
                 "{}",
                 text
             );
@@ -2410,7 +2410,7 @@ mod tests {
         empty.contents.clear();
         empty.sha256 = EMPTY.parse().ok();
         let mut read_only = file(None, hello());
-        read_only.inode.mode = Mode::new(0o644);
+        read_only.inode.mode = Some(Mode::new(0o644).unwrap());
         read_only.inode.read_only = Some(true);
         for (object, record) in [
             (

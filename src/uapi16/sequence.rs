@@ -322,7 +322,11 @@ mod tests {
         // two the object has, for symbolic links the target in `contents`.
         let none = SequenceCheck::new(Features::NONE, None);
         let cases: [(InodeType, Give<FileObject>, Field); 8] = [
-            (InodeType::Regular, |o| o.inode.mode = Mode::new(0o644), Field::Mode),
+            (
+                InodeType::Regular,
+                |o| o.inode.mode = Some(Mode::new(0o644).unwrap()),
+                Field::Mode,
+            ),
             (InodeType::CharDevice, |o| o.major = Some(1), Field::Major),
             (InodeType::BlockDevice, |o| o.minor = Some(1), Field::Minor),
             (
@@ -398,7 +402,7 @@ mod tests {
             ),
             (|o| o.inode.user_name = Some("u".into()), Field::UserName),
             (|o| o.inode.read_only = Some(true), Field::ReadOnly),
-            (|o| o.inode.mode = Mode::new(0o444), Field::Mode),
+            (|o| o.inode.mode = Some(Mode::new(0o444).unwrap()), Field::Mode),
             (
                 |o| o.inode.user_xattrs = Some(Box::default()),
                 Field::ExtendedAttributes,

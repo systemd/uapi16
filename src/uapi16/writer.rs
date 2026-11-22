@@ -865,14 +865,14 @@ mod tests {
         root.inode.user_xattrs = Some(Box::default());
         root.inode.gid = Some(1000);
         root.inode.mtime_nsec = Some(1_699_999_000_000_000_000);
-        root.inode.mode = Mode::new(0o775);
+        root.inode.mode = Some(Mode::new(0o775).unwrap());
         root.inode.uid = Some(1000);
         let owned_directory = |name_of: &str| {
             let mut owned = directory(name_of);
             owned.inode.user_xattrs = Some(Box::default());
             owned.inode.gid = Some(1000);
             owned.inode.mtime_nsec = Some(1_699_999_000_000_000_000);
-            owned.inode.mode = Mode::new(0o775);
+            owned.inode.mode = Some(Mode::new(0o775).unwrap());
             owned.inode.uid = Some(1000);
             owned
         };
@@ -880,7 +880,7 @@ mod tests {
         file.inode.user_xattrs = Some(Box::default());
         file.inode.gid = Some(1000);
         file.inode.mtime_nsec = Some(1_700_000_000_000_000_000);
-        file.inode.mode = Mode::new(0o664);
+        file.inode.mode = Some(Mode::new(0o664).unwrap());
         file.sha256 = "608047e995ccddf55441b8ed783ac49c780b9a911aa655f47d3a4c174748f86b"
             .parse()
             .ok();
@@ -1272,7 +1272,7 @@ mod tests {
             ..RootObject::default()
         };
         root.inode.read_only = Some(true);
-        root.inode.mode = Mode::new(0o755);
+        root.inode.mode = Some(Mode::new(0o755).unwrap());
         assert_eq!(
             refused(&root),
             (
@@ -1573,7 +1573,7 @@ mod tests {
                 r#"{"mode":420,"name":"x","readOnly":true,"size":1,"type":"fifo"}"#.into(),
                 |o| {
                     (o.inode_type, o.size) = (InodeType::Fifo, Some(1));
-                    (o.inode.mode, o.inode.read_only) = (Mode::new(0o644), Some(true));
+                    (o.inode.mode, o.inode.read_only) = (Some(Mode::new(0o644).unwrap()), Some(true));
                 },
                 Problem::FieldNotPermitted,
             ),
@@ -1581,7 +1581,10 @@ mod tests {
             // feature the manifest does not record.
             (
                 r#"{"mTimeNSec":1,"mode":420,"name":"x","readOnly":true}"#.into(),
-                |o| (o.inode.mtime_nsec, o.inode.mode, o.inode.read_only) = (Some(1), Mode::new(0o644), Some(true)),
+                |o| {
+                    (o.inode.mtime_nsec, o.inode.mode) = (Some(1), Some(Mode::new(0o644).unwrap()));
+                    o.inode.read_only = Some(true);
+                },
                 Problem::Contradiction,
             ),
             // A value, before a field of a feature the manifest does not
@@ -1870,7 +1873,7 @@ mod tests {
             ),
             (|o| o.major = Some(1), Problem::FieldNotPermitted, Some(Field::Major)),
             (
-                |o| (o.inode_type, o.inode.mode) = (InodeType::Symlink, Mode::new(0o777)),
+                |o| (o.inode_type, o.inode.mode) = (InodeType::Symlink, Some(Mode::new(0o777).unwrap())),
                 Problem::FieldNotPermitted,
                 Some(Field::Mode),
             ),
@@ -1895,7 +1898,7 @@ mod tests {
             // readOnly against mode and against gptFlags, both ways, and
             // gptFlags against the field of one of its flags.
             (
-                |o| (o.inode.read_only, o.inode.mode) = (Some(true), Mode::new(0o644)),
+                |o| (o.inode.read_only, o.inode.mode) = (Some(true), Some(Mode::new(0o644).unwrap())),
                 Problem::Contradiction,
                 Some(Field::ReadOnly),
             ),
