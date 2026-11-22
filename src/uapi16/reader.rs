@@ -249,7 +249,14 @@ enum Stage {
 }
 
 /// What a [`Decoder`] has for its caller next.
+///
+/// [`Step::Input`] asks for more of the manifest, [`Step::End`] says that
+/// there is nothing more, and the other steps hand something out. A step
+/// the caller does not know needs nothing from it but another call to
+/// [`Decoder::step`], so the caller can pass over it. Steps that come in
+/// later releases only hand something out.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step {
     /// More of the manifest: [`Decoder::feed`] takes it, and
     /// [`Decoder::end`] says that the input ended.
