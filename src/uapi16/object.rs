@@ -59,10 +59,11 @@ impl InodeType {
         }
     }
 
-    /// Whether an object of this type has contents: a regular file its
-    /// data, a symbolic link its target and a directory a manifest of its
-    /// own. Only such an object has a size, contents objects and a hash.
-    pub const fn has_contents(self) -> bool {
+    /// Whether an object of this type has data: a regular file the bytes
+    /// it holds, a symbolic link its target and a directory a manifest of
+    /// its own. Only such an object has a size, contents objects and a
+    /// hash.
+    pub const fn has_data(self) -> bool {
         matches!(self, InodeType::Regular | InodeType::Symlink | InodeType::Directory)
     }
 
@@ -1102,11 +1103,11 @@ pub struct FileObject {
     /// `type`: the inode type. An object that does not say is a regular
     /// file.
     pub inode_type: InodeType,
-    /// `size`: the size of the contents in bytes. For a symbolic link that
+    /// `size`: the size of the data in bytes. For a symbolic link that
     /// is the length of its target, for a directory the size of the
     /// manifest of its own that `contents` refers to.
     pub size: Option<u64>,
-    /// `sha256`: the hash of the contents.
+    /// `sha256`: the hash of the data.
     pub sha256: Option<Sha256>,
     /// `contents`: where the contents can be taken from. Without any they
     /// are in the file of the object's name next to the manifest.
@@ -1410,12 +1411,7 @@ mod tests {
             assert_eq!(name.parse(), Ok(inode_type));
             assert_eq!(inode_type.as_str(), name);
             assert_eq!(inode_type.to_string(), name);
-            assert_eq!(
-                inode_type.has_contents(),
-                ["reg", "dir", "lnk"].contains(&name),
-                "{}",
-                name
-            );
+            assert_eq!(inode_type.has_data(), ["reg", "dir", "lnk"].contains(&name), "{}", name);
             assert_eq!(inode_type.is_device(), ["chr", "blk"].contains(&name), "{}", name);
         }
         for name in ["", "REG", "file", "symlink", "reg "] {

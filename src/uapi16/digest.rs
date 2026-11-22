@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! The hashes a manifest gives for the contents of files.
+//! The hashes a manifest gives for the data of files.
 
 use std::fmt;
 use std::io;
@@ -48,8 +48,8 @@ impl std::error::Error for InvalidDigest {}
 impl Sha256 {
     /// The size of the hash in bytes.
     pub const SIZE: usize = 32;
-    /// The hash of no data. Contents of size 0 have this hash, and only
-    /// they do.
+    /// The hash of no data. Data of size 0 has this hash, and only it
+    /// does.
     pub const EMPTY: Sha256 = Sha256([
         0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae,
         0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
@@ -105,7 +105,7 @@ impl FromStr for Sha256 {
 }
 
 /// Computes the [`Sha256`] of data that comes in pieces, such as the
-/// contents of a file a manifest is written for.
+/// data of a file a manifest is written for.
 ///
 /// ```
 /// use std::io::Write;

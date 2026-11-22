@@ -417,7 +417,7 @@ impl FileObject {
     pub(crate) fn check_permitted_fields(&self, subject: Subject<'_>) -> Result<(), Error> {
         let inode_type = self.inode_type;
         let not_permitted = |message: String| Error::manifest(Problem::FieldNotPermitted, message);
-        if self.size.is_some() && !inode_type.has_contents() {
+        if self.size.is_some() && !inode_type.has_data() {
             return Err(
                 not_permitted(format!("{}: 'size' is not permitted on a {}", subject, inode_type)).at(Field::Size),
             );
@@ -438,7 +438,7 @@ impl FileObject {
                     .at(Field::InodeToken),
             );
         }
-        if (!self.contents.is_empty() || self.sha256.is_some()) && !inode_type.has_contents() {
+        if (!self.contents.is_empty() || self.sha256.is_some()) && !inode_type.has_data() {
             return Err(not_permitted(format!(
                 "{}: 'contents' and 'sha256' are not permitted on a {}",
                 subject, inode_type

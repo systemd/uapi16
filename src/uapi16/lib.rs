@@ -24,11 +24,11 @@
 //!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
 //!   the root file object and a file object both have is in
 //!   [`InodeAttributes`] and [`ValidityWindow`].
-//! - [`ContentSource`] is where the contents of the files come from when a
+//! - [`ContentSource`] is where the data of the files comes from when a
 //!   manifest is applied: [`DirectorySource`] for the files next to the
 //!   manifest and [`StreamSource`] for one stream with all of them.
-//!   [`FileObject::copy_contents`] copies the contents of a file and checks
-//!   them against the manifest with a [`ContentCheck`].
+//!   [`FileObject::copy_data`] copies the data of a file and checks it
+//!   against the manifest with a [`DataCheck`].
 //!
 //! A manifest that does not come through a [`Read`], such as one from an
 //! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::step`] says
@@ -48,10 +48,10 @@
 //! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
 //! string, and the caller sends them on.
 //!
-//! Contents that do not go through a [`Write`] are checked with a
-//! [`ContentCheck`]: [`ContentCheck::update`] takes them as they come, and
-//! [`ContentCheck::finish`] says whether they have the size and the hash
-//! the manifest gives.
+//! Data that does not go through a [`Write`] is checked with a
+//! [`DataCheck`]: [`DataCheck::update`] takes it as it comes, and
+//! [`DataCheck::finish`] says whether it has the size and the hash the
+//! manifest gives.
 //!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
@@ -62,8 +62,8 @@
 //!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
-//! manifest they sign. Contents that are stored in an encoding or that
-//! have to be fetched from a URL are not taken.
+//! manifest they sign. Data that is stored in an encoding or that has to
+//! be fetched from a URL is not taken.
 //!
 //! The reader takes every field the specification has. A field it does
 //! not know is passed over, as the specification asks, unless it holds a
@@ -104,9 +104,11 @@ mod strict;
 mod writer;
 
 pub use blocking::{Reader, Writer};
-pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
+pub use content::{
+    ContentSource, DataCheck, DataLocation, Directory, DirectorySource, ExternalFile, OpenError, StreamSource,
+};
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
-pub use error::{ContentProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedContent, ValidityProblem};
+pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};
 pub use object::{

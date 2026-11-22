@@ -62,9 +62,9 @@ impl Features {
     pub const USER_NAME: Features = Features(1 << 3);
     /// `group-name`: the name of the owning group, the field `groupName`.
     pub const GROUP_NAME: Features = Features(1 << 4);
-    /// `size`: the size of the contents, the field `size`.
+    /// `size`: the size of the data, the field `size`.
     pub const SIZE: Features = Features(1 << 5);
-    /// `sha256`: the hash of the contents, the field `sha256`.
+    /// `sha256`: the hash of the data, the field `sha256`.
     pub const SHA256: Features = Features(1 << 6);
     /// `symlink`: the targets of symbolic links, the field `contents` of
     /// file objects of the type `lnk`. Every one of them has its target in
