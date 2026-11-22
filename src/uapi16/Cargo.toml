@@ -2,10 +2,17 @@
 
 [package]
 name = "uapi16"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+description = "Reading, checking and writing UAPI.16 file manifests"
+repository = "https://github.com/systemd/uapi16"
+keywords = ["uapi", "manifest", "filesystem", "systemd", "json-seq"]
+categories = ["filesystem", "parser-implementations", "encoding"]
+# What the package cargo publish uploads holds next to Cargo.toml and
+# Cargo.lock.
+include = ["/*.rs", "/refused.jsonl", "/tests/", "/README.md", "/LICENSE"]
 
 [lib]
 path = "lib.rs"

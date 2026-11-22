@@ -10,7 +10,6 @@ edition = "2021"
 # uapi16 has to keep building with this rustc.
 rust-version = "1.85"
 license = "LGPL-2.1-or-later"
-publish = false
 
 [workspace.dependencies]
 # Stay on 0.2 like pathrs, errno, getrandom and sha2's cpufeatures, so
