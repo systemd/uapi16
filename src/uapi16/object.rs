@@ -111,11 +111,13 @@ impl FromStr for InodeType {
 pub struct Mode(u32);
 
 impl Mode {
-    /// Every bit a mode can have.
-    const ALL: u32 = libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX | libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO;
-    /// The write permission of the owner, of the group and of everybody
-    /// else.
-    const WRITE: u32 = libc::S_IWUSR | libc::S_IWGRP | libc::S_IWOTH;
+    /// Every bit a mode can have. The specification gives `mode` the range
+    /// `0o0000` to `0o7777`: the permission bits, the set-user-ID, the
+    /// set-group-ID and the sticky bit.
+    const ALL: u32 = 0o7777;
+    /// The three 'w' bits of the specification: the write permission of
+    /// the owner, of the group and of everybody else.
+    const WRITE: u32 = 0o222;
 
     /// The mode with the bits `bits`, unless there are others among them
     /// than a mode has.

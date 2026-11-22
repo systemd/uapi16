@@ -13,8 +13,8 @@ license = "LGPL-2.1-or-later"
 publish = false
 
 [workspace.dependencies]
-# Stay on 0.2 like ufat, which uses uapi16, so that ufat never builds
-# two versions of libc.
+# Stay on 0.2 like sha2's cpufeatures on aarch64 and loongarch64, so
+# that the tests never build two versions of libc there.
 libc = "0.2.191"
 # Reads and writes JSON. What a manifest asks for beyond JSON is checked
 # by src/uapi16/strict.rs. Never turn on arbitrary_precision: serde_json
