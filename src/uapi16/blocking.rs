@@ -63,7 +63,7 @@ pub(crate) const READ_SIZE: usize = 64 * 1024;
 /// let mut names = Vec::new();
 /// for object in Reader::open(manifest.as_bytes())? {
 ///     if let Object::File(object) = object? {
-///         names.push(object.name);
+///         names.push(object.into_name());
 ///     }
 /// }
 /// assert_eq!(names, ["a", "b"]);
@@ -245,9 +245,9 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// use uapi16::{FileObject, Name, Object, Order, Reader, RootObject, Writer};
 ///
 /// let mut root = RootObject::default();
-/// root.order = Some(Order::CodePoint);
+/// root.set_order(Some(Order::CodePoint));
 /// let mut file = FileObject::new(Name::new("a")?);
-/// file.size = Some(3);
+/// file.set_size(Some(3));
 /// let mut writer = Writer::begin(Vec::new(), &root)?;
 /// writer.file(&file)?;
 /// let bytes = writer.finish()?;

@@ -21,9 +21,14 @@
 //!   while it is read, and [`Sha256Context::finalize`] returns it.
 //! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
 //!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
-//!   [`Mode`], [`DosFlags`], [`InodeFlags`], [`Sha256`] and [`Uuid`] what
-//!   their fields hold. What the root file object and a file object both
-//!   have is in [`InodeAttributes`] and [`ValidityWindow`].
+//!   [`Mode`], [`Sha256`] and [`Uuid`] what their fields hold. Each field
+//!   has a getter named after it, and most have a setter. The inode
+//!   attributes and the identity of the file system are changed in place
+//!   instead, through [`FileObject::inode_mut`], [`RootObject::inode_mut`]
+//!   and [`RootObject::file_system_mut`], and the marks of what a reader
+//!   filled in, [`FilledIn`], can only be read. What the root file object
+//!   and a file object both have is in [`InodeAttributes`] and
+//!   [`ValidityWindow`].
 //! - [`DataProvider`] is where the data of the files comes from when a
 //!   manifest is applied: [`DirectoryProvider`] for the files next to the
 //!   manifest and [`StreamProvider`] for one stream with all of them.
@@ -112,9 +117,9 @@ pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, Un
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};
 pub use object::{
-    ContentsObject, ContentsSource, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates,
-    GptPartition, InodeAttributes, InodeFlags, InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject,
-    SignatureObject, UnknownInodeType, Uuid, Validity, ValidityWindow,
+    ContentsObject, ContentsSource, FatSerial, FileObject, FileSystemIdentity, FilledIn, GptPartition, InodeAttributes,
+    InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject, SignatureObject, UnknownInodeType, Uuid,
+    Validity, ValidityWindow,
 };
 pub use reader::{Decoder, Object, Step};
 pub use writer::Encoder;
@@ -154,10 +159,10 @@ pub(crate) const STRING_RULES: strict::StringRules =
 #[cfg(test)]
 pub(crate) mod testing {
     use super::blocking::READ_SIZE;
+    use super::object::{DosFlags, InodeFlags};
     use super::{
-        ContentsObject, ContentsSource, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType,
-        Mode, Name, Object, Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END,
-        RECORD_SEPARATOR,
+        ContentsObject, ContentsSource, Error, Features, FileObject, GptPartition, InodeType, Mode, Name, Object,
+        Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
     use serde_core::de::DeserializeSeed;

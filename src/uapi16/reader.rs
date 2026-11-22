@@ -311,7 +311,7 @@ pub enum Step {
 ///             let taken = decoder.feed(&input[..input.len().min(5)]);
 ///             input = &input[taken..];
 ///         }
-///         Step::Object(Object::File(object)) => names.push(object.name),
+///         Step::Object(Object::File(object)) => names.push(object.into_name()),
 ///         Step::End => break,
 ///         _ => {}
 ///     }
@@ -489,9 +489,10 @@ mod tests {
     use super::*;
     use crate::blocking::READ_SIZE;
     use crate::error::{ErrorKind, Field};
+    use crate::object::{DosFlags, FlagStates, InodeFlags};
     use crate::testing::{manifest, sequence, ROOT, SIGNATURE, TRAILER};
     use crate::testing::{read_whole, Whole, HELLO, PIECES};
-    use crate::{DosFlags, Features, FlagStates, InodeFlags, InodeType, Order, Reader, RootObject, Sha256};
+    use crate::{Features, InodeType, Order, Reader, RootObject, Sha256};
     use std::collections::BTreeMap;
 
     /// Reads `bytes` to the end and returns the names of the file objects

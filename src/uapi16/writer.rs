@@ -530,7 +530,7 @@ impl FileObject {
 
 impl Fields for FileObject {
     fn filled_in(&self) -> FilledIn {
-        self.filled_in.union(self.inode.filled_in)
+        FileObject::filled_in(self)
     }
 
     fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
@@ -750,7 +750,7 @@ impl ContentsObject {
 /// same. A reader fills them in again.
 impl Fields for ContentsObject {
     fn filled_in(&self) -> FilledIn {
-        self.filled_in
+        ContentsObject::filled_in(self)
     }
 
     fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {

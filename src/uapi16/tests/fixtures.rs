@@ -56,7 +56,7 @@ impl Manifest {
 
     /// The names of the file objects, in the order of the manifest.
     fn names(&self) -> Vec<&str> {
-        self.files.iter().map(|file| file.name.as_str()).collect()
+        self.files.iter().map(|file| file.name().as_str()).collect()
     }
 }
 
@@ -75,11 +75,11 @@ fn every_fixture_parses() {
     assert_eq!(
         esp.files
             .iter()
-            .filter(|e| e.inode_type == InodeType::Directory)
+            .filter(|e| e.inode_type() == InodeType::Directory)
             .count(),
         6
     );
-    assert_eq!(esp.root.inode.mtime_nsec, Some(1_699_999_000_000_000_000));
+    assert_eq!(esp.root.inode().mtime_nsec(), Some(1_699_999_000_000_000_000));
     assert!(esp.signatures.is_empty());
     assert_eq!(
         esp.names(),
@@ -100,11 +100,11 @@ fn every_fixture_parses() {
         ]
     );
     let uki = &esp.files[4];
-    assert_eq!(uki.size, Some(6395));
-    assert_eq!(uki.inode.mode.map(u32::from), Some(0o664));
-    assert_eq!(uki.inode.mtime_nsec, Some(1_700_000_002_000_000_000));
-    assert!(!uki.inode.is_read_only());
-    assert!(uki.contents.is_empty());
+    assert_eq!(uki.size(), Some(6395));
+    assert_eq!(uki.inode().mode().map(u32::from), Some(0o664));
+    assert_eq!(uki.inode().mtime_nsec(), Some(1_700_000_002_000_000_000));
+    assert!(!uki.inode().is_read_only());
+    assert!(uki.contents().is_empty());
 
     // The signature does not change the file objects.
     let signed = Manifest::load("esp", "signed.Uapi16Manifest");
@@ -115,45 +115,43 @@ fn every_fixture_parses() {
     // Fewer fields, same tree.
     let lean = Manifest::load("esp", "size-hash-mtime.Uapi16Manifest");
     assert_eq!(lean.names(), esp.names());
-    assert!(lean.files.iter().all(|e| e.inode.mode.is_none()));
-    assert!(lean
-        .files
-        .iter()
-        .zip(&esp.files)
-        .all(|(a, b)| a.size == b.size && a.sha256 == b.sha256 && a.inode.mtime_nsec == b.inode.mtime_nsec));
+    assert!(lean.files.iter().all(|e| e.inode().mode().is_none()));
+    assert!(lean.files.iter().zip(&esp.files).all(|(a, b)| a.size() == b.size()
+        && a.sha256() == b.sha256()
+        && a.inode().mtime_nsec() == b.inode().mtime_nsec()));
     let none = Manifest::load("esp", "none.Uapi16Manifest");
     assert_eq!(none.names(), esp.names());
     assert!(none
         .files
         .iter()
-        .all(|e| e.size.is_none() && e.sha256.is_none() && e.inode.mtime_nsec.is_none()));
+        .all(|e| e.size().is_none() && e.sha256().is_none() && e.inode().mtime_nsec().is_none()));
 
     let special = Manifest::load("special", "Uapi16Manifest");
     assert_eq!(special.files.len(), 13);
-    let types: Vec<InodeType> = special.files.iter().map(|e| e.inode_type).collect();
+    let types: Vec<InodeType> = special.files.iter().map(|e| e.inode_type()).collect();
     assert_eq!(types.iter().filter(|&&t| t == InodeType::Symlink).count(), 1);
     assert_eq!(types.iter().filter(|&&t| t == InodeType::Fifo).count(), 1);
     let link = special
         .files
         .iter()
-        .find(|e| e.inode_type == InodeType::Symlink)
+        .find(|e| e.inode_type() == InodeType::Symlink)
         .unwrap();
-    assert_eq!(link.contents[0].literal(), Some(&b"a.txt"[..]));
+    assert_eq!(link.contents()[0].literal(), Some(&b"a.txt"[..]));
     let hardlinks: Vec<&str> = special
         .files
         .iter()
-        .filter(|e| e.inode_token.is_some())
-        .map(|e| e.name.as_str())
+        .filter(|e| e.inode_token().is_some())
+        .map(|e| e.name().as_str())
         .collect();
     assert_eq!(hardlinks, vec!["sub/hl_a", "sub/hl_b"]);
-    let readonly = special.files.iter().find(|e| e.name == "sub/readonly.bin").unwrap();
-    assert_eq!(readonly.inode.mode.map(u32::from), Some(0o444));
-    assert!(readonly.inode.is_read_only());
+    let readonly = special.files.iter().find(|e| e.name() == "sub/readonly.bin").unwrap();
+    assert_eq!(readonly.inode().mode().map(u32::from), Some(0o444));
+    assert!(readonly.inode().is_read_only());
     assert!(special.names().contains(&"sub/\u{fc}mlaut \u{221e}.txt"));
 
     let empty = Manifest::load("empty", "Uapi16Manifest");
     assert!(empty.files.is_empty());
-    assert_eq!(empty.root.inode.mtime_nsec, Some(1_700_000_200_000_000_000));
+    assert_eq!(empty.root.inode().mtime_nsec(), Some(1_700_000_200_000_000_000));
 }
 
 /// The reader reads every manifest systemd-manifest wrote, and what the
@@ -180,7 +178,7 @@ fn reads_and_writes_back_every_fixture() {
             "{}",
             path.display()
         );
-        assert_eq!(read.root.order, Some(Order::CodePoint), "{}", path.display());
+        assert_eq!(read.root.order(), Some(Order::CodePoint), "{}", path.display());
         let written = read.write().unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
         assert_eq!(Manifest::read(&written).unwrap(), read, "{}", path.display());
     }

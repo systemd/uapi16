@@ -202,17 +202,44 @@ impl fmt::Display for Validity {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ValidityWindow {
-    /// `validSinceUSec`: the file is not to be used before this time, in
-    /// microseconds since the epoch.
-    pub since_usec: u64,
-    /// `validUntilUSec`: the file is not to be used from this time on, in
-    /// microseconds since the epoch.
-    pub until_usec: Option<u64>,
-    /// `validity`: whether the file is revoked.
-    pub state: Validity,
+    pub(crate) since_usec: u64,
+    pub(crate) until_usec: Option<u64>,
+    pub(crate) state: Validity,
 }
 
 impl ValidityWindow {
+    /// `validSinceUSec`: the file is not to be used before this time, in
+    /// microseconds since the epoch.
+    pub fn since_usec(&self) -> u64 {
+        self.since_usec
+    }
+
+    /// Sets `validSinceUSec`.
+    pub fn set_since_usec(&mut self, since_usec: u64) {
+        self.since_usec = since_usec;
+    }
+
+    /// `validUntilUSec`: the file is not to be used from this time on, in
+    /// microseconds since the epoch.
+    pub fn until_usec(&self) -> Option<u64> {
+        self.until_usec
+    }
+
+    /// Sets `validUntilUSec`.
+    pub fn set_until_usec(&mut self, until_usec: Option<u64>) {
+        self.until_usec = until_usec;
+    }
+
+    /// `validity`: whether the file is revoked.
+    pub fn state(&self) -> Validity {
+        self.state
+    }
+
+    /// Sets `validity`.
+    pub fn set_state(&mut self, state: Validity) {
+        self.state = state;
+    }
+
     /// Checks that what the window is of, which a message calls `subject`,
     /// may be used at the time `now_usec`, in microseconds since the epoch:
     /// that it is not revoked and that the time is inside the window.
@@ -364,20 +391,12 @@ impl FromStr for Uuid {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GptPartition {
-    /// `gptLabel`: the partition label, at most 36 UTF-16 units.
-    pub label: Option<String>,
-    /// `gptUuid`: the partition UUID.
-    pub uuid: Option<Uuid>,
-    /// `gptTypeUuid`: the partition type UUID.
-    pub type_uuid: Option<Uuid>,
-    /// `gptFlags`: the attribute flags of the partition entry.
-    pub flags: Option<u64>,
-    /// `gptFlagNoAuto`: the flag of that name in the Discoverable
-    /// Partitions Specification, [`GptPartition::FLAG_NO_AUTO`].
-    pub no_auto: Option<bool>,
-    /// `gptFlagGrowFileSystem`: the flag of that name in the Discoverable
-    /// Partitions Specification, [`GptPartition::FLAG_GROW_FILE_SYSTEM`].
-    pub grow_file_system: Option<bool>,
+    pub(crate) label: Option<String>,
+    pub(crate) uuid: Option<Uuid>,
+    pub(crate) type_uuid: Option<Uuid>,
+    pub(crate) flags: Option<u64>,
+    pub(crate) no_auto: Option<bool>,
+    pub(crate) grow_file_system: Option<bool>,
 }
 
 impl GptPartition {
@@ -396,6 +415,68 @@ impl GptPartition {
     /// The longest partition label, in UTF-16 units.
     pub const LABEL_MAX: usize = 36;
 
+    /// `gptLabel`: the partition label, at most 36 UTF-16 units.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// Sets `gptLabel`.
+    pub fn set_label(&mut self, label: Option<String>) {
+        self.label = label;
+    }
+
+    /// `gptUuid`: the partition UUID.
+    pub fn uuid(&self) -> Option<Uuid> {
+        self.uuid
+    }
+
+    /// Sets `gptUuid`.
+    pub fn set_uuid(&mut self, uuid: Option<Uuid>) {
+        self.uuid = uuid;
+    }
+
+    /// `gptTypeUuid`: the partition type UUID.
+    pub fn type_uuid(&self) -> Option<Uuid> {
+        self.type_uuid
+    }
+
+    /// Sets `gptTypeUuid`.
+    pub fn set_type_uuid(&mut self, type_uuid: Option<Uuid>) {
+        self.type_uuid = type_uuid;
+    }
+
+    /// `gptFlags`: the attribute flags of the partition entry.
+    pub fn flags(&self) -> Option<u64> {
+        self.flags
+    }
+
+    /// Sets `gptFlags`.
+    pub fn set_flags(&mut self, flags: Option<u64>) {
+        self.flags = flags;
+    }
+
+    /// `gptFlagNoAuto`: the flag of that name in the Discoverable
+    /// Partitions Specification, [`GptPartition::FLAG_NO_AUTO`].
+    pub fn no_auto(&self) -> Option<bool> {
+        self.no_auto
+    }
+
+    /// Sets `gptFlagNoAuto`.
+    pub fn set_no_auto(&mut self, no_auto: Option<bool>) {
+        self.no_auto = no_auto;
+    }
+
+    /// `gptFlagGrowFileSystem`: the flag of that name in the Discoverable
+    /// Partitions Specification, [`GptPartition::FLAG_GROW_FILE_SYSTEM`].
+    pub fn grow_file_system(&self) -> Option<bool> {
+        self.grow_file_system
+    }
+
+    /// Sets `gptFlagGrowFileSystem`.
+    pub fn set_grow_file_system(&mut self, grow_file_system: Option<bool>) {
+        self.grow_file_system = grow_file_system;
+    }
+
     /// Whether any of the fields is set. Only a regular file describes a
     /// partition.
     pub fn describes_partition(&self) -> bool {
@@ -411,11 +492,7 @@ impl GptPartition {
 /// A set of flags of one kind that the specification has a field for each:
 /// [`DosFlags`] and [`InodeFlags`]. [`FlagStates`] says the states of the
 /// flags of one kind.
-///
-/// It is public only so that it can bound the methods of [`FlagStates`].
-/// The crate does not export it, so no other crate can name or implement
-/// it.
-pub trait FlagSet:
+pub(crate) trait FlagSet:
     Copy + Default + PartialEq + BitAnd<Output = Self> + BitOr<Output = Self> + Not<Output = Self> + 'static
 {
     /// Every single flag with its field and the feature that records it, in
@@ -457,13 +534,13 @@ macro_rules! flag_set {
     ($flags:ident) => {
         impl $flags {
             /// Whether every flag of `flags` is among these.
-            pub const fn contains(self, flags: $flags) -> bool {
+            pub(crate) const fn contains(self, flags: $flags) -> bool {
                 self.0 & flags.0 == flags.0
             }
 
             /// These flags without those of `flags`.
             #[must_use]
-            pub const fn without(self, flags: $flags) -> $flags {
+            pub(crate) const fn without(self, flags: $flags) -> $flags {
                 $flags(self.0 & !flags.0)
             }
         }
@@ -514,24 +591,22 @@ macro_rules! flag_set {
 ///
 /// They are the attributes of FAT, of exFAT and of file systems like them.
 /// The read-only attribute has no field of its own. `readOnly` stands for
-/// it, see [`InodeAttributes::read_only`]. Only regular files and
+/// it, see [`InodeAttributes::read_only()`]. Only regular files and
 /// directories have DOS attributes, and the root directory has none: the
 /// root directory of FAT has no directory entry to keep them in.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct DosFlags(u8);
+pub(crate) struct DosFlags(u8);
 
 impl DosFlags {
     /// `flagHidden`: the DOS attribute `ATTR_HIDDEN`.
-    pub const HIDDEN: DosFlags = DosFlags(1 << 0);
+    pub(crate) const HIDDEN: DosFlags = DosFlags(1 << 0);
     /// `flagSystem`: the DOS attribute `ATTR_SYSTEM`.
-    pub const SYSTEM: DosFlags = DosFlags(1 << 1);
+    pub(crate) const SYSTEM: DosFlags = DosFlags(1 << 1);
     /// `flagArchive`: the DOS attribute `ATTR_ARCHIVE`.
-    pub const ARCHIVE: DosFlags = DosFlags(1 << 2);
+    pub(crate) const ARCHIVE: DosFlags = DosFlags(1 << 2);
 
-    /// No DOS attribute.
-    pub const NONE: DosFlags = DosFlags(0);
     /// Every DOS attribute.
-    pub const ALL: DosFlags = DosFlags(DosFlags::HIDDEN.0 | DosFlags::SYSTEM.0 | DosFlags::ARCHIVE.0);
+    pub(crate) const ALL: DosFlags = DosFlags(DosFlags::HIDDEN.0 | DosFlags::SYSTEM.0 | DosFlags::ARCHIVE.0);
 }
 
 impl FlagSet for DosFlags {
@@ -550,24 +625,22 @@ flag_set!(DosFlags);
 /// Only regular files and directories have them, the root directory among
 /// them.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct InodeFlags(u8);
+pub(crate) struct InodeFlags(u8);
 
 impl InodeFlags {
     /// `flagAppendOnly`: the inode flag `FS_APPEND_FL`.
-    pub const APPEND_ONLY: InodeFlags = InodeFlags(1 << 0);
+    pub(crate) const APPEND_ONLY: InodeFlags = InodeFlags(1 << 0);
     /// `flagImmutable`: the inode flag `FS_IMMUTABLE_FL`.
-    pub const IMMUTABLE: InodeFlags = InodeFlags(1 << 1);
+    pub(crate) const IMMUTABLE: InodeFlags = InodeFlags(1 << 1);
     /// `flagNoAtime`: the inode flag `FS_NOATIME_FL`.
-    pub const NO_ATIME: InodeFlags = InodeFlags(1 << 2);
+    pub(crate) const NO_ATIME: InodeFlags = InodeFlags(1 << 2);
     /// `flagNoCow`: the inode flag `FS_NOCOW_FL`.
-    pub const NO_COW: InodeFlags = InodeFlags(1 << 3);
+    pub(crate) const NO_COW: InodeFlags = InodeFlags(1 << 3);
     /// `flagNoDump`: the inode flag `FS_NODUMP_FL`.
-    pub const NO_DUMP: InodeFlags = InodeFlags(1 << 4);
+    pub(crate) const NO_DUMP: InodeFlags = InodeFlags(1 << 4);
 
-    /// No inode flag.
-    pub const NONE: InodeFlags = InodeFlags(0);
     /// Every inode flag.
-    pub const ALL: InodeFlags = InodeFlags(
+    pub(crate) const ALL: InodeFlags = InodeFlags(
         InodeFlags::APPEND_ONLY.0
             | InodeFlags::IMMUTABLE.0
             | InodeFlags::NO_ATIME.0
@@ -594,34 +667,26 @@ flag_set!(InodeFlags);
 
 /// What an object says about the flags of one kind, [`DosFlags`] or
 /// [`InodeFlags`]: which of them it states, and which of those are set.
-/// Nothing is known about the others.
-///
-/// ```
-/// use uapi16::{DosFlags, FlagStates};
-///
-/// let mut states = FlagStates::default();
-/// states.put(DosFlags::HIDDEN, Some(true));
-/// states.put(DosFlags::ARCHIVE, Some(false));
-/// assert_eq!(states.get(DosFlags::HIDDEN), Some(true));
-/// assert_eq!(states.get(DosFlags::ARCHIVE), Some(false));
-/// assert_eq!(states.get(DosFlags::SYSTEM), None);
-/// ```
+/// Nothing is known about the others. The objects give one getter and one
+/// setter for each flag, which go through [`FlagStates::get`] and
+/// [`FlagStates::put`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FlagStates<F> {
+pub(crate) struct FlagStates<F> {
     /// The flags the object states.
-    pub stated: F,
-    /// Of those, the flags that are set.
-    pub set: F,
+    pub(crate) stated: F,
+    /// Of those, the flags that are set. [`FlagStates::put`] keeps them
+    /// among those it states.
+    pub(crate) set: F,
 }
 
 impl<F: FlagSet> FlagStates<F> {
     /// Whether `flag` is set, cleared, or not known.
-    pub fn get(self, flag: F) -> Option<bool> {
+    pub(crate) fn get(self, flag: F) -> Option<bool> {
         ((self.stated & flag) == flag).then_some((self.set & flag) == flag)
     }
 
     /// States `flag` as set or cleared, or as not known.
-    pub fn put(&mut self, flag: F, state: Option<bool>) {
+    pub(crate) fn put(&mut self, flag: F, state: Option<bool>) {
         self.stated = self.stated & !flag;
         self.set = self.set & !flag;
         if let Some(set) = state {
@@ -672,7 +737,15 @@ impl<F: FlagSet> FlagStates<F> {
 ///
 /// The `size` and the `sha256` of a [`FileObject`], the sizes and hashes
 /// of a [`ContentsObject`] and the `readOnly` of [`InodeAttributes`] can be
-/// filled in. Each of them notes it in its own `filled_in`.
+/// filled in. [`FileObject::filled_in()`], [`ContentsObject::filled_in()`]
+/// and [`InodeAttributes::filled_in()`] say which were.
+///
+/// A value that is set is not one a reader filled in. A value that the
+/// sizes and hashes of the same object follow from also drops those that
+/// a reader filled in when it is set: they are None then. These are the
+/// size, the hash and the contents objects of a file object, and the sizes,
+/// the hashes, the encoding and the source of a contents object. The next
+/// reader of the manifest fills them in again.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FilledIn(u8);
 
@@ -702,13 +775,13 @@ impl FilledIn {
     }
 
     /// Notes that `field` was filled in, if it is one that can be.
-    pub fn insert(&mut self, field: Field) {
+    pub(crate) fn insert(&mut self, field: Field) {
         self.0 |= FilledIn::bit(field);
     }
 
     /// Notes that `field` was not filled in, for a value that was set
     /// since.
-    pub fn remove(&mut self, field: Field) {
+    pub(crate) fn remove(&mut self, field: Field) {
         self.0 &= !FilledIn::bit(field);
     }
 
@@ -829,16 +902,43 @@ impl FromStr for FatSerial {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileSystemIdentity {
-    /// `fsUUID`: the UUID of the file system.
-    pub uuid: Option<Uuid>,
-    /// `fsLabel`: the label of the file system, see
-    /// [`FileSystemIdentity::is_valid_label`].
-    pub label: Option<String>,
-    /// `fatSerial`: the volume serial number of a FAT or exFAT file system.
-    pub fat_serial: Option<FatSerial>,
+    pub(crate) uuid: Option<Uuid>,
+    pub(crate) label: Option<String>,
+    pub(crate) fat_serial: Option<FatSerial>,
 }
 
 impl FileSystemIdentity {
+    /// `fsUUID`: the UUID of the file system.
+    pub fn uuid(&self) -> Option<Uuid> {
+        self.uuid
+    }
+
+    /// Sets `fsUUID`.
+    pub fn set_uuid(&mut self, uuid: Option<Uuid>) {
+        self.uuid = uuid;
+    }
+
+    /// `fsLabel`: the label of the file system, see
+    /// [`FileSystemIdentity::is_valid_label`].
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// Sets `fsLabel`.
+    pub fn set_label(&mut self, label: Option<String>) {
+        self.label = label;
+    }
+
+    /// `fatSerial`: the volume serial number of a FAT or exFAT file system.
+    pub fn fat_serial(&self) -> Option<FatSerial> {
+        self.fat_serial
+    }
+
+    /// Sets `fatSerial`.
+    pub fn set_fat_serial(&mut self, fat_serial: Option<FatSerial>) {
+        self.fat_serial = fat_serial;
+    }
+
     /// Whether `label` can be the label of a file system in a manifest,
     /// in `fsLabel`: a string a manifest can have, without control
     /// characters. A file system can take less than that.
@@ -868,9 +968,9 @@ impl FileSystemIdentity {
     /// use uapi16::{FatSerial, FileSystemIdentity};
     ///
     /// let mut identity = FileSystemIdentity::default();
-    /// identity.uuid = "1234abcd-5678-4ef0-9abc-def012345678".parse().ok();
+    /// identity.set_uuid("1234abcd-5678-4ef0-9abc-def012345678".parse().ok());
     /// assert_eq!(identity.volume_serial(), Some(FatSerial::new(0x1234_abcd)));
-    /// identity.fat_serial = Some(FatSerial::new(0x5678_9abc));
+    /// identity.set_fat_serial(Some(FatSerial::new(0x5678_9abc)));
     /// assert_eq!(identity.volume_serial(), Some(FatSerial::new(0x5678_9abc)));
     /// ```
     pub fn volume_serial(&self) -> Option<FatSerial> {
@@ -905,27 +1005,16 @@ pub enum ContentsSource {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContentsObject {
-    /// `file`, `url` or `literal`: where the data is.
-    pub source: ContentsSource,
-    /// `httpHeaders`: the header fields of the HTTP requests for the data
-    /// at `url`, by name, in the order the manifest lists them.
-    pub http_headers: Vec<(String, String)>,
-    /// `encoding`: the HTTP content coding the data is stored in, in
-    /// lower case. None is no encoding.
-    pub encoding: Option<String>,
-    /// `encodedSize`: the size of the data as it is stored.
-    pub encoded_size: Option<u64>,
-    /// `encodedSha256`: the hash of the data as it is stored.
-    pub encoded_sha256: Option<Sha256>,
-    /// `originalSize`: the size of the decoded data.
-    pub original_size: Option<u64>,
-    /// `originalSha256`: the hash of the decoded data.
-    pub original_sha256: Option<Sha256>,
-    /// `offset`: where the file object's data starts in the decoded data.
-    pub offset: u64,
-    /// The sizes and hashes that follow from the other fields, if a reader
-    /// filled them in. Whoever sets another value takes the field out.
-    pub filled_in: FilledIn,
+    pub(crate) source: ContentsSource,
+    pub(crate) http_headers: Vec<(String, String)>,
+    pub(crate) encoding: Option<String>,
+    pub(crate) encoded_size: Option<u64>,
+    pub(crate) encoded_sha256: Option<Sha256>,
+    pub(crate) original_size: Option<u64>,
+    pub(crate) original_sha256: Option<Sha256>,
+    pub(crate) offset: u64,
+    /// The sizes and hashes a reader filled in.
+    pub(crate) filled_in: FilledIn,
 }
 
 impl ContentsObject {
@@ -962,6 +1051,119 @@ impl ContentsObject {
             _ => None,
         }
     }
+
+    /// `file`, `url` or `literal`: where the data is.
+    pub fn source(&self) -> &ContentsSource {
+        &self.source
+    }
+
+    /// Sets `file`, `url` or `literal`, and drops what a reader filled in.
+    pub fn set_source(&mut self, source: ContentsSource) {
+        self.drop_filled_in();
+        self.source = source;
+    }
+
+    /// `httpHeaders`: the header fields of the HTTP requests for the data
+    /// at `url`, by name, in the order the manifest lists them.
+    pub fn http_headers(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.http_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    /// Sets `httpHeaders`.
+    pub fn set_http_headers(&mut self, headers: Vec<(String, String)>) {
+        self.http_headers = headers;
+    }
+
+    /// `encoding`: the HTTP content coding the data is stored in, in
+    /// lower case. None is no encoding.
+    pub fn encoding(&self) -> Option<&str> {
+        self.encoding.as_deref()
+    }
+
+    /// Sets `encoding`, and drops what a reader filled in.
+    pub fn set_encoding(&mut self, encoding: Option<String>) {
+        self.drop_filled_in();
+        self.encoding = encoding;
+    }
+
+    /// `encodedSize`: the size of the data as it is stored.
+    pub fn encoded_size(&self) -> Option<u64> {
+        self.encoded_size
+    }
+
+    /// Sets `encodedSize`, and drops what a reader filled in.
+    pub fn set_encoded_size(&mut self, size: Option<u64>) {
+        self.drop_filled_in();
+        self.encoded_size = size;
+    }
+
+    /// `encodedSha256`: the hash of the data as it is stored.
+    pub fn encoded_sha256(&self) -> Option<Sha256> {
+        self.encoded_sha256
+    }
+
+    /// Sets `encodedSha256`, and drops what a reader filled in.
+    pub fn set_encoded_sha256(&mut self, sha256: Option<Sha256>) {
+        self.drop_filled_in();
+        self.encoded_sha256 = sha256;
+    }
+
+    /// `originalSize`: the size of the decoded data.
+    pub fn original_size(&self) -> Option<u64> {
+        self.original_size
+    }
+
+    /// Sets `originalSize`, and drops what a reader filled in.
+    pub fn set_original_size(&mut self, size: Option<u64>) {
+        self.drop_filled_in();
+        self.original_size = size;
+    }
+
+    /// `originalSha256`: the hash of the decoded data.
+    pub fn original_sha256(&self) -> Option<Sha256> {
+        self.original_sha256
+    }
+
+    /// Sets `originalSha256`, and drops what a reader filled in.
+    pub fn set_original_sha256(&mut self, sha256: Option<Sha256>) {
+        self.drop_filled_in();
+        self.original_sha256 = sha256;
+    }
+
+    /// `offset`: where the file object's data starts in the decoded data.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Sets `offset`.
+    pub fn set_offset(&mut self, offset: u64) {
+        self.offset = offset;
+    }
+
+    /// The sizes and hashes a reader filled in, see [`FilledIn`].
+    pub fn filled_in(&self) -> FilledIn {
+        self.filled_in
+    }
+
+    /// Drops the sizes and hashes a reader filled in, which follow from the
+    /// other fields: they are None, and none is noted as filled in.
+    fn drop_filled_in(&mut self) {
+        let filled_in = std::mem::take(&mut self.filled_in);
+        if filled_in.contains(Field::EncodedSize) {
+            self.encoded_size = None;
+        }
+        if filled_in.contains(Field::EncodedSha256) {
+            self.encoded_sha256 = None;
+        }
+        if filled_in.contains(Field::OriginalSize) {
+            self.original_size = None;
+        }
+        if filled_in.contains(Field::OriginalSha256) {
+            self.original_sha256 = None;
+        }
+    }
 }
 
 /// The inode attributes of a file: its access mode, its owner, its
@@ -974,37 +1176,31 @@ impl ContentsObject {
 /// where a directory is described twice: by the file object of the
 /// manifest it is in and by the root file object of a sub-manifest of its
 /// own.
+///
+/// The Linux inode flags the specification has, some of those
+/// `chattr(1)` changes, have a field each, such as `flagImmutable`. Only
+/// regular files and directories have them, the root directory among
+/// them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InodeAttributes {
-    /// `mode`: the access mode.
-    pub mode: Option<Mode>,
-    /// `uid`: the owning user.
-    pub uid: Option<u32>,
-    /// `gid`: the owning group.
-    pub gid: Option<u32>,
-    /// `userName`: the name of the owning user.
-    pub user_name: Option<Box<str>>,
-    /// `groupName`: the name of the owning group.
-    pub group_name: Option<Box<str>>,
-    /// `mTimeNSec`: the modification time in nanoseconds since the epoch,
-    /// see [`InodeAttributes::mtime`].
-    pub mtime_nsec: Option<u64>,
-    /// `extendedAttributes`: the extended attributes of the `user`
-    /// namespace, by their names without the `user.` in front. None says
-    /// nothing about them. A map lists them all, so an empty one says the
-    /// file has none.
-    pub user_xattrs: Option<Box<BTreeMap<String, Vec<u8>>>>,
-    /// `readOnly`: whether the file is read-only, see
-    /// [`InodeAttributes::is_read_only`]. It stands for the read-only
-    /// attribute of DOS and for [`GptPartition::FLAG_READ_ONLY`] too.
-    pub read_only: Option<bool>,
+    pub(crate) mode: Option<Mode>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+    pub(crate) user_name: Option<Box<str>>,
+    pub(crate) group_name: Option<Box<str>>,
+    pub(crate) mtime_nsec: Option<u64>,
+    /// The extended attributes by their names. A map lists them all, so an
+    /// empty one says the file has none. Few files have any, and the box
+    /// keeps the attributes of the others small.
+    #[allow(clippy::box_collection)]
+    pub(crate) user_xattrs: Option<Box<BTreeMap<String, Vec<u8>>>>,
+    pub(crate) read_only: Option<bool>,
     /// `flagAppendOnly` and the other fields of the inode flags: the
     /// flags the object states.
-    pub flags: FlagStates<InodeFlags>,
-    /// `readOnly`, if a reader filled it in. Whoever sets another value
-    /// takes the field out.
-    pub filled_in: FilledIn,
+    pub(crate) flags: FlagStates<InodeFlags>,
+    /// `readOnly`, if a reader filled it in.
+    pub(crate) filled_in: FilledIn,
 }
 
 impl InodeAttributes {
@@ -1067,6 +1263,107 @@ impl InodeAttributes {
         if features.contains(Features::USER_XATTR) && self.user_xattrs.is_none() {
             self.user_xattrs = Some(Box::default());
         }
+    }
+
+    /// `mode`: the access mode.
+    pub fn mode(&self) -> Option<Mode> {
+        self.mode
+    }
+
+    /// Sets `mode`.
+    pub fn set_mode(&mut self, mode: Option<Mode>) {
+        self.mode = mode;
+    }
+
+    /// `uid`: the owning user.
+    pub fn uid(&self) -> Option<u32> {
+        self.uid
+    }
+
+    /// Sets `uid`.
+    pub fn set_uid(&mut self, uid: Option<u32>) {
+        self.uid = uid;
+    }
+
+    /// `gid`: the owning group.
+    pub fn gid(&self) -> Option<u32> {
+        self.gid
+    }
+
+    /// Sets `gid`.
+    pub fn set_gid(&mut self, gid: Option<u32>) {
+        self.gid = gid;
+    }
+
+    /// `userName`: the name of the owning user.
+    pub fn user_name(&self) -> Option<&str> {
+        self.user_name.as_deref()
+    }
+
+    /// Sets `userName`.
+    pub fn set_user_name(&mut self, name: Option<String>) {
+        self.user_name = name.map(String::into_boxed_str);
+    }
+
+    /// `groupName`: the name of the owning group.
+    pub fn group_name(&self) -> Option<&str> {
+        self.group_name.as_deref()
+    }
+
+    /// Sets `groupName`.
+    pub fn set_group_name(&mut self, name: Option<String>) {
+        self.group_name = name.map(String::into_boxed_str);
+    }
+
+    /// `mTimeNSec`: the modification time in nanoseconds since the epoch,
+    /// see [`InodeAttributes::mtime`].
+    pub fn mtime_nsec(&self) -> Option<u64> {
+        self.mtime_nsec
+    }
+
+    /// Sets `mTimeNSec`. Unlike [`InodeAttributes::set_mtime`] it can take
+    /// the time away.
+    pub fn set_mtime_nsec(&mut self, nsec: Option<u64>) {
+        self.mtime_nsec = nsec;
+    }
+
+    /// `extendedAttributes`: the extended attributes of the `user`
+    /// namespace, by their names without the `user.` in front, in the order
+    /// of their names. None says nothing about them. Some lists them all,
+    /// so where it lists none the file has none.
+    pub fn user_xattrs(&self) -> Option<impl ExactSizeIterator<Item = (&str, &[u8])>> {
+        let xattrs = self.user_xattrs.as_deref()?;
+        Some(xattrs.iter().map(|(name, value)| (name.as_str(), value.as_slice())))
+    }
+
+    /// The value of the extended attribute of the `user` namespace whose
+    /// name without the `user.` in front is `name`, if the attributes list
+    /// it.
+    pub fn user_xattr(&self, name: &str) -> Option<&[u8]> {
+        self.user_xattrs.as_deref()?.get(name).map(Vec::as_slice)
+    }
+
+    /// Sets `extendedAttributes`, see [`InodeAttributes::user_xattrs`].
+    pub fn set_user_xattrs(&mut self, xattrs: Option<BTreeMap<String, Vec<u8>>>) {
+        self.user_xattrs = xattrs.map(Box::new);
+    }
+
+    /// `readOnly`: whether the file is read-only, see
+    /// [`InodeAttributes::is_read_only`]. It stands for the read-only
+    /// attribute of DOS and for [`GptPartition::FLAG_READ_ONLY`] too.
+    pub fn read_only(&self) -> Option<bool> {
+        self.read_only
+    }
+
+    /// Sets `readOnly`.
+    pub fn set_read_only(&mut self, read_only: Option<bool>) {
+        self.filled_in.remove(Field::ReadOnly);
+        self.read_only = read_only;
+    }
+
+    /// `readOnly`, if a reader filled it in, see [`FilledIn`].
+    pub fn filled_in(&self) -> FilledIn {
+        self.filled_in
     }
 
     /// The modification time, if the attributes have one.
@@ -1168,48 +1465,39 @@ impl InodeAttributes {
 ///
 /// Every field but the name and the type is optional. What the file is as
 /// an inode, its access mode, owner, time and the like, is in
-/// [`FileObject::inode`], as it is for the root directory in the
+/// [`FileObject::inode()`], as it is for the root directory in the
 /// [`RootObject`]. A reader fills in what follows from the other fields:
 /// the size 0 for the hash of no data and that hash for the size 0, and
 /// the size and the hash of a file whose contents object gives them. It
-/// notes them in `filled_in`, and a writer leaves them out.
+/// notes them, see [`FileObject::filled_in()`], and a writer leaves them
+/// out.
+///
+/// The DOS attributes hidden, system and archive have a field each:
+/// `flagHidden`, `flagSystem` and `flagArchive`. They are the attributes
+/// of FAT, of exFAT and of file systems like them. The read-only attribute
+/// has no field of its own. `readOnly` stands for it, see
+/// [`InodeAttributes::read_only()`]. Only regular files and directories
+/// have DOS attributes, and the root directory has none: the root
+/// directory of FAT has no directory entry to keep them in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileObject {
-    /// `name`: the path of the file below the root.
-    pub name: Name,
-    /// `type`: the inode type. An object that does not say is a regular
-    /// file.
-    pub inode_type: InodeType,
-    /// `size`: the size of the data in bytes. For a symbolic link that
-    /// is the length of its target, for a directory the size of the
-    /// manifest of its own that `contents` refers to.
-    pub size: Option<u64>,
-    /// `sha256`: the hash of the data.
-    pub sha256: Option<Sha256>,
-    /// `contents`: where the contents can be taken from. Without any they
-    /// are in the file of the object's name next to the manifest.
-    pub contents: Vec<ContentsObject>,
-    /// `inodeToken`: the objects that carry the same token are hard links
-    /// to one file. None is a file of its own.
-    pub inode_token: Option<NonZeroU64>,
-    /// `major`: the major number of a device node.
-    pub major: Option<u64>,
-    /// `minor`: the minor number of a device node.
-    pub minor: Option<u64>,
-    /// The `gpt` fields, if the object describes a partition.
-    pub gpt: Option<Box<GptPartition>>,
+    pub(crate) name: Name,
+    pub(crate) inode_type: InodeType,
+    pub(crate) size: Option<u64>,
+    pub(crate) sha256: Option<Sha256>,
+    pub(crate) contents: Vec<ContentsObject>,
+    pub(crate) inode_token: Option<NonZeroU64>,
+    pub(crate) major: Option<u64>,
+    pub(crate) minor: Option<u64>,
+    pub(crate) gpt: Option<Box<GptPartition>>,
     /// `flagHidden`, `flagSystem` and `flagArchive`: the DOS attributes the
     /// object states.
-    pub dos_flags: FlagStates<DosFlags>,
-    /// The inode attributes of the file.
-    pub inode: InodeAttributes,
-    /// `validSinceUSec`, `validUntilUSec` and `validity`: when the file may
-    /// be used.
-    pub validity: ValidityWindow,
-    /// The size and the hash, if a reader filled them in. Whoever sets
-    /// another value takes the field out.
-    pub filled_in: FilledIn,
+    pub(crate) dos_flags: FlagStates<DosFlags>,
+    pub(crate) inode: InodeAttributes,
+    pub(crate) validity: ValidityWindow,
+    /// The size and the hash, if a reader filled them in.
+    pub(crate) filled_in: FilledIn,
 }
 
 impl FileObject {
@@ -1249,6 +1537,154 @@ impl FileObject {
             inode: InodeAttributes::default(),
             validity: ValidityWindow::default(),
             filled_in: FilledIn::default(),
+        }
+    }
+
+    /// `name`: the path of the file below the root.
+    pub fn name(&self) -> &Name {
+        &self.name
+    }
+
+    /// Sets `name`.
+    pub fn set_name(&mut self, name: Name) {
+        self.name = name;
+    }
+
+    /// The name, the object taken apart for it.
+    pub fn into_name(self) -> Name {
+        self.name
+    }
+
+    /// `type`: the inode type. An object that does not say is a regular
+    /// file.
+    pub fn inode_type(&self) -> InodeType {
+        self.inode_type
+    }
+
+    /// Sets `type`.
+    pub fn set_inode_type(&mut self, inode_type: InodeType) {
+        self.inode_type = inode_type;
+    }
+
+    /// `size`: the size of the data in bytes. For a symbolic link that is
+    /// the length of its target, for a directory the size of the manifest
+    /// of its own that `contents` refers to.
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Sets `size`, and drops what a reader filled in, see [`FilledIn`].
+    pub fn set_size(&mut self, size: Option<u64>) {
+        self.drop_filled_in();
+        self.size = size;
+    }
+
+    /// `sha256`: the hash of the data.
+    pub fn sha256(&self) -> Option<Sha256> {
+        self.sha256
+    }
+
+    /// Sets `sha256`, and drops what a reader filled in, see [`FilledIn`].
+    pub fn set_sha256(&mut self, sha256: Option<Sha256>) {
+        self.drop_filled_in();
+        self.sha256 = sha256;
+    }
+
+    /// `contents`: where the data can be taken from. A regular file without
+    /// contents objects has its data in the file of its own name next to
+    /// the manifest, see [`FileObject::data_location`].
+    pub fn contents(&self) -> &[ContentsObject] {
+        &self.contents
+    }
+
+    /// Sets `contents`, and drops what a reader filled in, see
+    /// [`FilledIn`]. A writer refuses more than [`MAX_CONTENTS`] of them.
+    ///
+    /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
+    pub fn set_contents(&mut self, contents: Vec<ContentsObject>) {
+        self.drop_filled_in();
+        self.contents = contents;
+    }
+
+    /// `inodeToken`: the objects that carry the same token are hard links
+    /// to one file. None is a file of its own.
+    pub fn inode_token(&self) -> Option<NonZeroU64> {
+        self.inode_token
+    }
+
+    /// Sets `inodeToken`.
+    pub fn set_inode_token(&mut self, token: Option<NonZeroU64>) {
+        self.inode_token = token;
+    }
+
+    /// `major`: the major number of a device node.
+    pub fn major(&self) -> Option<u64> {
+        self.major
+    }
+
+    /// Sets `major`.
+    pub fn set_major(&mut self, major: Option<u64>) {
+        self.major = major;
+    }
+
+    /// `minor`: the minor number of a device node.
+    pub fn minor(&self) -> Option<u64> {
+        self.minor
+    }
+
+    /// Sets `minor`.
+    pub fn set_minor(&mut self, minor: Option<u64>) {
+        self.minor = minor;
+    }
+
+    /// The `gpt` fields, if the object describes a partition.
+    pub fn gpt(&self) -> Option<&GptPartition> {
+        self.gpt.as_deref()
+    }
+
+    /// Sets the `gpt` fields.
+    pub fn set_gpt(&mut self, gpt: Option<GptPartition>) {
+        self.gpt = gpt.map(Box::new);
+    }
+
+    /// The inode attributes of the file.
+    pub fn inode(&self) -> &InodeAttributes {
+        &self.inode
+    }
+
+    /// The inode attributes of the file, to change them.
+    pub fn inode_mut(&mut self) -> &mut InodeAttributes {
+        &mut self.inode
+    }
+
+    /// `validSinceUSec`, `validUntilUSec` and `validity`: when the file may
+    /// be used.
+    pub fn validity(&self) -> ValidityWindow {
+        self.validity
+    }
+
+    /// Sets `validSinceUSec`, `validUntilUSec` and `validity`.
+    pub fn set_validity(&mut self, validity: ValidityWindow) {
+        self.validity = validity;
+    }
+
+    /// What a reader filled in of the object: its size and its hash, and
+    /// the `readOnly` of its inode attributes, see [`FilledIn`]. A writer
+    /// leaves these out.
+    pub fn filled_in(&self) -> FilledIn {
+        self.filled_in.union(self.inode.filled_in)
+    }
+
+    /// Drops the size and the hash a reader filled in, which follow from
+    /// each other and from the contents objects: they are None, and
+    /// neither is noted as filled in.
+    fn drop_filled_in(&mut self) {
+        let filled_in = std::mem::take(&mut self.filled_in);
+        if filled_in.contains(Field::Size) {
+            self.size = None;
+        }
+        if filled_in.contains(Field::Sha256) {
+            self.sha256 = None;
         }
     }
 
@@ -1373,22 +1809,12 @@ impl FileObject {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RootObject {
-    /// The inode attributes of the root directory.
-    pub inode: InodeAttributes,
-    /// `fsUUID`, `fsLabel` and `fatSerial`: the identity of the file
-    /// system the file objects are placed in.
-    pub file_system: FileSystemIdentity,
-    /// `gptDiskUuid`: the disk UUID of the GPT partition table the file
-    /// objects are placed in as partitions.
-    pub gpt_disk_uuid: Option<Uuid>,
-    /// `order`: the order the manifest lists its file objects in.
-    pub order: Option<Order>,
-    /// `features`: what the manifest records. None is
-    /// [`Features::DEFAULT`].
-    pub features: Option<Features>,
-    /// `validSinceUSec`, `validUntilUSec` and `validity`: when the
-    /// manifest may be used.
-    pub validity: ValidityWindow,
+    pub(crate) inode: InodeAttributes,
+    pub(crate) file_system: FileSystemIdentity,
+    pub(crate) gpt_disk_uuid: Option<Uuid>,
+    pub(crate) order: Option<Order>,
+    pub(crate) features: Option<Features>,
+    pub(crate) validity: ValidityWindow,
 }
 
 impl RootObject {
@@ -1401,6 +1827,70 @@ impl RootObject {
         (Field::FsUuid, Features::FS_UUID),
         (Field::GptDiskUuid, Features::GPT_DISK_UUID),
     ];
+
+    /// The inode attributes of the root directory.
+    pub fn inode(&self) -> &InodeAttributes {
+        &self.inode
+    }
+
+    /// The inode attributes of the root directory, to change them.
+    pub fn inode_mut(&mut self) -> &mut InodeAttributes {
+        &mut self.inode
+    }
+
+    /// `fsUUID`, `fsLabel` and `fatSerial`: the identity of the file
+    /// system the file objects are placed in.
+    pub fn file_system(&self) -> &FileSystemIdentity {
+        &self.file_system
+    }
+
+    /// The identity of the file system, to change it.
+    pub fn file_system_mut(&mut self) -> &mut FileSystemIdentity {
+        &mut self.file_system
+    }
+
+    /// `gptDiskUuid`: the disk UUID of the GPT partition table the file
+    /// objects are placed in as partitions.
+    pub fn gpt_disk_uuid(&self) -> Option<Uuid> {
+        self.gpt_disk_uuid
+    }
+
+    /// Sets `gptDiskUuid`.
+    pub fn set_gpt_disk_uuid(&mut self, uuid: Option<Uuid>) {
+        self.gpt_disk_uuid = uuid;
+    }
+
+    /// `order`: the order the manifest lists its file objects in.
+    pub fn order(&self) -> Option<Order> {
+        self.order
+    }
+
+    /// Sets `order`.
+    pub fn set_order(&mut self, order: Option<Order>) {
+        self.order = order;
+    }
+
+    /// `features`: what the manifest records. None is
+    /// [`Features::DEFAULT`].
+    pub fn features(&self) -> Option<Features> {
+        self.features
+    }
+
+    /// Sets `features`.
+    pub fn set_features(&mut self, features: Option<Features>) {
+        self.features = features;
+    }
+
+    /// `validSinceUSec`, `validUntilUSec` and `validity`: when the
+    /// manifest may be used.
+    pub fn validity(&self) -> ValidityWindow {
+        self.validity
+    }
+
+    /// Sets `validSinceUSec`, `validUntilUSec` and `validity`.
+    pub fn set_validity(&mut self, validity: ValidityWindow) {
+        self.validity = validity;
+    }
 
     /// Whether the object has `field`, one of
     /// [`RootObject::FEATURE_FIELDS`].
@@ -1483,13 +1973,9 @@ impl RootObject {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SignatureObject {
-    /// `mechanism`: how the signature was made. The specification has
-    /// `openpgp` and `pkcs7`.
-    pub mechanism: String,
-    /// `key`: what identifies the key, such as its fingerprint.
-    pub key: Option<Vec<u8>>,
-    /// `data`: the signature.
-    pub data: Option<Vec<u8>>,
+    pub(crate) mechanism: String,
+    pub(crate) key: Option<Vec<u8>>,
+    pub(crate) data: Option<Vec<u8>>,
 }
 
 impl SignatureObject {
@@ -1501,6 +1987,37 @@ impl SignatureObject {
             key: None,
             data: None,
         }
+    }
+
+    /// `mechanism`: how the signature was made. The specification has
+    /// `openpgp` and `pkcs7`.
+    pub fn mechanism(&self) -> &str {
+        &self.mechanism
+    }
+
+    /// Sets `mechanism`.
+    pub fn set_mechanism(&mut self, mechanism: impl Into<String>) {
+        self.mechanism = mechanism.into();
+    }
+
+    /// `key`: what identifies the key, such as its fingerprint.
+    pub fn key(&self) -> Option<&[u8]> {
+        self.key.as_deref()
+    }
+
+    /// Sets `key`.
+    pub fn set_key(&mut self, key: Option<Vec<u8>>) {
+        self.key = key;
+    }
+
+    /// `data`: the signature.
+    pub fn data(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
+
+    /// Sets `data`.
+    pub fn set_data(&mut self, data: Option<Vec<u8>>) {
+        self.data = data;
     }
 }
 
@@ -1709,20 +2226,23 @@ mod tests {
         assert!(inode.windows(2).all(|pair| pair[0] < pair[1]), "{:?}", inode);
         let every_dos = DosFlags::FIELDS
             .iter()
-            .fold(DosFlags::NONE, |every, (flag, _, _)| every | *flag);
+            .fold(DosFlags::default(), |every, (flag, _, _)| every | *flag);
         let every_inode = InodeFlags::FIELDS
             .iter()
-            .fold(InodeFlags::NONE, |every, (flag, _, _)| every | *flag);
+            .fold(InodeFlags::default(), |every, (flag, _, _)| every | *flag);
         assert_eq!((every_dos, every_inode), (DosFlags::ALL, InodeFlags::ALL));
         // A field is the field of one kind of flags.
         assert!(dos.iter().all(|field| !inode.contains(field)));
         for &(flag, _, _) in DosFlags::FIELDS {
-            assert_eq!((!flag & flag, !flag | flag), (DosFlags::NONE, DosFlags::ALL));
+            assert_eq!((!flag & flag, !flag | flag), (DosFlags::default(), DosFlags::ALL));
         }
         for &(flag, _, _) in InodeFlags::FIELDS {
-            assert_eq!((!flag & flag, !flag | flag), (InodeFlags::NONE, InodeFlags::ALL));
+            assert_eq!((!flag & flag, !flag | flag), (InodeFlags::default(), InodeFlags::ALL));
         }
-        assert_eq!((!DosFlags::NONE, !InodeFlags::ALL), (DosFlags::ALL, InodeFlags::NONE));
+        assert_eq!(
+            (!DosFlags::default(), !InodeFlags::ALL),
+            (DosFlags::ALL, InodeFlags::default())
+        );
         let flags = DosFlags::HIDDEN | DosFlags::ARCHIVE;
         assert!(flags.contains(DosFlags::ARCHIVE) && !flags.contains(DosFlags::ALL));
         assert_eq!(flags.without(DosFlags::ARCHIVE), DosFlags::HIDDEN);
@@ -1731,7 +2251,7 @@ mod tests {
             format!("{:?}", InodeFlags::NO_COW | InodeFlags::APPEND_ONLY),
             "InodeFlags(flagAppendOnly | flagNoCow)"
         );
-        assert_eq!(format!("{:?}", InodeFlags::NONE), "InodeFlags()");
+        assert_eq!(format!("{:?}", InodeFlags::default()), "InodeFlags()");
         // What an object says about the flags of one kind.
         let mut states = FlagStates::default();
         assert_eq!(states.get(InodeFlags::IMMUTABLE), None);
@@ -1801,7 +2321,7 @@ mod tests {
                 let mut attributes = InodeAttributes::default();
                 set(&mut attributes, state);
                 assert_eq!(get(&attributes), state, "{:?}", flag);
-                let stated = if state.is_some() { flag } else { InodeFlags::NONE };
+                let stated = if state.is_some() { flag } else { InodeFlags::default() };
                 assert_eq!(attributes.flags.stated, stated, "{:?}", flag);
                 assert_eq!(attributes.flags.get(flag), state, "{:?}", flag);
             }
@@ -1809,7 +2329,7 @@ mod tests {
                 let mut object = FileObject::new(Name::new("f").unwrap());
                 set(&mut object, state);
                 assert_eq!(get(&object), state, "{:?}", flag);
-                let stated = if state.is_some() { flag } else { DosFlags::NONE };
+                let stated = if state.is_some() { flag } else { DosFlags::default() };
                 assert_eq!(object.dos_flags.stated, stated, "{:?}", flag);
                 assert_eq!(object.dos_flags.get(flag), state, "{:?}", flag);
             }
@@ -1958,5 +2478,102 @@ mod tests {
         assert_eq!(file.file().map(Name::as_str), Some("blob"));
         let url = ContentsObject::new(ContentsSource::Url("https://example.com/x".to_string()));
         assert_eq!(url.url(), Some("https://example.com/x"));
+    }
+
+    /// The extended attributes and the HTTP header fields come out as they
+    /// went in, the attributes in the order of their names.
+    #[test]
+    fn lists() {
+        let mut inode = InodeAttributes::default();
+        assert!(inode.user_xattrs().is_none());
+        assert_eq!(inode.user_xattr("a"), None);
+        inode.set_user_xattrs(Some(BTreeMap::from([
+            ("b".to_string(), b"2".to_vec()),
+            ("a".to_string(), Vec::new()),
+        ])));
+        let listed: Vec<(&str, &[u8])> = inode.user_xattrs().unwrap().collect();
+        assert_eq!(listed, [("a", &b""[..]), ("b", &b"2"[..])]);
+        assert_eq!(inode.user_xattrs().map(|xattrs| xattrs.len()), Some(2));
+        assert_eq!((inode.user_xattr("b"), inode.user_xattr("c")), (Some(&b"2"[..]), None));
+        // None of them, which says that the file has none.
+        inode.set_user_xattrs(Some(BTreeMap::new()));
+        assert_eq!(inode.user_xattrs().map(|xattrs| xattrs.len()), Some(0));
+        let mut contents = ContentsObject::new(ContentsSource::Url("https://example.com/x".to_string()));
+        contents.set_http_headers(vec![("X-B".into(), "2".into()), ("X-A".into(), "1".into())]);
+        let headers: Vec<(&str, &str)> = contents.http_headers().collect();
+        assert_eq!(headers, [("X-B", "2"), ("X-A", "1")]);
+    }
+
+    /// A value that is set drops the sizes and hashes a reader filled in on
+    /// the same object, and leaves the ones the record gives.
+    #[test]
+    fn setters_drop_what_a_reader_filled_in() {
+        use crate::testing::{manifest, read_whole, record, sequence, EMPTY, HELLO, TRAILER};
+
+        let read = |record: &str| read_whole(&manifest(&[record])).unwrap().objects.pop().unwrap();
+        let hello: Option<Sha256> = HELLO.parse().ok();
+        let none = FilledIn::default();
+        // The size 0 a reader fills in for the hash of no data, and the
+        // hash of no data for the size 0.
+        let mut object = read(&format!(r#"{{"name":"a","sha256":"{}"}}"#, EMPTY));
+        assert_eq!(
+            (object.size(), object.filled_in().contains(Field::Size)),
+            (Some(0), true)
+        );
+        object.set_sha256(hello);
+        assert_eq!(
+            (object.size(), object.sha256(), object.filled_in()),
+            (None, hello, none)
+        );
+        assert_eq!(record(&object), format!(r#"{{"name":"a","sha256":"{}"}}"#, HELLO));
+        let mut object = read(r#"{"name":"a","size":0}"#);
+        assert!(object.filled_in().contains(Field::Sha256));
+        object.set_size(Some(5));
+        assert_eq!(
+            (object.size(), object.sha256(), object.filled_in()),
+            (Some(5), None, none)
+        );
+        // The size a contents object gives.
+        let mut object = read(r#"{"name":"a","contents":[{"file":"blob","originalSize":3}]}"#);
+        assert_eq!(object.size(), Some(3));
+        let mut contents = object.contents()[0].clone();
+        contents.set_original_size(Some(7));
+        object.set_contents(vec![contents]);
+        assert_eq!((object.size(), object.filled_in()), (None, none));
+        // What the record gives stays.
+        let mut object = read(&format!(r#"{{"name":"a","size":5,"sha256":"{}"}}"#, HELLO));
+        object.set_size(Some(5));
+        assert_eq!((object.size(), object.sha256()), (Some(5), hello));
+        // Without an encoding the encoded size is the original size, and a
+        // literal gives both.
+        let object = read(r#"{"name":"a","contents":[{"file":"blob","originalSize":3}]}"#);
+        let mut contents = object.contents()[0].clone();
+        assert_eq!(contents.encoded_size(), Some(3));
+        assert!(contents.filled_in().contains(Field::EncodedSize));
+        contents.set_original_size(Some(7));
+        assert_eq!(
+            (contents.encoded_size(), contents.original_size(), contents.filled_in()),
+            (None, Some(7), none)
+        );
+        let mut contents = object.contents()[0].clone();
+        contents.set_encoding(Some("gzip".to_string()));
+        assert_eq!((contents.encoded_size(), contents.original_size()), (None, Some(3)));
+        let object = read(r#"{"name":"a","contents":[{"literal":"aGVsbG8="}]}"#);
+        let mut contents = object.contents()[0].clone();
+        assert_eq!((contents.encoded_size(), contents.original_size()), (Some(5), Some(5)));
+        contents.set_source(ContentsSource::File(Name::new("blob").unwrap()));
+        assert_eq!(
+            (contents.encoded_size(), contents.original_size(), contents.filled_in()),
+            (None, None, none)
+        );
+        // readOnly, which the object notes with its own marks.
+        let root = r#"{"features":["read-only"],"mediaType":"application/vnd.uapi.16.manifest"}"#;
+        let whole = read_whole(&sequence(&[root, r#"{"name":"a"}"#, TRAILER])).unwrap();
+        let mut object = whole.objects.into_iter().next().unwrap();
+        assert_eq!(object.inode().read_only(), Some(false));
+        assert!(object.filled_in().contains(Field::ReadOnly));
+        object.inode_mut().set_read_only(Some(false));
+        assert_eq!(object.inode().read_only(), Some(false));
+        assert!(!object.filled_in().contains(Field::ReadOnly));
     }
 }

@@ -157,8 +157,9 @@ impl SequenceCheck {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::object::{DosFlags, InodeFlags};
     use crate::testing::full_tree_names;
-    use crate::{ContentsObject, ContentsSource, DosFlags, FatSerial, InodeFlags, Mode, Name, Uuid};
+    use crate::{ContentsObject, ContentsSource, FatSerial, Mode, Name, Uuid};
     use std::num::NonZeroU64;
 
     /// Gives an object a field.

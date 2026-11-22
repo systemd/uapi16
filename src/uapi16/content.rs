@@ -47,15 +47,10 @@ pub enum DataLocation<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExternalFile<'a> {
-    /// The name of the file: the one a contents object names, or else the
-    /// object's own name.
-    pub name: &'a Name,
-    /// Where the data starts in the file.
-    pub offset: u64,
-    /// The size of the whole file, if the manifest gives it.
-    pub original_size: Option<u64>,
-    /// The hash of the whole file, if the manifest gives it.
-    pub original_sha256: Option<Sha256>,
+    pub(crate) name: &'a Name,
+    pub(crate) offset: u64,
+    pub(crate) original_size: Option<u64>,
+    pub(crate) original_sha256: Option<Sha256>,
 }
 
 /// How much of its file the data of a file object is.
@@ -68,6 +63,27 @@ enum DataExtent {
 }
 
 impl<'a> ExternalFile<'a> {
+    /// The name of the file: the one a contents object names, or else the
+    /// object's own name.
+    pub fn name(&self) -> &'a Name {
+        self.name
+    }
+
+    /// Where the data starts in the file.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The size of the whole file, if the manifest gives it.
+    pub fn original_size(&self) -> Option<u64> {
+        self.original_size
+    }
+
+    /// The hash of the whole file, if the manifest gives it.
+    pub fn original_sha256(&self) -> Option<Sha256> {
+        self.original_sha256
+    }
+
     /// The file `name` an object has its data in, by way of the contents
     /// object `contents` if one names it.
     fn new(name: &'a Name, contents: Option<&'a ContentsObject>) -> ExternalFile<'a> {
@@ -348,8 +364,8 @@ impl ContentsObject {
 /// use uapi16::{DataCheck, FileObject, Name, Sha256};
 ///
 /// let mut object = FileObject::new(Name::new("hello.txt")?);
-/// object.size = Some(5);
-/// object.sha256 = Some(Sha256::digest(b"hello"));
+/// object.set_size(Some(5));
+/// object.set_sha256(Some(Sha256::digest(b"hello")));
 /// let mut check = DataCheck::new(&object);
 /// check.update(b"hel")?;
 /// check.update(b"lo")?;
@@ -479,8 +495,9 @@ impl Write for CheckedSink<'_, '_> {
 /// [`DataProvider::end`].
 pub trait DataProvider {
     /// Writes the data of `object`, which is in `file`, to `sink`: exactly
-    /// `object.size` bytes when the object has a size. An error of the sink
-    /// comes back as it was, and one of the provider names the object.
+    /// `object.size()` bytes when the object has a size. An error of the
+    /// sink comes back as it was, and one of the provider names the
+    /// object.
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error>;
 
     /// Passes over the data of `object`, which the consumer does not take.
