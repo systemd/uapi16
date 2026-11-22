@@ -1102,6 +1102,66 @@ impl InodeAttributes {
             (None, None) => false,
         }
     }
+
+    /// `flagAppendOnly`: whether the inode flag `FS_APPEND_FL` is set. None
+    /// says nothing about it.
+    pub fn flag_append_only(&self) -> Option<bool> {
+        self.flags.get(InodeFlags::APPEND_ONLY)
+    }
+
+    /// Sets `flagAppendOnly`: the inode flag `FS_APPEND_FL` is set, cleared, or
+    /// not known.
+    pub fn set_flag_append_only(&mut self, append_only: Option<bool>) {
+        self.flags.put(InodeFlags::APPEND_ONLY, append_only);
+    }
+
+    /// `flagImmutable`: whether the inode flag `FS_IMMUTABLE_FL` is set. None
+    /// says nothing about it.
+    pub fn flag_immutable(&self) -> Option<bool> {
+        self.flags.get(InodeFlags::IMMUTABLE)
+    }
+
+    /// Sets `flagImmutable`: the inode flag `FS_IMMUTABLE_FL` is set, cleared,
+    /// or not known.
+    pub fn set_flag_immutable(&mut self, immutable: Option<bool>) {
+        self.flags.put(InodeFlags::IMMUTABLE, immutable);
+    }
+
+    /// `flagNoAtime`: whether the inode flag `FS_NOATIME_FL` is set. None says
+    /// nothing about it.
+    pub fn flag_no_atime(&self) -> Option<bool> {
+        self.flags.get(InodeFlags::NO_ATIME)
+    }
+
+    /// Sets `flagNoAtime`: the inode flag `FS_NOATIME_FL` is set, cleared, or
+    /// not known.
+    pub fn set_flag_no_atime(&mut self, no_atime: Option<bool>) {
+        self.flags.put(InodeFlags::NO_ATIME, no_atime);
+    }
+
+    /// `flagNoCow`: whether the inode flag `FS_NOCOW_FL` is set. None says
+    /// nothing about it.
+    pub fn flag_no_cow(&self) -> Option<bool> {
+        self.flags.get(InodeFlags::NO_COW)
+    }
+
+    /// Sets `flagNoCow`: the inode flag `FS_NOCOW_FL` is set, cleared, or not
+    /// known.
+    pub fn set_flag_no_cow(&mut self, no_cow: Option<bool>) {
+        self.flags.put(InodeFlags::NO_COW, no_cow);
+    }
+
+    /// `flagNoDump`: whether the inode flag `FS_NODUMP_FL` is set. None says
+    /// nothing about it.
+    pub fn flag_no_dump(&self) -> Option<bool> {
+        self.flags.get(InodeFlags::NO_DUMP)
+    }
+
+    /// Sets `flagNoDump`: the inode flag `FS_NODUMP_FL` is set, cleared, or not
+    /// known.
+    pub fn set_flag_no_dump(&mut self, no_dump: Option<bool>) {
+        self.flags.put(InodeFlags::NO_DUMP, no_dump);
+    }
 }
 
 /// A file object: what a manifest says about one file below its root.
@@ -1261,6 +1321,42 @@ impl FileObject {
         self.validity
             .check(now_usec, self.name.as_str().escape_debug())
             .map_err(|e| e.named(self.name.as_str()))
+    }
+
+    /// `flagArchive`: whether the DOS attribute `ATTR_ARCHIVE` is set. None
+    /// says nothing about it.
+    pub fn flag_archive(&self) -> Option<bool> {
+        self.dos_flags.get(DosFlags::ARCHIVE)
+    }
+
+    /// Sets `flagArchive`: the DOS attribute `ATTR_ARCHIVE` is set, cleared, or
+    /// not known.
+    pub fn set_flag_archive(&mut self, archive: Option<bool>) {
+        self.dos_flags.put(DosFlags::ARCHIVE, archive);
+    }
+
+    /// `flagHidden`: whether the DOS attribute `ATTR_HIDDEN` is set. None says
+    /// nothing about it.
+    pub fn flag_hidden(&self) -> Option<bool> {
+        self.dos_flags.get(DosFlags::HIDDEN)
+    }
+
+    /// Sets `flagHidden`: the DOS attribute `ATTR_HIDDEN` is set, cleared, or
+    /// not known.
+    pub fn set_flag_hidden(&mut self, hidden: Option<bool>) {
+        self.dos_flags.put(DosFlags::HIDDEN, hidden);
+    }
+
+    /// `flagSystem`: whether the DOS attribute `ATTR_SYSTEM` is set. None says
+    /// nothing about it.
+    pub fn flag_system(&self) -> Option<bool> {
+        self.dos_flags.get(DosFlags::SYSTEM)
+    }
+
+    /// Sets `flagSystem`: the DOS attribute `ATTR_SYSTEM` is set, cleared, or
+    /// not known.
+    pub fn set_flag_system(&mut self, system: Option<bool>) {
+        self.dos_flags.put(DosFlags::SYSTEM, system);
     }
 }
 
@@ -1651,6 +1747,73 @@ mod tests {
         states.put(InodeFlags::IMMUTABLE, None);
         states.put(InodeFlags::NO_DUMP, None);
         assert_eq!(states, FlagStates::default());
+    }
+
+    /// Every flag has a getter and a setter of its own, for its field and
+    /// no other.
+    #[test]
+    fn flag_accessors() {
+        type Get<T> = fn(&T) -> Option<bool>;
+        type Set<T> = fn(&mut T, Option<bool>);
+        let inode: [(InodeFlags, Get<InodeAttributes>, Set<InodeAttributes>); 5] = [
+            (
+                InodeFlags::APPEND_ONLY,
+                InodeAttributes::flag_append_only,
+                InodeAttributes::set_flag_append_only,
+            ),
+            (
+                InodeFlags::IMMUTABLE,
+                InodeAttributes::flag_immutable,
+                InodeAttributes::set_flag_immutable,
+            ),
+            (
+                InodeFlags::NO_ATIME,
+                InodeAttributes::flag_no_atime,
+                InodeAttributes::set_flag_no_atime,
+            ),
+            (
+                InodeFlags::NO_COW,
+                InodeAttributes::flag_no_cow,
+                InodeAttributes::set_flag_no_cow,
+            ),
+            (
+                InodeFlags::NO_DUMP,
+                InodeAttributes::flag_no_dump,
+                InodeAttributes::set_flag_no_dump,
+            ),
+        ];
+        let dos: [(DosFlags, Get<FileObject>, Set<FileObject>); 3] = [
+            (
+                DosFlags::ARCHIVE,
+                FileObject::flag_archive,
+                FileObject::set_flag_archive,
+            ),
+            (DosFlags::HIDDEN, FileObject::flag_hidden, FileObject::set_flag_hidden),
+            (DosFlags::SYSTEM, FileObject::flag_system, FileObject::set_flag_system),
+        ];
+        // One pair for every field, in the order of the fields.
+        let fields: Vec<InodeFlags> = InodeFlags::FIELDS.iter().map(|&(flag, _, _)| flag).collect();
+        assert_eq!(inode.map(|(flag, _, _)| flag).to_vec(), fields);
+        let fields: Vec<DosFlags> = DosFlags::FIELDS.iter().map(|&(flag, _, _)| flag).collect();
+        assert_eq!(dos.map(|(flag, _, _)| flag).to_vec(), fields);
+        for state in [Some(true), Some(false), None] {
+            for (flag, get, set) in inode {
+                let mut attributes = InodeAttributes::default();
+                set(&mut attributes, state);
+                assert_eq!(get(&attributes), state, "{:?}", flag);
+                let stated = if state.is_some() { flag } else { InodeFlags::NONE };
+                assert_eq!(attributes.flags.stated, stated, "{:?}", flag);
+                assert_eq!(attributes.flags.get(flag), state, "{:?}", flag);
+            }
+            for (flag, get, set) in dos {
+                let mut object = FileObject::new(Name::new("f").unwrap());
+                set(&mut object, state);
+                assert_eq!(get(&object), state, "{:?}", flag);
+                let stated = if state.is_some() { flag } else { DosFlags::NONE };
+                assert_eq!(object.dos_flags.stated, stated, "{:?}", flag);
+                assert_eq!(object.dos_flags.get(flag), state, "{:?}", flag);
+            }
+        }
     }
 
     #[test]
