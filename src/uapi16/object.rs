@@ -844,24 +844,19 @@ impl FileSystemIdentity {
 
     /// The volume serial number a FAT or exFAT file system takes from the
     /// identity, as the specification has it: `fatSerial`, or else the one
-    /// derived from `fsUUID`, see [`FatSerial::from_uuid`]. Returned with
-    /// the field it comes from.
+    /// derived from `fsUUID`, see [`FatSerial::from_uuid`].
     ///
     /// ```
-    /// use uapi16::{FatSerial, Field, FileSystemIdentity};
+    /// use uapi16::{FatSerial, FileSystemIdentity};
     ///
     /// let mut identity = FileSystemIdentity::default();
     /// identity.uuid = "1234abcd-5678-4ef0-9abc-def012345678".parse().ok();
-    /// assert_eq!(identity.volume_serial(), Some((FatSerial(0x1234_abcd), Field::FsUuid)));
+    /// assert_eq!(identity.volume_serial(), Some(FatSerial(0x1234_abcd)));
     /// identity.fat_serial = Some(FatSerial(0x5678_9abc));
-    /// assert_eq!(identity.volume_serial(), Some((FatSerial(0x5678_9abc), Field::FatSerial)));
+    /// assert_eq!(identity.volume_serial(), Some(FatSerial(0x5678_9abc)));
     /// ```
-    pub fn volume_serial(&self) -> Option<(FatSerial, Field)> {
-        match (self.fat_serial, &self.uuid) {
-            (Some(serial), _) => Some((serial, Field::FatSerial)),
-            (None, Some(uuid)) => Some((FatSerial::from_uuid(uuid), Field::FsUuid)),
-            (None, None) => None,
-        }
+    pub fn volume_serial(&self) -> Option<FatSerial> {
+        self.fat_serial.or_else(|| self.uuid.as_ref().map(FatSerial::from_uuid))
     }
 }
 
