@@ -18,7 +18,7 @@
 //! - [`Writer`] writes a manifest record by record to a [`Write`], and
 //!   checks it the way the reader does. [`Encoder`] does the same into a
 //!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
-//!   while it is read, and [`Finalize::finalize`] returns it.
+//!   while it is read, and [`Sha256Context::finalize`] returns it.
 //! - [`RootObject`], [`FileObject`], [`Contents`] and [`Signature`] are the
 //!   objects, and [`Name`], [`InodeType`], [`Mode`], [`DosFlags`],
 //!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
@@ -105,7 +105,7 @@ mod writer;
 
 pub use blocking::{Reader, Writer};
 pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
-pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
+pub use digest::{InvalidDigest, Sha256, Sha256Context};
 pub use error::{ContentProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedContent, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};

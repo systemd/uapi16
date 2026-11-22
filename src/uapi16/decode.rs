@@ -20,7 +20,6 @@ use std::num::NonZeroU64;
 use serde_core::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::base64::Base64;
-use crate::digest::Digest;
 use crate::error::{Error, Field, Problem};
 use crate::hex::Hex;
 use crate::object::{

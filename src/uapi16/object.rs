@@ -1392,7 +1392,6 @@ impl Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Digest;
 
     /// Gives an object a field.
     type Give<T> = fn(&mut T);

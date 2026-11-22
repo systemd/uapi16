@@ -491,7 +491,7 @@ mod tests {
     use crate::error::{ErrorKind, Field};
     use crate::testing::{manifest, sequence, ROOT, SIGNATURE, TRAILER};
     use crate::testing::{read_whole, Whole, HELLO, PIECES};
-    use crate::{Digest, DosFlags, Features, FlagStates, InodeFlags, InodeType, Order, Reader, RootObject, Sha256};
+    use crate::{DosFlags, Features, FlagStates, InodeFlags, InodeType, Order, Reader, RootObject, Sha256};
     use std::collections::BTreeMap;
 
     /// Reads `bytes` to the end and returns the names of the file objects

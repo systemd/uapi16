@@ -8,7 +8,7 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
-use crate::digest::{Finalize, Sha256Context};
+use crate::digest::Sha256Context;
 use crate::error::{ContentProblem, Error, ErrorKind, Field, SourceProblem, UnsupportedContent};
 use crate::object::{Contents, FileObject, InodeType, Location};
 use crate::{Name, Sha256};
@@ -418,7 +418,7 @@ impl<'a> ContentCheck<'a> {
                 .named(self.name.as_str())
                 .sizes(Some(self.len), Some(size)));
         }
-        if self.context.map(Finalize::finalize) != self.sha256 {
+        if self.context.map(Sha256Context::finalize) != self.sha256 {
             let message = format!(
                 "'{}' does not match the hash in the manifest",
                 self.name.as_str().escape_debug()
@@ -1034,7 +1034,7 @@ impl<R: Read> ContentSource for StreamSource<R> {
                 .named(name.as_str())
                 .sizes(Some(copied), Some(size)));
         }
-        if context.map(Finalize::finalize) != sha256 {
+        if context.map(Sha256Context::finalize) != sha256 {
             let message = format!(
                 "{}: {} does not match the hash in the manifest",
                 name.as_str().escape_debug(),
@@ -1087,7 +1087,6 @@ impl<R: Read> ContentSource for StreamSource<R> {
 mod tests {
     use super::*;
     use crate::testing::{json, manifest, read_whole, sequence, HELLO, TRAILER, WORLD};
-    use crate::Digest;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 

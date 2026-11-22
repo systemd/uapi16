@@ -12,7 +12,6 @@ use serde_core::ser::{Serialize, SerializeMap, Serializer};
 
 use crate::base64::Base64;
 use crate::decode::{Subject, ROOT_RECORD};
-use crate::digest::Digest;
 use crate::error::{Error, Field, Problem};
 use crate::hex::Hex;
 use crate::object::{
