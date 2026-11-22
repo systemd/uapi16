@@ -771,9 +771,11 @@ impl<F: FlagSet> FlagStates<F> {
 /// A value that is set is not one a reader filled in. A value that the
 /// sizes and hashes of the same object follow from also drops those that
 /// a reader filled in when it is set: they are None then. These are the
-/// size, the hash and the contents objects of a file object, and the sizes,
-/// the hashes, the encoding and the source of a contents object. The next
-/// reader of the manifest fills them in again.
+/// size and the hash of a file object, and the sizes, the hashes, the
+/// encoding and the source of a contents object. The next reader of the
+/// manifest fills them in again. The contents objects of a file object
+/// fill in again what follows from them when they are set, see
+/// [`FileObject::set_contents`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FilledIn(u16);
 
@@ -1100,6 +1102,12 @@ impl ContentsObject {
         self.source = source;
     }
 
+    /// `file`, `url` or `literal`, moved out of the contents object, such
+    /// as the data of a literal.
+    pub fn into_source(self) -> ContentsSource {
+        self.source
+    }
+
     /// `httpHeaders`: the header fields of the HTTP requests for the data
     /// at `url`, by name, in the order the manifest lists them.
     pub fn http_headers(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
@@ -1388,6 +1396,25 @@ impl InodeAttributes {
         self.user_xattrs = xattrs.map(Box::new);
     }
 
+    /// Sets the extended attribute of the `user` namespace whose name
+    /// without the `user.` in front is `name` to `value`, and returns the
+    /// value it had, like [`BTreeMap::insert`]. Attributes that said
+    /// nothing about the extended attributes list this one alone then.
+    pub fn insert_user_xattr(&mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Option<Vec<u8>> {
+        self.filled_in.remove(Field::ExtendedAttributes);
+        self.user_xattrs
+            .get_or_insert_with(Box::default)
+            .insert(name.into(), value.into())
+    }
+
+    /// Removes the extended attribute of the `user` namespace whose name
+    /// without the `user.` in front is `name`, and returns its value, like
+    /// [`BTreeMap::remove`].
+    pub fn remove_user_xattr(&mut self, name: &str) -> Option<Vec<u8>> {
+        self.filled_in.remove(Field::ExtendedAttributes);
+        self.user_xattrs.as_deref_mut()?.remove(name)
+    }
+
     /// `readOnly`: whether the file is read-only, see
     /// [`InodeAttributes::is_read_only`]. It stands for the read-only
     /// attribute of DOS and for [`GptPartition::FLAG_READ_ONLY`] too.
@@ -1654,13 +1681,27 @@ impl FileObject {
         &self.contents
     }
 
-    /// Sets `contents`, and drops what a reader filled in, see
-    /// [`FilledIn`]. A writer refuses more than [`MAX_CONTENTS`] of them.
+    /// Sets `contents`, and fills in what follows from them as a reader
+    /// does, see [`FilledIn`]: what each contents object says of its own
+    /// data, and the size and the hash of the data of the file. What a
+    /// reader filled in that no longer follows is dropped, and what the
+    /// object states stays. A writer refuses an object whose fields
+    /// contradict each other, and more than [`MAX_CONTENTS`] contents
+    /// objects.
     ///
     /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
     pub fn set_contents(&mut self, contents: Vec<ContentsObject>) {
         self.drop_filled_in();
         self.contents = contents;
+        self.fill_in_from_contents();
+    }
+
+    /// Takes `contents` out of the object, with the size and the hash a
+    /// reader filled in, which follow from them. Set back with
+    /// [`FileObject::set_contents`], they fill them in again.
+    pub fn take_contents(&mut self) -> Vec<ContentsObject> {
+        self.drop_filled_in();
+        std::mem::take(&mut self.contents)
     }
 
     /// `inodeToken`: the objects that carry the same token are hard links
@@ -1699,9 +1740,19 @@ impl FileObject {
         self.gpt.as_deref()
     }
 
+    /// The `gpt` fields to change in place. Nothing follows from them.
+    pub fn gpt_mut(&mut self) -> Option<&mut GptPartition> {
+        self.gpt.as_deref_mut()
+    }
+
     /// Sets the `gpt` fields.
     pub fn set_gpt(&mut self, gpt: Option<GptPartition>) {
         self.gpt = gpt.map(Box::new);
+    }
+
+    /// Takes the `gpt` fields out of the object.
+    pub fn take_gpt(&mut self) -> Option<GptPartition> {
+        self.gpt.take().map(|gpt| *gpt)
     }
 
     /// The inode attributes of the file.
@@ -2572,6 +2623,18 @@ mod tests {
         assert_eq!(headers, [("X-B", "2"), ("X-A", "1")]);
     }
 
+    /// The fields of a partition change in place, and come out whole.
+    #[test]
+    fn gpt_in_place() {
+        let mut object = FileObject::new(Name::new("a").unwrap());
+        assert!(object.gpt_mut().is_none());
+        object.set_gpt(Some(GptPartition::default()));
+        object.gpt_mut().unwrap().set_label(Some("esp".to_string()));
+        assert_eq!(object.gpt().and_then(GptPartition::label), Some("esp"));
+        let gpt = object.take_gpt().unwrap();
+        assert_eq!((gpt.label(), object.gpt()), (Some("esp"), None));
+    }
+
     /// A value that is set drops the sizes and hashes a reader filled in on
     /// the same object, and leaves the ones the record gives.
     #[test]
@@ -2601,13 +2664,29 @@ mod tests {
             (object.size(), object.sha256(), object.filled_in()),
             (Some(5), None, none)
         );
-        // The size a contents object gives.
+        // The size a contents object gives, which contents that are set
+        // fill in again.
         let mut object = read(r#"{"name":"a","contents":[{"file":"blob","originalSize":3}]}"#);
         assert_eq!(object.size(), Some(3));
-        let mut contents = object.contents()[0].clone();
-        contents.set_original_size(Some(7));
-        object.set_contents(vec![contents]);
+        let mut contents = object.take_contents();
         assert_eq!((object.size(), object.filled_in()), (None, none));
+        contents[0].set_original_size(Some(7));
+        object.set_contents(contents);
+        assert_eq!(
+            (
+                object.size(),
+                object.contents()[0].encoded_size(),
+                object.filled_in().contains(Field::Size)
+            ),
+            (Some(7), Some(7), true)
+        );
+        // Contents that contradict the size the object states fill in
+        // nothing, and the size stays.
+        let mut object = read(r#"{"name":"a","size":3,"contents":[{"file":"blob","originalSize":3}]}"#);
+        let mut contents = object.take_contents();
+        contents[0].set_original_size(Some(7));
+        object.set_contents(contents);
+        assert_eq!((object.size(), object.filled_in()), (Some(3), none));
         // What the record gives stays.
         let mut object = read(&format!(r#"{{"name":"a","size":5,"sha256":"{}"}}"#, HELLO));
         object.set_size(Some(5));
@@ -2660,5 +2739,15 @@ mod tests {
             object.stated_features(),
             Features::FLAG_HIDDEN | Features::FLAG_NO_DUMP | Features::USER_XATTR
         );
+        // One extended attribute at a time as well.
+        let whole = read_whole(&sequence(&[root, r#"{"name":"a"}"#, TRAILER])).unwrap();
+        let mut object = whole.objects.into_iter().next().unwrap();
+        let inode = object.inode_mut();
+        assert_eq!(inode.remove_user_xattr("comment"), None);
+        assert!(!inode.filled_in().contains(Field::ExtendedAttributes));
+        assert_eq!(inode.insert_user_xattr("comment", b"one"), None);
+        assert_eq!(inode.insert_user_xattr("comment", b"two"), Some(b"one".to_vec()));
+        assert_eq!(inode.remove_user_xattr("comment"), Some(b"two".to_vec()));
+        assert_eq!(inode.user_xattrs().map(|xattrs| xattrs.len()), Some(0));
     }
 }

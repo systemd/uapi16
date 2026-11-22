@@ -389,16 +389,7 @@ impl Draft {
         // The contents objects were checked when they were read, and hold
         // what follows from their fields.
         let data = object.check_consistency(subject, |contents| Ok(contents.data()))?;
-        // What the record does not give was filled in.
-        for (field, given, known) in [
-            (Field::Size, object.size.is_some(), data.size.is_some()),
-            (Field::Sha256, object.sha256.is_some(), data.sha256.is_some()),
-        ] {
-            if known && !given {
-                object.filled_in.insert(field);
-            }
-        }
-        (object.size, object.sha256) = (data.size, data.sha256);
+        object.fill_in_data(data);
         Ok(())
     }
 }
@@ -455,6 +446,45 @@ impl FileObject {
         match self.unpermitted_flag() {
             Some(field) => Err(Error::unpermitted_flag(self, field, subject)),
             None => Ok(()),
+        }
+    }
+
+    /// Fills in the size and the hash of the data, `data` from
+    /// [`FileObject::check_consistency`], and notes those the object does
+    /// not give.
+    fn fill_in_data(&mut self, data: SizeAndHash) {
+        for (field, given, known) in [
+            (Field::Size, self.size.is_some(), data.size.is_some()),
+            (Field::Sha256, self.sha256.is_some(), data.sha256.is_some()),
+        ] {
+            if known && !given {
+                self.filled_in.insert(field);
+            }
+        }
+        (self.size, self.sha256) = (data.size, data.sha256);
+    }
+
+    /// Fills in what follows from the contents objects, as a reader does:
+    /// what each of them says of its own data, and the size and the hash of
+    /// the data of the object. Where fields contradict each other nothing
+    /// follows from them, and a writer refuses the object.
+    pub(crate) fn fill_in_from_contents(&mut self) {
+        // The object is in no record, and what is wrong with it is not
+        // shown, so the number of the record does not matter.
+        let subject = Subject::new(self, ROOT_RECORD);
+        let data: Vec<_> = self
+            .contents
+            .iter()
+            .map(|contents| contents.check_consistency(subject).ok())
+            .collect();
+        for (contents, data) in self.contents.iter_mut().zip(data) {
+            if let Some(data) = data {
+                contents.fill_in(data);
+            }
+        }
+        let subject = Subject::new(self, ROOT_RECORD);
+        if let Ok(data) = self.check_consistency(subject, |contents| Ok(contents.data())) {
+            self.fill_in_data(data);
         }
     }
 

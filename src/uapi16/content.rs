@@ -2536,6 +2536,29 @@ mod tests {
         }
     }
 
+    /// The size a reader fills in from a contents object comes back where
+    /// the contents are set back, and a copy from a stream goes by it.
+    #[test]
+    fn contents_set_back_give_the_size_again() {
+        let record = format!(
+            r#"{{"name":"s","contents":[{{"originalSize":5,"originalSha256":"{}"}}]}}"#,
+            HELLO
+        );
+        let mut object = object(&record);
+        assert_eq!(object.size(), Some(5));
+        object.set_contents(object.contents().to_vec());
+        assert_eq!(object.size(), Some(5));
+        let mut stream = &b"hello"[..];
+        let copied = object.copy_data(&mut StreamProvider::new(&mut stream), &mut io::sink());
+        assert_eq!(copied.unwrap(), 5);
+        let contents = object.take_contents();
+        assert_eq!(object.size(), None);
+        object.set_contents(contents);
+        let mut stream = &b"hello"[..];
+        let copied = object.copy_data(&mut StreamProvider::new(&mut stream), &mut io::sink());
+        assert_eq!(copied.unwrap(), 5);
+    }
+
     #[test]
     fn a_sink_that_fails() {
         let o = object(r#"{"name":"a","size":5}"#);
