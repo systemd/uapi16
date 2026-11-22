@@ -1245,7 +1245,7 @@ impl FileObject {
     /// true of everything in it.
     pub fn check_validity(&self, now_usec: u64) -> Result<(), Error> {
         self.validity
-            .check(now_usec, self.name.escape_debug())
+            .check(now_usec, self.name.as_str().escape_debug())
             .map_err(|e| e.named(self.name.as_str()))
     }
 }

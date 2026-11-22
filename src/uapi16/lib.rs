@@ -321,8 +321,9 @@ pub(crate) mod testing {
         let (root, root_text) = recording_all();
         let directories: Vec<FileObject> = object
             .name
+            .as_str()
             .match_indices('/')
-            .map(|(end, _)| directory(&object.name[..end]))
+            .map(|(end, _)| directory(&object.name.as_str()[..end]))
             .collect();
         let mut records = written(&root, |writer| {
             for directory in &directories {

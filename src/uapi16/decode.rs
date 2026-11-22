@@ -297,9 +297,9 @@ impl Draft {
     /// The name the record gives, valid or not.
     fn stated_name(&self) -> Option<&str> {
         if !self.object.name.is_root() {
-            return Some(&self.object.name);
+            return Some(self.object.name.as_str());
         }
-        self.name.as_deref().or(self.invalid_name.as_deref())
+        self.name.as_ref().map(Name::as_str).or(self.invalid_name.as_deref())
     }
 
     /// The fields of a partition, which are made when the first of them is

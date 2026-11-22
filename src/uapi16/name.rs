@@ -4,7 +4,6 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::iter;
-use std::ops::Deref;
 use std::str::FromStr;
 
 use crate::strict::StringRules;
@@ -232,14 +231,6 @@ impl Name {
 
     /// The name as a string.
     pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for Name {
-    type Target = str;
-
-    fn deref(&self) -> &str {
         &self.0
     }
 }
@@ -771,12 +762,12 @@ mod tests {
         assert_eq!(Name::ROOT.join("a").unwrap().join("b").unwrap(), "a/b");
         // The length of the whole name counts.
         let mut deep = Name::ROOT;
-        while deep.len() + 2 * (long.len() + 1) <= Name::MAX_LEN {
+        while deep.as_str().len() + 2 * (long.len() + 1) <= Name::MAX_LEN {
             deep = deep.join(&long).unwrap();
         }
-        let room = Name::MAX_LEN - (deep.len() + 1);
+        let room = Name::MAX_LEN - (deep.as_str().len() + 1);
         assert!(room > 0);
-        assert_eq!(deep.join(&"y".repeat(room)).unwrap().len(), Name::MAX_LEN);
+        assert_eq!(deep.join(&"y".repeat(room)).unwrap().as_str().len(), Name::MAX_LEN);
         assert_eq!(deep.join(&"y".repeat(room + 1)), Err(NameProblem::TooLong));
         // A component that is too long, and wrong in another way too, is
         // refused for its length, as the whole name is.

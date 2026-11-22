@@ -97,8 +97,8 @@ impl<'a> Reference<'a> {
         if let Some(total) = self.original_size.filter(|&total| total != len) {
             let message = format!(
                 "{}: {} is {} bytes, the manifest says {}",
-                name.escape_debug(),
-                self.file.escape_debug(),
+                name.as_str().escape_debug(),
+                self.file.as_str().escape_debug(),
                 len,
                 total
             );
@@ -109,8 +109,8 @@ impl<'a> Reference<'a> {
         if end.is_none_or(|end| end > len) {
             let message = format!(
                 "{}: {} is too short for offset {} and size {}",
-                name.escape_debug(),
-                self.file.escape_debug(),
+                name.as_str().escape_debug(),
+                self.file.as_str().escape_debug(),
                 self.offset,
                 size
             );
@@ -127,8 +127,8 @@ impl<'a> Reference<'a> {
             OpenError::NotRegular => {
                 let message = format!(
                     "{}: {} is not a regular file",
-                    name.escape_debug(),
-                    self.file.escape_debug()
+                    name.as_str().escape_debug(),
+                    self.file.as_str().escape_debug()
                 );
                 return Error::new(ErrorKind::Source(SourceProblem::NotRegular), message).named(name.as_str());
             }
@@ -141,8 +141,8 @@ impl<'a> Reference<'a> {
         };
         let message = format!(
             "{}: failed to open {}: {}",
-            name.escape_debug(),
-            self.file.escape_debug(),
+            name.as_str().escape_debug(),
+            self.file.as_str().escape_debug(),
             error
         );
         Error::new(ErrorKind::Source(problem), message)
@@ -178,7 +178,7 @@ impl FileObject {
         if self.contents.is_empty() {
             let message = format!(
                 "'{}' is a {} without contents objects, which has no data",
-                self.name.escape_debug(),
+                self.name.as_str().escape_debug(),
                 self.inode_type
             );
             return Error::new(ErrorKind::Unsupported(UnsupportedContent::Absent), message).named(self.name.as_str());
@@ -196,7 +196,7 @@ impl FileObject {
         let ways = ways.join(" or ");
         let message = format!(
             "'{}' is only available through {}, which is not supported",
-            self.name.escape_debug(),
+            self.name.as_str().escape_debug(),
             ways
         );
         Error::new(ErrorKind::Unsupported(UnsupportedContent::UrlOrEncoding), message)
@@ -321,7 +321,7 @@ impl Contents {
         }
         let message = format!(
             "'{}' is a part of literal contents that do not match the hash in the manifest",
-            object.name.escape_debug()
+            object.name.as_str().escape_debug()
         );
         Err(Error::new(ErrorKind::Content(ContentProblem::HashMismatch), message).named(object.name.as_str()))
     }
@@ -390,7 +390,7 @@ impl<'a> ContentCheck<'a> {
         if let Some(size) = self.size.filter(|&size| added > size.saturating_sub(self.len)) {
             let message = format!(
                 "'{}' has more than the {} bytes the manifest says",
-                self.name.escape_debug(),
+                self.name.as_str().escape_debug(),
                 size
             );
             return Err(Error::new(ErrorKind::Content(ContentProblem::SizeMismatch), message)
@@ -410,7 +410,7 @@ impl<'a> ContentCheck<'a> {
         if let Some(size) = self.size.filter(|&size| size != self.len) {
             let message = format!(
                 "'{}' is {} bytes, the manifest says {}",
-                self.name.escape_debug(),
+                self.name.as_str().escape_debug(),
                 self.len,
                 size
             );
@@ -419,7 +419,10 @@ impl<'a> ContentCheck<'a> {
                 .sizes(Some(self.len), Some(size)));
         }
         if self.context.map(Finalize::finalize) != self.sha256 {
-            let message = format!("'{}' does not match the hash in the manifest", self.name.escape_debug());
+            let message = format!(
+                "'{}' does not match the hash in the manifest",
+                self.name.as_str().escape_debug()
+            );
             return Err(Error::new(ErrorKind::Content(ContentProblem::HashMismatch), message).named(self.name.as_str()));
         }
         Ok(self.len)
@@ -683,7 +686,7 @@ impl CopyFailure {
         let name = &object.name;
         let (problem, what) = match self {
             CopyFailure::ReadFailed(error) => {
-                let message = format!("{}: failed to read {}: {}", name.escape_debug(), place, error);
+                let message = format!("{}: failed to read {}: {}", name.as_str().escape_debug(), place, error);
                 return Error::new(ErrorKind::Source(SourceProblem::Unreadable), message)
                     .named(name.as_str())
                     .caused_by(error);
@@ -693,7 +696,7 @@ impl CopyFailure {
             CopyFailure::HashMismatch => (ContentProblem::HashMismatch, "does not match the hash in the manifest"),
             CopyFailure::SourceChanged => (ContentProblem::SourceChanged, "changed while it was read"),
         };
-        let message = format!("{}: {} {}", name.escape_debug(), place, what);
+        let message = format!("{}: {} {}", name.as_str().escape_debug(), place, what);
         Error::new(ErrorKind::Content(problem), message).named(name.as_str())
     }
 }
@@ -902,7 +905,8 @@ impl<D: Directory> ContentSource for DirectorySource<D> {
         } else {
             DataExtent::PartOfFile
         };
-        let failed = |failure: CopyFailure| failure.into_error(object, &reference.file.escape_debug().to_string());
+        let failed =
+            |failure: CopyFailure| failure.into_error(object, &reference.file.as_str().escape_debug().to_string());
         let Some(sha256) = object.original_sha256_to_check(reference.original_sha256, extent) else {
             return pieces.copy_data(sink).map_err(failed);
         };
@@ -968,7 +972,7 @@ impl<R: Read> StreamSource<R> {
     fn note_served(&mut self, name: &Name, size: u64) {
         let (last, last_size) = self.last.get_or_insert_with(Default::default);
         last.clear();
-        last.push_str(name);
+        last.push_str(name.as_str());
         *last_size = size;
     }
 }
@@ -992,14 +996,14 @@ impl<R: Read> ContentSource for StreamSource<R> {
         if reference.offset != 0 {
             let message = format!(
                 "{}: an offset cannot be used with streamed contents",
-                name.escape_debug()
+                name.as_str().escape_debug()
             );
             return Err(
                 Error::new(ErrorKind::Unsupported(UnsupportedContent::OffsetInStream), message).named(name.as_str()),
             );
         }
         let Some(size) = object.size else {
-            let message = format!("{}: streamed contents need a known size", name.escape_debug());
+            let message = format!("{}: streamed contents need a known size", name.as_str().escape_debug());
             return Err(Error::new(ErrorKind::Unsupported(UnsupportedContent::NoSize), message)
                 .at(Field::Size)
                 .named(name.as_str()));
@@ -1023,7 +1027,7 @@ impl<R: Read> ContentSource for StreamSource<R> {
         if copied < size {
             let message = format!(
                 "{}: the stream ended {} bytes early",
-                name.escape_debug(),
+                name.as_str().escape_debug(),
                 size - copied
             );
             return Err(Error::new(ErrorKind::Content(ContentProblem::StreamEnded), message)
@@ -1033,8 +1037,8 @@ impl<R: Read> ContentSource for StreamSource<R> {
         if context.map(Finalize::finalize) != sha256 {
             let message = format!(
                 "{}: {} does not match the hash in the manifest",
-                name.escape_debug(),
-                reference.file.escape_debug()
+                name.as_str().escape_debug(),
+                reference.file.as_str().escape_debug()
             );
             return Err(Error::new(ErrorKind::Content(ContentProblem::HashMismatch), message).named(name.as_str()));
         }
