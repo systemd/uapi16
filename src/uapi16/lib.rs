@@ -98,6 +98,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+compile_error!("uapi16 supports Linux and Android only");
+
 mod base64;
 mod blocking;
 mod content;
