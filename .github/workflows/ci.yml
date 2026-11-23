@@ -1,0 +1,348 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# The build and the tests with the oldest and the newest rustc on x86_64,
+# the same with musl, the build and the tests on i686, the lints for
+# fourteen targets, the formatting, the documentation for Linux and
+# Android, the package cargo publish uploads, the dependency check and
+# the sign-offs.
+#
+# Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS,
+# clippy's -D warnings and RUSTDOCFLAGS.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Weekly, which catches a new stable rustc or runner image.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test (rustc ${{ matrix.rust }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustc --version
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --locked --workspace --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+  musl:
+    name: Build and test (x86_64-unknown-linux-musl, rustc ${{ matrix.rust }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustup target add "$TARGET"
+          rustc --version
+          t=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      # rustc links a musl binary with the C library and the startup
+      # files that come with the target, so no musl toolchain is needed.
+      - name: Build
+        run: cargo build --locked --target "$TARGET" --workspace --all-targets
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+  i686:
+    name: Build and test (i686-unknown-linux-gnu)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      TARGET: i686-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        # The tests run on the x86_64 kernel with the i386 libraries of
+        # the runner.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386-cross libc6-i386 lib32gcc-s1
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+          rustc --version
+          t=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          {
+            echo "CARGO_TARGET_${t}_LINKER=i686-linux-gnu-gcc"
+            echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --locked --target "$TARGET" --workspace --all-targets
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+  clippy:
+    name: clippy (rustc ${{ matrix.rust }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    env:
+      TARGETS: >-
+        x86_64-unknown-linux-gnu
+        i686-unknown-linux-gnu
+        aarch64-unknown-linux-gnu
+        armv7-unknown-linux-gnueabihf
+        loongarch64-unknown-linux-gnu
+        powerpc-unknown-linux-gnu
+        powerpc64-unknown-linux-gnu
+        powerpc64le-unknown-linux-gnu
+        riscv64gc-unknown-linux-gnu
+        s390x-unknown-linux-gnu
+        sparc64-unknown-linux-gnu
+        x86_64-unknown-linux-musl
+        aarch64-linux-android
+        armv7-linux-androideabi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --component clippy
+          rustup default "$RUST"
+          # shellcheck disable=SC2086
+          rustup target add $TARGETS
+          rustc --version
+
+      - name: clippy
+        # The lints differ between architectures. Checking needs no cross
+        # linker.
+        run: |
+          rc=0
+          for t in $TARGETS; do
+            echo "::group::$t"
+            cargo clippy --locked --target "$t" --workspace --all-targets -- -D warnings ||
+              { echo "::error::clippy failed for $t"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustc --version
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+          rustc --version
+
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps
+
+      # What is there on Linux only is missing on Android, and no link may
+      # lead to it there. The documentation needs no NDK.
+      - name: rustdoc for Android
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --target aarch64-linux-android
+
+  package:
+    name: Package
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: cargo publish --dry-run
+        # Builds the package that would be uploaded, from its unpacked
+        # copy in target/package. A version that is on crates.io already
+        # only gets a warning.
+        run: cargo publish --dry-run --locked -p uapi16
+
+      - name: Test the package
+        # With a target directory of its own, so that nothing of the
+        # repository is used.
+        run: |
+          cd target/package/uapi16-*/
+          CARGO_TARGET_DIR=$RUNNER_TEMP/package cargo test --locked
+
+  deps:
+    name: Dependencies
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the crates uapi16 depends on
+        # Cargo.lock lists every dependency, for all targets and features,
+        # the build and test dependencies included: libc, pathrs, rustix,
+        # serde_core, serde_json and sha2 with the crates they need, those
+        # for other operating systems among them. The tests turn on
+        # preserve_order of serde_json, which adds foldhash and indexmap
+        # with the crates it needs. serde_json and serde_core name serde
+        # and serde_derive for cfg(any()), which no target has, so that
+        # all three keep one version. So these two are in Cargo.lock, and
+        # nothing builds them.
+        env:
+          EXPECTED: >-
+            bitflags block-buffer cfg-if cpufeatures crypto-common digest either equivalent errno fastrand
+            foldhash getrandom hashbrown hybrid-array indexmap itertools itoa libc linux-raw-sys memchr
+            once_cell pathrs proc-macro2 quote r-efi rustix rustversion serde serde_core serde_derive
+            serde_json sha2 static_assertions syn tempfile thiserror thiserror-impl typenum unicode-ident
+            windows-link windows-sys zmij
+        run: |
+          deps=$(cargo metadata --locked --format-version 1 |
+            jq -r '.workspace_members as $m | .packages[] | select(.id as $i | $m | index($i) | not) | .name' |
+            LC_ALL=C sort -u | xargs)
+          echo "$deps"
+          [ "$deps" = "$EXPECTED" ] || { echo "::error::expected the crates $EXPECTED, found $deps"; exit 1; }
+
+  signoff:
+    name: Sign-off
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check that every commit is signed off
+        # Every commit carries a Signed-off-by: line from its author: the
+        # commits of a pull request, and those a push added. Merge commits
+        # are left out, since GitHub's merge button writes them without a
+        # sign-off. A sign-off counts when its address or its name is the
+        # author's: an affiliation in parentheses changes the name, and
+        # dependabot signs off with another address than it commits with.
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case $EVENT in
+          pull_request) range=HEAD^1..HEAD^2 ;;
+          push)
+            range=$BEFORE..HEAD
+            # A new branch or a push that replaced the history: all of it.
+            git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null || range=HEAD
+            ;;
+          *) exit 0 ;;
+          esac
+          # A range git can't list fails the step here.
+          commits=$(git log --no-merges --format='%H %ae %an' "$range")
+          bad=0
+          while read -r commit email name; do
+            [ -n "$commit" ] || continue
+            ok=0
+            while read -r signoff; do
+              signoff_name=${signoff%% <*}
+              signoff_email=${signoff##*<}
+              signoff_email=${signoff_email%%>*}
+              if [ "${signoff_email,,}" = "${email,,}" ] || [ "${signoff_name,,}" = "${name,,}" ]; then
+                ok=1
+              fi
+            done < <(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")
+            if [ "$ok" = 0 ]; then
+              echo "::error::$(git log -1 --format='%h %s' "$commit"): no Signed-off-by: from $name <$email>"
+              bad=1
+            fi
+          done <<< "$commits"
+          exit "$bad"

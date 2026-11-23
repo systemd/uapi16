@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Base64, the way a manifest carries literal contents, the values of
-//! extended attributes and the data of a signature.
+//! Base64, the way a manifest carries the data of a literal, the values
+//! of extended attributes and the data of a signature.
 
 use std::fmt;
 

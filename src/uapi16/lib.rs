@@ -18,17 +18,27 @@
 //! - [`Writer`] writes a manifest record by record to a [`Write`], and
 //!   checks it the way the reader does. [`Encoder`] does the same into a
 //!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
-//!   while it is read, and [`Finalize::finalize`] returns it.
-//! - [`RootObject`], [`FileObject`], [`Contents`] and [`Signature`] are the
-//!   objects, and [`Name`], [`InodeType`], [`Mode`], [`DosFlags`],
-//!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
-//!   the root file object and a file object both have is in
-//!   [`InodeAttributes`] and [`ValidityWindow`].
-//! - [`ContentSource`] is where the contents of the files come from when a
-//!   manifest is applied: [`DirectorySource`] for the files next to the
-//!   manifest and [`StreamSource`] for one stream with all of them.
-//!   [`FileObject::copy_contents`] copies the contents of a file and checks
-//!   them against the manifest with a [`ContentCheck`].
+//!   while it is read, and [`Sha256Context::finalize`] returns it.
+//! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
+//!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
+//!   [`Mode`], [`Sha256`] and [`Uuid`] what their fields hold. Each field
+//!   has a getter named after it, and most have a setter. The inode
+//!   attributes and the identity of the file system are changed in place
+//!   instead, through [`FileObject::inode_mut`], [`RootObject::inode_mut`]
+//!   and [`RootObject::file_system_mut`], and the marks of what a reader
+//!   filled in, [`FilledIn`], can only be read. What the root file object
+//!   and a file object both have is in [`InodeAttributes`] and
+//!   [`ValidityWindow`].
+//! - [`DataProvider`] is where the data of the files comes from when a
+//!   manifest is applied. [`StreamProvider`] takes it from one stream
+//!   that carries it all.
+#![cfg_attr(
+    target_os = "linux",
+    doc = "  On Linux, [`DirectoryProvider`] takes it from the files next to the",
+    doc = "  manifest, in a [`PinnedDirectory`]."
+)]
+//!   [`FileObject::copy_data`] copies the data of a file and checks it
+//!   against the manifest with a [`DataCheck`].
 //!
 //! A manifest that does not come through a [`Read`], such as one from an
 //! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::step`] says
@@ -48,10 +58,10 @@
 //! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
 //! string, and the caller sends them on.
 //!
-//! Contents that do not go through a [`Write`] are checked with a
-//! [`ContentCheck`]: [`ContentCheck::update`] takes them as they come, and
-//! [`ContentCheck::finish`] says whether they have the size and the hash
-//! the manifest gives.
+//! Data that does not go through a [`Write`] is checked with a
+//! [`DataCheck`]: [`DataCheck::update`] takes it as it comes, and
+//! [`DataCheck::finish`] says whether it has the size and the hash the
+//! manifest gives.
 //!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
@@ -60,10 +70,19 @@
 //! grows with the manifest. Writing one keeps the record it puts together,
 //! its separator included, and the name of the file object before it.
 //!
+//! Two checks are up to the caller: whether a manifest declares the order
+//! of its file objects, [`RootObject::require_order`], and whether an
+//! object may be used at a given time, [`RootObject::check_validity`] and
+//! [`FileObject::check_validity`]. What is true of a directory is true of
+//! everything in it, but the validity of a directory does not carry over
+//! to its entries: [`FileObject::check_validity`] looks at the object
+//! alone. A caller that uses an entry checks the objects of the
+//! directories it is in as well, which come before it in the manifest.
+//!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
-//! manifest they sign. Contents that are stored in an encoding or that
-//! have to be fetched from a URL are not taken.
+//! manifest they sign. Data that is stored in an encoding or that has to
+//! be fetched from a URL is not taken.
 //!
 //! The reader takes every field the specification has. A field it does
 //! not know is passed over, as the specification asks, unless it holds a
@@ -88,14 +107,20 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+compile_error!("uapi16 supports Linux and Android only");
+
 mod base64;
 mod blocking;
 mod content;
 mod decode;
 mod digest;
+#[cfg(target_os = "linux")]
+mod directory;
 mod error;
 mod features;
 mod hex;
+mod metadata;
 mod name;
 mod object;
 mod reader;
@@ -104,15 +129,19 @@ mod strict;
 mod writer;
 
 pub use blocking::{Reader, Writer};
-pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
-pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
-pub use error::{ContentProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedContent, ValidityProblem};
+#[cfg(target_os = "linux")]
+pub use content::DirectoryProvider;
+pub use content::{DataCheck, DataLocation, DataProvider, ExternalFile, StreamProvider};
+pub use digest::{InvalidDigest, Sha256, Sha256Context};
+#[cfg(target_os = "linux")]
+pub use directory::PinnedDirectory;
+pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameProblem};
 pub use object::{
-    Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates, GptPartition, InodeAttributes,
-    InodeFlags, InodeType, InvalidFatSerial, InvalidUuid, Location, Mode, RootObject, Signature, UnknownInodeType,
-    Uuid, Validity, ValidityWindow,
+    ContentsObject, ContentsSource, FatSerial, FileObject, FileSystemIdentity, FilledIn, GptPartition, InodeAttributes,
+    InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject, SignatureObject, UnknownInodeType, Uuid,
+    Validity, ValidityWindow,
 };
 pub use reader::{Decoder, Object, Step};
 pub use writer::Encoder;
@@ -152,14 +181,38 @@ pub(crate) const STRING_RULES: strict::StringRules =
 #[cfg(test)]
 pub(crate) mod testing {
     use super::blocking::READ_SIZE;
+    use super::object::{DosFlags, InodeFlags};
     use super::{
-        Contents, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType, Location, Mode, Name,
-        Object, Reader, RootObject, Sha256, Signature, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
+        ContentsObject, ContentsSource, Error, Features, FileObject, GptPartition, InodeType, Mode, Name, Object,
+        Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
     use serde_core::de::DeserializeSeed;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::num::NonZeroU64;
+    use std::path::PathBuf;
+
+    /// A directory of its own below the temporary directory, removed with
+    /// everything in it when the test ends.
+    pub(crate) struct TempDir(pub(crate) PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(name: &str) -> TempDir {
+            let path = std::env::temp_dir().join(format!("uapi16-{}-{}", name, std::process::id()));
+            // What a test of the same name in a process of the same number
+            // left behind.
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// The root file object that says nothing but that this is a manifest.
     pub(crate) const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#;
@@ -201,7 +254,7 @@ pub(crate) mod testing {
     pub(crate) struct Whole {
         pub(crate) root: RootObject,
         pub(crate) objects: Vec<FileObject>,
-        pub(crate) signatures: Vec<Signature>,
+        pub(crate) signatures: Vec<SignatureObject>,
     }
 
     /// How many arrays and objects serde_json reads inside each other.
@@ -321,8 +374,9 @@ pub(crate) mod testing {
         let (root, root_text) = recording_all();
         let directories: Vec<FileObject> = object
             .name
+            .as_str()
             .match_indices('/')
-            .map(|(end, _)| directory(&object.name[..end]))
+            .map(|(end, _)| directory(&object.name.as_str()[..end]))
             .collect();
         let mut records = written(&root, |writer| {
             for directory in &directories {
@@ -344,7 +398,7 @@ pub(crate) mod testing {
             bytes[Uuid::SIZE - 1] = last;
             Uuid::new(bytes)
         };
-        let mut encoded = Contents::new(Location::File(name("blob.gz")));
+        let mut encoded = ContentsObject::new(ContentsSource::File(name("blob.gz")));
         encoded.encoding = Some("gzip".into());
         encoded.encoded_size = Some(3);
         encoded.encoded_sha256 = Some(Sha256::digest(b"gz"));
@@ -353,7 +407,7 @@ pub(crate) mod testing {
         encoded.offset = 4;
         let mut object = FileObject::new(name("a/\u{e9} \"quoted\"\\"));
         object.size = Some(5);
-        object.inode.mode = Mode::new(0o440);
+        object.inode.mode = Some(Mode::new(0o440).unwrap());
         object.inode.uid = Some(1);
         object.inode.gid = Some(2);
         object.inode.user_name = Some("user".into());
@@ -389,15 +443,15 @@ pub(crate) mod testing {
         object.inode.read_only = Some(true);
         object.contents = vec![
             encoded,
-            Contents {
+            ContentsObject {
                 http_headers: vec![
                     ("X-Foo".into(), "bar".into()),
                     ("Authorization".into(), "Bearer x".into()),
                 ],
-                ..Contents::new(Location::Url("https://example.com/blob".into()))
+                ..ContentsObject::new(ContentsSource::Url("https://example.com/blob".into()))
             },
-            Contents::new(Location::Literal(b"hello".to_vec())),
-            Contents::default(),
+            ContentsObject::new(ContentsSource::Literal(b"hello".to_vec())),
+            ContentsObject::default(),
         ];
         object.sha256 = HELLO.parse().ok();
         object.validity.since_usec = 6;

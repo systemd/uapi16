@@ -24,9 +24,9 @@ use std::str::FromStr;
 /// without the field has that flag cleared. Where the list doesn't name the
 /// feature, nothing is known about these properties.
 ///
-/// A manifest that does not list its features records
-/// [`Features::DEFAULT`], what `systemd-manifest make` records unless it
-/// is told otherwise.
+/// A manifest that does not list `features` records [`Features::DEFAULT`],
+/// the features the specification gives such a manifest: `device`, `gid`,
+/// `hardlink`, `mode`, `sha256`, `size`, `symlink` and `uid`.
 ///
 /// ```
 /// use uapi16::Features;
@@ -62,9 +62,9 @@ impl Features {
     pub const USER_NAME: Features = Features(1 << 3);
     /// `group-name`: the name of the owning group, the field `groupName`.
     pub const GROUP_NAME: Features = Features(1 << 4);
-    /// `size`: the size of the contents, the field `size`.
+    /// `size`: the size of the data, the field `size`.
     pub const SIZE: Features = Features(1 << 5);
-    /// `sha256`: the hash of the contents, the field `sha256`.
+    /// `sha256`: the hash of the data, the field `sha256`.
     pub const SHA256: Features = Features(1 << 6);
     /// `symlink`: the targets of symbolic links, the field `contents` of
     /// file objects of the type `lnk`. Every one of them has its target in

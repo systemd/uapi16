@@ -2,25 +2,40 @@
 
 [package]
 name = "uapi16"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+description = "Reading, checking and writing UAPI.16 file manifests"
+repository = "https://github.com/systemd/uapi16"
+keywords = ["uapi", "manifest", "filesystem", "systemd", "json-seq"]
+categories = ["filesystem", "parser-implementations", "encoding"]
+# What the package cargo publish uploads holds next to Cargo.toml and
+# Cargo.lock.
+include = ["/*.rs", "/refused.jsonl", "/tests/", "/README.md", "/LICENSE"]
 
 [lib]
 path = "lib.rs"
 
 [dependencies]
-libc.workspace = true
 serde_core.workspace = true
 # Without float_roundtrip serde_json refuses some spellings of the largest
 # doubles as out of range, such as 1.7976931348623158e308.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 
-# The tests look at the order of the keys the writer writes.
+# PinnedDirectory, which only Linux has.
+[target.'cfg(target_os = "linux")'.dependencies]
+pathrs.workspace = true
+
+# PinnedDirectory, and the device numbers of FileObject::from_metadata().
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
+# The errno values of the errors the tests make.
+libc.workspace = true
+# The tests look at the order of the keys the writer writes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 
 [lints]

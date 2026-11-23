@@ -20,12 +20,11 @@ use std::num::NonZeroU64;
 use serde_core::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::base64::Base64;
-use crate::digest::Digest;
 use crate::error::{Error, Field, Problem};
 use crate::hex::Hex;
 use crate::object::{
-    Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FlagSet, GptPartition, InodeAttributes, InodeFlags,
-    InodeType, Location, Mode, RootObject, Signature, Uuid, Validity,
+    ContentsObject, ContentsSource, DosFlags, FatSerial, FileObject, FileSystemIdentity, FlagSet, GptPartition,
+    InodeAttributes, InodeFlags, InodeType, Mode, RootObject, SignatureObject, Uuid, Validity,
 };
 use crate::strict::{FieldTable, Key, Members, Skip, Strict};
 use crate::{
@@ -54,7 +53,7 @@ pub(crate) enum DecodedObject {
     /// A file object, or what is wrong with it.
     File(Result<Box<FileObject>, Error>),
     /// A signature object.
-    Signature(Signature),
+    Signature(SignatureObject),
     /// The trailer object.
     Trailer,
     /// An object of a media type this crate does not know.
@@ -297,9 +296,9 @@ impl Draft {
     /// The name the record gives, valid or not.
     fn stated_name(&self) -> Option<&str> {
         if !self.object.name.is_root() {
-            return Some(&self.object.name);
+            return Some(self.object.name.as_str());
         }
-        self.name.as_deref().or(self.invalid_name.as_deref())
+        self.name.as_ref().map(Name::as_str).or(self.invalid_name.as_deref())
     }
 
     /// The fields of a partition, which are made when the first of them is
@@ -390,16 +389,7 @@ impl Draft {
         // The contents objects were checked when they were read, and hold
         // what follows from their fields.
         let data = object.check_consistency(subject, |contents| Ok(contents.data()))?;
-        // What the record does not give was filled in.
-        for (field, given, known) in [
-            (Field::Size, object.size.is_some(), data.size.is_some()),
-            (Field::Sha256, object.sha256.is_some(), data.sha256.is_some()),
-        ] {
-            if known && !given {
-                object.filled_in.insert(field);
-            }
-        }
-        (object.size, object.sha256) = (data.size, data.sha256);
+        object.fill_in_data(data);
         Ok(())
     }
 }
@@ -418,7 +408,7 @@ impl FileObject {
     pub(crate) fn check_permitted_fields(&self, subject: Subject<'_>) -> Result<(), Error> {
         let inode_type = self.inode_type;
         let not_permitted = |message: String| Error::manifest(Problem::FieldNotPermitted, message);
-        if self.size.is_some() && !inode_type.has_contents() {
+        if self.size.is_some() && !inode_type.has_data() {
             return Err(
                 not_permitted(format!("{}: 'size' is not permitted on a {}", subject, inode_type)).at(Field::Size),
             );
@@ -439,7 +429,7 @@ impl FileObject {
                     .at(Field::InodeToken),
             );
         }
-        if (!self.contents.is_empty() || self.sha256.is_some()) && !inode_type.has_contents() {
+        if (!self.contents.is_empty() || self.sha256.is_some()) && !inode_type.has_data() {
             return Err(not_permitted(format!(
                 "{}: 'contents' and 'sha256' are not permitted on a {}",
                 subject, inode_type
@@ -459,11 +449,50 @@ impl FileObject {
         }
     }
 
+    /// Fills in the size and the hash of the data, `data` from
+    /// [`FileObject::check_consistency`], and notes those the object does
+    /// not give.
+    fn fill_in_data(&mut self, data: SizeAndHash) {
+        for (field, given, known) in [
+            (Field::Size, self.size.is_some(), data.size.is_some()),
+            (Field::Sha256, self.sha256.is_some(), data.sha256.is_some()),
+        ] {
+            if known && !given {
+                self.filled_in.insert(field);
+            }
+        }
+        (self.size, self.sha256) = (data.size, data.sha256);
+    }
+
+    /// Fills in what follows from the contents objects, as a reader does:
+    /// what each of them says of its own data, and the size and the hash of
+    /// the data of the object. Where fields contradict each other nothing
+    /// follows from them, and a writer refuses the object.
+    pub(crate) fn fill_in_from_contents(&mut self) {
+        // The object is in no record, and what is wrong with it is not
+        // shown, so the number of the record does not matter.
+        let subject = Subject::new(self, ROOT_RECORD);
+        let data: Vec<_> = self
+            .contents
+            .iter()
+            .map(|contents| contents.check_consistency(subject).ok())
+            .collect();
+        for (contents, data) in self.contents.iter_mut().zip(data) {
+            if let Some(data) = data {
+                contents.fill_in(data);
+            }
+        }
+        let subject = Subject::new(self, ROOT_RECORD);
+        if let Ok(data) = self.check_consistency(subject, |contents| Ok(contents.data())) {
+            self.fill_in_data(data);
+        }
+    }
+
     /// Checks that the fields of the object agree with each other, as the
     /// specification requires: `readOnly` and `mode`, and the size and the
     /// hash of the object and those of its contents objects. `contents_data`
     /// gives what each contents object says of its data: what
-    /// [`Contents::check_consistency`] returns for it, or what its fields
+    /// [`ContentsObject::check_consistency`] returns for it, or what its fields
     /// hold once a reader checked and filled it in. Returns the size and the
     /// hash of the data of the object: those it gives, and those that follow
     /// from its contents objects and from each other. Whether `gptFlags`
@@ -472,7 +501,7 @@ impl FileObject {
     pub(crate) fn check_consistency(
         &self,
         subject: Subject<'_>,
-        contents_data: impl Fn(&Contents) -> Result<ContentsData, Error>,
+        contents_data: impl Fn(&ContentsObject) -> Result<ContentsData, Error>,
     ) -> Result<SizeAndHash, Error> {
         self.inode.check_read_only(subject)?;
         // The size and the hash of the object and those of its contents
@@ -491,7 +520,7 @@ impl FileObject {
             let Some(total) = original.size else {
                 continue;
             };
-            // Contents::check_consistency found the offset inside the data.
+            // ContentsObject::check_consistency found the offset inside the data.
             let rest = total - contents.offset;
             match (self.size, data.size) {
                 (Some(stated), _) => {
@@ -677,7 +706,7 @@ impl InodeAttributes {
     }
 }
 
-impl Contents {
+impl ContentsObject {
     /// Checks that the fields of the contents object agree with each
     /// other, as the specification requires, and returns what they say of
     /// its data with what follows from them: a literal gives the size of
@@ -696,7 +725,7 @@ impl Contents {
         let mut data = self.data();
         // A literal is as large as the data as it is stored, and without
         // an encoding that is the data.
-        if let Location::Literal(literal) = &self.location {
+        if let ContentsSource::Literal(literal) = &self.source {
             let len = literal.len() as u64;
             let original = data.original.size.filter(|_| self.encoding.is_none());
             if let Some(size) = [data.encoded.size, original]
@@ -779,7 +808,7 @@ impl Contents {
     }
 
     /// Fills in what follows from the fields of the contents object, `data`
-    /// from [`Contents::check_consistency`], and notes what it filled in.
+    /// from [`ContentsObject::check_consistency`], and notes what it filled in.
     fn fill_in(&mut self, data: ContentsData) {
         let given = [
             self.encoded_size.is_some(),
@@ -1190,7 +1219,7 @@ impl<'a> RecordDecoder<'a> {
         let (media_type, candidate) = RecordDecoder::read(text, record_number)?;
         Ok(match media_type {
             MediaType::Trailer => DecodedObject::Trailer,
-            MediaType::Signature => DecodedObject::Signature(Signature::decode(text, record_number)?),
+            MediaType::Signature => DecodedObject::Signature(SignatureObject::decode(text, record_number)?),
             MediaType::Other => DecodedObject::Other,
             MediaType::Absent | MediaType::Manifest => DecodedObject::File(candidate.into_file_object()),
         })
@@ -1299,7 +1328,7 @@ impl<'a> RecordDecoder<'a> {
     /// one.
     fn mode<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Mode> {
         let bits = self.unsigned(field, value)?;
-        let mode = u32::try_from(bits).ok().and_then(Mode::new);
+        let mode = u32::try_from(bits).ok().and_then(|bits| Mode::new(bits).ok());
         if mode.is_none() {
             self.note_error(Problem::FieldOutOfRange, field, || {
                 format!("manifest field '{}' is out of range: {}", field, bits)
@@ -1698,21 +1727,21 @@ impl<'a> Part<'a> for XattrValue {
 struct ContentsArray;
 
 impl<'a> Part<'a> for ContentsArray {
-    type Value = Vec<Contents>;
+    type Value = Vec<ContentsObject>;
 
     fn array<A: SeqAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, mut seq: A) -> Parsed<'a, Self::Value, A::Error> {
         let subject = decoder.subject();
         let mut list = Vec::new();
         let error_before = decoder.first_error.is_some();
         let mut count = 0usize;
-        while let Some(value) = seq.next_element_seed(decoder.seed(ContentsObject))? {
+        while let Some(value) = seq.next_element_seed(decoder.seed(ContentsElement))? {
             let contents = match value {
                 Value::Part(contents) => contents,
                 _ => {
                     decoder.note_error(Problem::InvalidContents, Field::Contents, || {
                         format!("{}: contents entry is not an object", subject)
                     });
-                    Contents::default()
+                    ContentsObject::default()
                 }
             };
             count += 1;
@@ -1730,14 +1759,14 @@ impl<'a> Part<'a> for ContentsArray {
 }
 
 /// A contents object.
-struct ContentsObject;
+struct ContentsElement;
 
-impl<'a> Part<'a> for ContentsObject {
-    type Value = Contents;
+impl<'a> Part<'a> for ContentsElement {
+    type Value = ContentsObject;
 
     fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
         let subject = decoder.subject();
-        let mut contents = Contents::default();
+        let mut contents = ContentsObject::default();
         // How many of file, url and literal the object has.
         let mut places = 0;
         let mut members = Members::new(map, &Field::CONTENTS, &mut decoder.json);
@@ -1764,7 +1793,7 @@ impl<'a> Part<'a> for ContentsObject {
                     if let Some(file) = decoder.string(field, value) {
                         match Name::new(file.as_ref()) {
                             Ok(file) => {
-                                contents.location = Location::File(file);
+                                contents.source = ContentsSource::File(file);
                                 places += 1;
                             }
                             Err(reason) => decoder.note_error(Problem::InvalidContents, field, || {
@@ -1780,8 +1809,8 @@ impl<'a> Part<'a> for ContentsObject {
                 }
                 Field::Url => {
                     if let Some(url) = decoder.string(field, value) {
-                        if decoder.note_err(Contents::check_url(&url, subject)).is_some() {
-                            contents.location = Location::Url(url.into_owned());
+                        if decoder.note_err(ContentsObject::check_url(&url, subject)).is_some() {
+                            contents.source = ContentsSource::Url(url.into_owned());
                             places += 1;
                         }
                     }
@@ -1790,7 +1819,7 @@ impl<'a> Part<'a> for ContentsObject {
                     if let Some(literal) = decoder.string(field, value) {
                         match Base64::decode(&literal) {
                             Some(literal) => {
-                                contents.location = Location::Literal(literal);
+                                contents.source = ContentsSource::Literal(literal);
                                 places += 1;
                             }
                             None => decoder.note_error(Problem::InvalidContents, field, || {
@@ -1802,7 +1831,10 @@ impl<'a> Part<'a> for ContentsObject {
                 Field::Encoding => {
                     if let Some(encoding) = decoder.string(field, value) {
                         let encoding = encoding.to_ascii_lowercase();
-                        if decoder.note_err(Contents::check_encoding(&encoding, subject)).is_some() {
+                        if decoder
+                            .note_err(ContentsObject::check_encoding(&encoding, subject))
+                            .is_some()
+                        {
                             contents.encoding = Some(encoding);
                         }
                     }
@@ -1836,7 +1868,7 @@ impl<'a> Part<'a> for ContentsObject {
 }
 
 /// `httpHeaders`: an object that maps the names of HTTP header fields to
-/// their values, see [`Contents::check_headers`].
+/// their values, see [`ContentsObject::check_headers`].
 struct HeaderFields;
 
 impl<'a> Part<'a> for HeaderFields {
@@ -1861,7 +1893,7 @@ impl<'a> Part<'a> for HeaderFields {
                 }),
             }
         }
-        decoder.note_err(Contents::check_headers(&headers, subject));
+        decoder.note_err(ContentsObject::check_headers(&headers, subject));
         Ok(Value::Part(headers))
     }
 }
@@ -1903,12 +1935,12 @@ impl<'a> Part<'a> for SignatureRecord {
     }
 }
 
-impl Signature {
+impl SignatureObject {
     /// Reads the signature object the record `text` holds, the one with the
     /// number `record_number`, which is known to be a JSON object. The
     /// signature is not verified, but a manifest whose signature objects
     /// are malformed is refused like systemd refuses it.
-    fn decode(text: &str, record_number: u64) -> Result<Signature, Error> {
+    fn decode(text: &str, record_number: u64) -> Result<SignatureObject, Error> {
         RecordDecoder::new(record_number)
             .object(text, SignatureRecord)?
             .into_signature(record_number)
@@ -1919,7 +1951,7 @@ impl Signature {
 impl SignatureMembers<'_> {
     /// The signature object of the record with the number `record_number`
     /// that has these members.
-    fn into_signature(self, record_number: u64) -> Result<Signature, Error> {
+    fn into_signature(self, record_number: u64) -> Result<SignatureObject, Error> {
         let not_a_string = |field: Field| {
             Error::manifest(
                 Problem::WrongFieldType,
@@ -1962,7 +1994,7 @@ impl SignatureMembers<'_> {
                 }
             },
         };
-        let mut signature = Signature::new(mechanism);
+        let mut signature = SignatureObject::new(mechanism);
         signature.key = key;
         signature.data = data;
         Ok(signature)
@@ -2011,7 +2043,7 @@ mod tests {
         assert_eq!(o.name, "dir/file");
         assert_eq!(o.inode_type, InodeType::Regular);
         assert_eq!(o.size, Some(5));
-        assert_eq!(o.inode.mode, Mode::new(0o644));
+        assert_eq!(o.inode.mode, Some(Mode::new(0o644).unwrap()));
         assert_eq!((o.inode.uid, o.inode.gid), (Some(1000), Some(100)));
         assert_eq!(o.inode.user_name.as_deref(), Some("Domain Users"));
         assert_eq!(o.inode.group_name.as_deref(), Some("users"));
@@ -2083,7 +2115,7 @@ mod tests {
         assert_eq!(root.inode.user_xattrs.as_deref().map(BTreeMap::len), Some(0));
         assert_eq!(
             (root.inode.uid, root.inode.gid, root.inode.mode),
-            (Some(1000), Some(1000), Mode::new(0o775))
+            (Some(1000), Some(1000), Some(Mode::new(0o775).unwrap()))
         );
         assert_eq!(root.inode.read_only, Some(false));
         assert_eq!(root.gpt_disk_uuid, Some(uuid));
@@ -2245,7 +2277,7 @@ mod tests {
         for (text, mode) in [("420", 0o644), ("4095", 0o7777), ("0", 0)] {
             assert_eq!(
                 object(&format!(r#"{{"name":"x","mode":{}}}"#, text)).inode.mode,
-                Mode::new(mode),
+                Some(Mode::new(mode).unwrap()),
                 "{}",
                 text
             );
@@ -2340,6 +2372,15 @@ mod tests {
             e.to_string(),
             format!("manifest object 1: name is longer than 4095 bytes: '{}x'", name)
         );
+        // A name below one that is reserved for the manifest is reserved as
+        // well: its directory cannot be listed, so it could only come out
+        // of place.
+        let e = refused(r#"{"name":"Uapi16Manifest/x"}"#);
+        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(
+            e.to_string(),
+            "manifest object 1: name is reserved for the manifest: 'Uapi16Manifest/x'"
+        );
     }
 
     /// A `readOnly` the reader filled in is not one the object has: the
@@ -2388,13 +2429,13 @@ mod tests {
             let subject = Subject::new(object, 1);
             object.check_consistency(subject, |contents| contents.check_consistency(subject))
         };
-        let file = |size: Option<u64>, contents: Contents| {
+        let file = |size: Option<u64>, contents: ContentsObject| {
             let mut object = FileObject::new(Name::new("x").unwrap());
             object.size = size;
             object.contents = vec![contents];
             object
         };
-        let hello = || Contents::new(Location::Literal(b"hello".to_vec()));
+        let hello = || ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()));
         assert_eq!(
             check(&file(None, hello())).unwrap(),
             SizeAndHash {
@@ -2404,13 +2445,13 @@ mod tests {
         );
         let mut beyond = hello();
         beyond.offset = 7;
-        let mut headers = Contents::new(Location::File(Name::new("a").unwrap()));
+        let mut headers = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
         headers.http_headers = vec![("A".to_string(), "b".to_string())];
         let mut empty = file(Some(3), hello());
         empty.contents.clear();
         empty.sha256 = EMPTY.parse().ok();
         let mut read_only = file(None, hello());
-        read_only.inode.mode = Mode::new(0o644);
+        read_only.inode.mode = Some(Mode::new(0o644).unwrap());
         read_only.inode.read_only = Some(true);
         for (object, record) in [
             (
@@ -2784,10 +2825,10 @@ mod tests {
                 .contents
                 .remove(0)
         };
-        assert_eq!(contents("{}"), Contents::default());
+        assert_eq!(contents("{}"), ContentsObject::default());
         assert_eq!(
             contents(r#"{"file":null,"url":null,"literal":null,"offset":null,"xHeaders":{"A":"b"}}"#),
-            Contents::default()
+            ContentsObject::default()
         );
         // The header fields of a request for a URL, sorted by nothing but
         // the manifest.

@@ -185,43 +185,42 @@ pub enum SourceProblem {
     Unreadable,
 }
 
-/// How contents fail to be what the manifest describes, found while they
-/// are copied.
+/// How the data of a file fails to be what the manifest describes, found
+/// while it is copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum ContentProblem {
-    /// They are not as many bytes as the manifest says, their file is too
-    /// short for them, or their file is not as long as the `originalSize`
-    /// the manifest gives, shorter or longer.
+pub enum DataProblem {
+    /// It is not as many bytes as the manifest says, its file is too short
+    /// for it, or its file is not as long as the `originalSize` the
+    /// manifest gives, shorter or longer.
     SizeMismatch,
-    /// They do not have the hash the manifest says, or their file does not
+    /// It does not have the hash the manifest says, or its file does not
     /// have the hash the manifest gives for it.
     HashMismatch,
-    /// The stream they come from ended before they were complete.
+    /// The stream it comes from ended before it was complete.
     StreamEnded,
-    /// The file they are in changed while it was read: it is not as long
-    /// as it was when it was opened, or longer.
+    /// The file it is in changed while it was read: it is not as long as
+    /// it was when it was opened, or longer.
     SourceChanged,
 }
 
-/// Contents that a manifest gives in a way this crate cannot take.
+/// Data that a manifest gives in a way this crate cannot take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum UnsupportedContent {
-    /// They start at an offset in their file, and the source is a
-    /// [`StreamSource`](crate::StreamSource), which has them and nothing
+pub enum UnsupportedData {
+    /// It starts at an offset in its file, and the provider is a
+    /// [`StreamProvider`](crate::StreamProvider), which has it and nothing
     /// else of the file.
     OffsetInStream,
-    /// The object gives no size, and the source is a
-    /// [`StreamSource`](crate::StreamSource), which needs it to know where
-    /// they end.
+    /// The object gives no size, and the provider is a
+    /// [`StreamProvider`](crate::StreamProvider), which needs it to know
+    /// where the data ends.
     NoSize,
-    /// Every contents object of the file has them at a URL or in an
-    /// encoding, and they would have to be fetched or decoded.
+    /// Every contents object of the file has it at a URL or in an
+    /// encoding, and it would have to be fetched or decoded.
     UrlOrEncoding,
-    /// There are none. The object has no contents objects, and only a
-    /// regular file has its contents in the file of its own name without
-    /// one.
+    /// There is none. The object has no contents objects, and only a
+    /// regular file has its data in the file of its own name without one.
     Absent,
 }
 
@@ -245,10 +244,11 @@ pub enum ErrorKind {
     Manifest(Problem),
     /// The data of a file object cannot be had from where it is.
     Source(SourceProblem),
-    /// Contents are not what the manifest describes.
-    Content(ContentProblem),
-    /// The manifest gives contents in a way this crate cannot take.
-    Unsupported(UnsupportedContent),
+    /// The data of a file is not what the manifest describes.
+    Data(DataProblem),
+    /// The manifest gives the data of a file in a way this crate cannot
+    /// take.
+    Unsupported(UnsupportedData),
     /// A file object is revoked or outside its validity window.
     NotValid(ValidityProblem),
     /// Reading or writing failed.
@@ -521,8 +521,7 @@ impl Error {
         self
     }
 
-    /// Notes what is not supported: the ways the contents are available
-    /// in.
+    /// Notes what is not supported: the ways the data is available in.
     #[must_use]
     pub(crate) fn valued(mut self, value: impl Into<String>) -> Error {
         self.0.value = Some(value.into());
@@ -659,8 +658,8 @@ impl Error {
     }
 
     /// The size that was found, when the error is about a size and it is
-    /// known: for a [`ContentProblem::SizeMismatch`] and a
-    /// [`ContentProblem::StreamEnded`].
+    /// known: for a [`DataProblem::SizeMismatch`] and a
+    /// [`DataProblem::StreamEnded`].
     pub fn found_size(&self) -> Option<u64> {
         self.0.found_size
     }
@@ -672,9 +671,8 @@ impl Error {
         self.0.expected_size
     }
 
-    /// What is not supported, for [`UnsupportedContent::UrlOrEncoding`]:
-    /// the ways the contents are available in, such as `'gzip' encoding or
-    /// a URL`.
+    /// What is not supported, for [`UnsupportedData::UrlOrEncoding`]: the
+    /// ways the data is available in, such as `'gzip' encoding or a URL`.
     pub fn value(&self) -> Option<&str> {
         self.0.value.as_deref()
     }
@@ -766,7 +764,7 @@ mod tests {
         assert_eq!(e.to_string(), "message");
         assert_eq!((e.found_size(), e.expected_size(), e.value()), (None, None, None));
         assert!(e.io_error().is_none() && std::error::Error::source(&e).is_none());
-        let e = Error::new(ErrorKind::Content(ContentProblem::SizeMismatch), String::new())
+        let e = Error::new(ErrorKind::Data(DataProblem::SizeMismatch), String::new())
             .sizes(Some(1), Some(2))
             .valued("gzip");
         assert_eq!(

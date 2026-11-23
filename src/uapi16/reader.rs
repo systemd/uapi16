@@ -6,7 +6,7 @@ use std::io::{self, BufRead};
 
 use crate::decode::{DecodedObject, RecordDecoder, ROOT_RECORD};
 use crate::error::{Error, Problem};
-use crate::object::{FileObject, RootObject, Signature};
+use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::sequence::SequenceCheck;
 use crate::strict::is_whitespace;
 use crate::{MAX_RECORD_SIZE, RECORD_END, RECORD_SEPARATOR};
@@ -232,7 +232,7 @@ pub enum Object {
     /// A file object.
     File(Box<FileObject>),
     /// A signature object. It comes after the last file object.
-    Signature(Signature),
+    Signature(SignatureObject),
 }
 
 /// How far a decoder has got in the manifest.
@@ -249,7 +249,14 @@ enum Stage {
 }
 
 /// What a [`Decoder`] has for its caller next.
+///
+/// [`Step::Input`] asks for more of the manifest, [`Step::End`] says that
+/// there is nothing more, and the other steps hand something out. A step
+/// the caller does not know needs nothing from it but another call to
+/// [`Decoder::step`], so the caller can pass over it. Steps that come in
+/// later releases only hand something out.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step {
     /// More of the manifest: [`Decoder::feed`] takes it, and
     /// [`Decoder::end`] says that the input ended.
@@ -304,7 +311,7 @@ pub enum Step {
 ///             let taken = decoder.feed(&input[..input.len().min(5)]);
 ///             input = &input[taken..];
 ///         }
-///         Step::Object(Object::File(object)) => names.push(object.name),
+///         Step::Object(Object::File(object)) => names.push(object.into_name()),
 ///         Step::End => break,
 ///         _ => {}
 ///     }
@@ -482,9 +489,10 @@ mod tests {
     use super::*;
     use crate::blocking::READ_SIZE;
     use crate::error::{ErrorKind, Field};
+    use crate::object::{DosFlags, FlagStates, InodeFlags};
     use crate::testing::{manifest, sequence, ROOT, SIGNATURE, TRAILER};
     use crate::testing::{read_whole, Whole, HELLO, PIECES};
-    use crate::{Digest, DosFlags, Features, FlagStates, InodeFlags, InodeType, Order, Reader, RootObject, Sha256};
+    use crate::{Features, InodeType, Order, Reader, RootObject, Sha256};
     use std::collections::BTreeMap;
 
     /// Reads `bytes` to the end and returns the names of the file objects

@@ -117,7 +117,7 @@ impl SequenceCheck {
         // at once.
         let pair = NamePair::new(&self.last, name);
         if !pair.second_is_in_open_directory(self.last_type) {
-            let directory = object.name.parent().unwrap_or_default();
+            let directory = object.name.parent_str().unwrap_or_default();
             return Err(Error::manifest(
                 Problem::Misplaced,
                 format!(
@@ -157,8 +157,9 @@ impl SequenceCheck {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::object::{DosFlags, InodeFlags};
     use crate::testing::full_tree_names;
-    use crate::{Contents, DosFlags, FatSerial, InodeFlags, Location, Mode, Name, Uuid};
+    use crate::{ContentsObject, ContentsSource, FatSerial, Mode, Name, Uuid};
     use std::num::NonZeroU64;
 
     /// Gives an object a field.
@@ -322,7 +323,11 @@ mod tests {
         // two the object has, for symbolic links the target in `contents`.
         let none = SequenceCheck::new(Features::NONE, None);
         let cases: [(InodeType, Give<FileObject>, Field); 8] = [
-            (InodeType::Regular, |o| o.inode.mode = Mode::new(0o644), Field::Mode),
+            (
+                InodeType::Regular,
+                |o| o.inode.mode = Some(Mode::new(0o644).unwrap()),
+                Field::Mode,
+            ),
             (InodeType::CharDevice, |o| o.major = Some(1), Field::Major),
             (InodeType::BlockDevice, |o| o.minor = Some(1), Field::Minor),
             (
@@ -347,7 +352,7 @@ mod tests {
             ),
             (
                 InodeType::Symlink,
-                |o| o.contents = vec![Contents::new(Location::Literal(b"t".to_vec()))],
+                |o| o.contents = vec![ContentsObject::new(ContentsSource::Literal(b"t".to_vec()))],
                 Field::Contents,
             ),
         ];
@@ -398,7 +403,7 @@ mod tests {
             ),
             (|o| o.inode.user_name = Some("u".into()), Field::UserName),
             (|o| o.inode.read_only = Some(true), Field::ReadOnly),
-            (|o| o.inode.mode = Mode::new(0o444), Field::Mode),
+            (|o| o.inode.mode = Some(Mode::new(0o444).unwrap()), Field::Mode),
             (
                 |o| o.inode.user_xattrs = Some(Box::default()),
                 Field::ExtendedAttributes,

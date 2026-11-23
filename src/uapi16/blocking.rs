@@ -8,7 +8,7 @@ use std::iter::FusedIterator;
 
 use crate::decode::ROOT_RECORD;
 use crate::error::Error;
-use crate::object::{FileObject, RootObject, Signature};
+use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::reader::{Decoder, Object, Step};
 use crate::writer::Encoder;
 
@@ -63,7 +63,7 @@ pub(crate) const READ_SIZE: usize = 64 * 1024;
 /// let mut names = Vec::new();
 /// for object in Reader::open(manifest.as_bytes())? {
 ///     if let Object::File(object) = object? {
-///         names.push(object.name);
+///         names.push(object.into_name());
 ///     }
 /// }
 /// assert_eq!(names, ["a", "b"]);
@@ -131,7 +131,7 @@ impl<R: Read> Reader<R> {
     /// its record separator. None as long as no signature object was read.
     ///
     /// This crate does not verify signatures. With this number and the
-    /// [`Signature`] objects a caller can.
+    /// signature objects, see [`SignatureObject`], a caller can.
     pub fn signed_len(&self) -> Option<u64> {
         self.decoder.signed_len()
     }
@@ -245,9 +245,9 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// use uapi16::{FileObject, Name, Object, Order, Reader, RootObject, Writer};
 ///
 /// let mut root = RootObject::default();
-/// root.order = Some(Order::CodePoint);
+/// root.set_order(Some(Order::CodePoint));
 /// let mut file = FileObject::new(Name::new("a")?);
-/// file.size = Some(3);
+/// file.set_size(Some(3));
 /// let mut writer = Writer::begin(Vec::new(), &root)?;
 /// writer.file(&file)?;
 /// let bytes = writer.finish()?;
@@ -262,6 +262,31 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// let mut reader = Reader::open(&bytes[..])?;
 /// assert!(matches!(reader.next(), Some(Ok(Object::File(object))) if *object == file));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// A copy of a manifest writes back what a reader returns, one object at
+/// a time. The writer takes the root file object by reference, so it
+/// starts before the loop and needs no copy of it:
+///
+/// ```
+/// use uapi16::{Object, Reader, Writer};
+///
+/// let manifest = concat!(
+///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
+///     "\x1e{\"name\":\"a\",\"size\":3}\n",
+///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+/// );
+/// let mut reader = Reader::open(manifest.as_bytes())?;
+/// let mut writer = Writer::begin(Vec::new(), reader.root())?;
+/// for object in &mut reader {
+///     match object? {
+///         Object::File(file) => writer.file(&file)?,
+///         Object::Signature(signature) => writer.signature(&signature)?,
+///         _ => {}
+///     }
+/// }
+/// assert_eq!(writer.finish()?, manifest.as_bytes());
+/// # Ok::<(), uapi16::Error>(())
 /// ```
 ///
 /// [`FilledIn`]: crate::FilledIn
@@ -289,7 +314,7 @@ impl<W: Write> Writer<W> {
 
     /// Writes a signature object. No file object can follow it: it would
     /// be one the signature does not cover.
-    pub fn signature(&mut self, signature: &Signature) -> Result<(), Error> {
+    pub fn signature(&mut self, signature: &SignatureObject) -> Result<(), Error> {
         self.send_record(|encoder| encoder.encode_signature(signature))
     }
 
@@ -308,6 +333,14 @@ impl<W: Write> Writer<W> {
     /// objects sign.
     pub fn get_ref(&self) -> &W {
         &self.out
+    }
+
+    /// What the manifest is written to, to change it, such as to flush it
+    /// in between. Writing to it directly breaks the manifest the writer
+    /// writes. The writer holds nothing back: every method writes its whole
+    /// record to it before it returns.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
     }
 
     /// Writes out the record that `encode` has the encoder put together.
@@ -623,7 +656,7 @@ mod tests {
         writer.file(&largest).unwrap();
         assert_eq!(writer.get_ref().len() - before, MAX_RECORD_SIZE);
         assert!(writer.encoder.record.capacity() <= RECORD_CAPACITY);
-        let mut signature = Signature::new("pkcs7");
+        let mut signature = SignatureObject::new("pkcs7");
         signature.data = Some(vec![0; MAX_RECORD_SIZE]);
         let e = writer.signature(&signature).unwrap_err();
         assert_eq!(
@@ -654,7 +687,7 @@ mod tests {
         writer.file(&FileObject::new(name("a"))).unwrap();
         let signed = writer.get_ref().len();
         let hash = Sha256::digest(writer.get_ref());
-        let mut signature = Signature::new("pkcs7");
+        let mut signature = SignatureObject::new("pkcs7");
         signature.data = Some(hash.as_bytes().to_vec());
         writer.signature(&signature).unwrap();
         let bytes = writer.finish().unwrap();
@@ -663,6 +696,17 @@ mod tests {
         assert_eq!(objects.len(), 2);
         assert_eq!(reader.signed_len(), u64::try_from(signed).ok());
         assert_eq!(Sha256::digest(&bytes[..signed]), hash);
+    }
+
+    /// What the writer writes to is lent out as it is, with every record
+    /// written so far in it.
+    #[test]
+    fn lends_out_what_it_writes_to() {
+        let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
+        let root = sequence(&[ROOT]);
+        assert_eq!(writer.get_mut(), &root);
+        writer.get_mut().flush().unwrap();
+        assert_eq!(writer.finish().unwrap(), sequence(&[ROOT, TRAILER]));
     }
 
     /// Notes every write and every flush, and fails the write `fail_at`.

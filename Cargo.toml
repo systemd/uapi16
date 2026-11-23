@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[workspace]
+members = ["src/uapi16"]
+# cargo update picks dependency versions that support rust-version.
+resolver = "3"
+
+[workspace.package]
+edition = "2021"
+# uapi16 has to keep building with this rustc.
+rust-version = "1.85"
+license = "LGPL-2.1-or-later"
+
+[workspace.dependencies]
+# Stay on 0.2 like pathrs, errno, getrandom and sha2's cpufeatures, so
+# that the tests never build two versions of libc.
+libc = "0.2.191"
+# Resolves the names of the files next to a manifest below their
+# directory, for PinnedDirectory. It builds on Linux only.
+pathrs = "0.2.6"
+# Tells what pathrs resolved apart before it is opened, and reopens it
+# through O_EMPTYPATH. Splits the device number of a file into its major
+# and minor numbers, for FileObject::from_metadata().
+rustix = "1.1.6"
+# Reads and writes JSON. What a manifest asks for beyond JSON is checked
+# by src/uapi16/strict.rs. Never turn on arbitrary_precision: serde_json
+# then hands numbers to the visitors of uapi16 as objects, see the crate
+# docs of uapi16.
+serde_core = "1.0.229"
+serde_json = "1.0.154"
+# 0.11.1 and later need rustc 1.88.
+sha2 = { version = "0.11.0", default-features = false }
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_qualifications = "warn"

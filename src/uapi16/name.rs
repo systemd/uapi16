@@ -4,7 +4,6 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::iter;
-use std::ops::Deref;
 use std::str::FromStr;
 
 use crate::strict::StringRules;
@@ -39,9 +38,9 @@ const RULES: StringRules = STRING_RULES.without(StringRules::NO_NUL);
 /// single slashes, and none of them is empty, `.` or `..`. It has no
 /// control characters and no noncharacters, and it is at most
 /// [`Name::MAX_LEN`] bytes long. Its components are not limited on their
-/// own. It is not `Uapi16Manifest` and does not begin with
-/// `Uapi16Manifest.`, the names the manifest itself and what belongs to it
-/// have inside the tree.
+/// own. Its first component is not `Uapi16Manifest` and does not begin
+/// with `Uapi16Manifest.`, the names the manifest itself and what belongs
+/// to it have inside the tree.
 ///
 /// Names are ordered the way the specification orders the file objects of
 /// a manifest in code point order: component by component, each compared
@@ -75,8 +74,10 @@ pub enum NameProblem {
     Empty,
     /// It is longer than [`Name::MAX_LEN`] bytes.
     TooLong,
-    /// It is `Uapi16Manifest` or begins with `Uapi16Manifest.`, which the
-    /// specification reserves for the manifest and what belongs to it.
+    /// Its first component is `Uapi16Manifest` or begins with
+    /// `Uapi16Manifest.`, which the specification reserves for the manifest
+    /// and what belongs to it. A file below a directory of such a name
+    /// cannot be listed, since its directory cannot be.
     Reserved,
     /// It contains a control character: ASCII 0 to 31 or 127.
     ContainsControlCharacter,
@@ -201,9 +202,18 @@ impl Name {
         self.0.split(SEPARATOR).filter(|component| !component.is_empty())
     }
 
-    /// The name of the directory the file is in, which is the empty name
-    /// of the root for a file at the top. The root has none.
-    pub fn parent(&self) -> Option<&str> {
+    /// The name of the directory the file is in, [`Name::ROOT`] for a file
+    /// at the top. The root has none.
+    pub fn parent(&self) -> Option<Name> {
+        // The first component of a name is not reserved, and that is the
+        // only check a part of a name could fail. So every directory a name
+        // is in has a name, which is not checked again.
+        self.parent_str().map(|parent| Name(parent.to_owned()))
+    }
+
+    /// The name of the directory the file is in, as [`Name::parent`] has
+    /// it, without a copy.
+    pub(crate) fn parent_str(&self) -> Option<&str> {
         if self.is_root() {
             return None;
         }
@@ -217,12 +227,13 @@ impl Name {
     }
 
     /// Whether `name` is one the specification reserves for the manifest
-    /// and what belongs to it: `Uapi16Manifest`, or a name that begins
-    /// with `Uapi16Manifest.`. A file of such a name is not listed in a
-    /// manifest.
+    /// and what belongs to it: one whose first component is `Uapi16Manifest`
+    /// or begins with `Uapi16Manifest.`. A file of such a name is not listed
+    /// in a manifest, and neither is a file below a directory of such a
+    /// name.
     pub fn is_reserved(name: &str) -> bool {
         name.strip_prefix(FILENAME)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR) || rest.starts_with(SEPARATOR))
     }
 
     /// Whether this is the name of the root file object.
@@ -232,14 +243,6 @@ impl Name {
 
     /// The name as a string.
     pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for Name {
-    type Target = str;
-
-    fn deref(&self) -> &str {
         &self.0
     }
 }
@@ -409,6 +412,7 @@ mod tests {
             "xUapi16Manifest.sig",
         ] {
             let parsed = Name::new(name).unwrap_or_else(|_| panic!("{:?}", name));
+            check_parent(&parsed);
             assert_eq!(parsed, name);
             assert_eq!(parsed.as_str(), name);
             assert_eq!(parsed.to_string(), name);
@@ -444,6 +448,8 @@ mod tests {
             ("Uapi16Manifest.sig", NameProblem::Reserved),
             ("Uapi16Manifest.gz", NameProblem::Reserved),
             ("Uapi16Manifest.d/inside", NameProblem::Reserved),
+            ("Uapi16Manifest/inside", NameProblem::Reserved),
+            ("Uapi16Manifest/a/b", NameProblem::Reserved),
         ] {
             assert_eq!(Name::new(name), Err(reason), "{:?}", name);
             assert_eq!(name.parse::<Name>(), Err(reason), "{:?}", name);
@@ -588,7 +594,11 @@ mod tests {
         if name.len() > Name::MAX_LEN {
             reasons.push(NameProblem::TooLong);
         }
-        if Name::is_reserved(name) {
+        let first = name.split(SEPARATOR).next().unwrap_or_default();
+        if first
+            .strip_prefix(FILENAME)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR))
+        {
             reasons.push(NameProblem::Reserved);
         }
         if name.chars().any(|c| c.is_ascii_control()) {
@@ -652,7 +662,10 @@ mod tests {
             ] {
                 let reasons = reasons(&name);
                 match Name::new(name.as_str()) {
-                    Ok(_) => assert!(reasons.is_empty(), "{:?} {:?}", name, reasons),
+                    Ok(valid) => {
+                        assert!(reasons.is_empty(), "{:?} {:?}", name, reasons);
+                        check_parent(&valid);
+                    }
                     Err(reason) => assert!(reasons.contains(&reason), "{:?} {:?} {:?}", name, reason, reasons),
                 }
                 valid[usize::from(reasons.is_empty())] += 1;
@@ -685,14 +698,32 @@ mod tests {
         let name = Name::new("a/b/c").unwrap();
         assert_eq!(name.components().collect::<Vec<_>>(), ["a", "b", "c"]);
         assert_eq!(name.components().next_back(), Some("c"));
-        assert_eq!(name.parent(), Some("a/b"));
+        assert_eq!(name.parent(), Some(Name::new("a/b").unwrap()));
         assert_eq!(name.file_name(), Some("c"));
         let top = Name::new("a").unwrap();
-        assert_eq!(top.parent(), Some(""));
+        assert_eq!(top.parent(), Some(Name::ROOT));
         assert_eq!(top.file_name(), Some("a"));
         assert_eq!(Name::ROOT.components().count(), 0);
         assert_eq!(Name::ROOT.parent(), None);
         assert_eq!(Name::ROOT.file_name(), None);
+        // A component is not always a name: the last one of a name can be
+        // one that is reserved at the top.
+        let below = Name::new("a/Uapi16Manifest").unwrap();
+        assert_eq!(below.file_name(), Some("Uapi16Manifest"));
+        assert_eq!(Name::new("Uapi16Manifest"), Err(NameProblem::Reserved));
+        for name in full_tree_names(&["a", "...", ".hidden", "Uapi16Manifest2", "b c"], 3) {
+            check_parent(&name);
+        }
+    }
+
+    /// Checks that the directory `name` is in has a name, which is why
+    /// [`Name::parent`] does not check it again.
+    fn check_parent(name: &Name) {
+        match name.parent() {
+            None => assert!(name.is_root()),
+            Some(parent) if parent.is_root() => assert_eq!(name.components().count(), 1, "{:?}", name),
+            Some(parent) => assert_eq!(Name::new(parent.as_str()), Ok(parent), "{:?}", name),
+        }
     }
 
     #[test]
@@ -710,14 +741,18 @@ mod tests {
             "Uapi16Manifest.",
             "Uapi16Manifest.sig",
             "Uapi16Manifest.d/x",
+            "Uapi16Manifest/x",
+            "Uapi16Manifest/x/y",
         ] {
             assert!(Name::is_reserved(name), "{:?}", name);
         }
         for name in [
             "",
             "Uapi16Manifest2",
+            "Uapi16Manifest2/x",
             "Uapi16Manifes",
             "sub/Uapi16Manifest",
+            "sub/Uapi16Manifest/x",
             "x.Uapi16Manifest",
         ] {
             assert!(!Name::is_reserved(name), "{:?}", name);
@@ -771,12 +806,12 @@ mod tests {
         assert_eq!(Name::ROOT.join("a").unwrap().join("b").unwrap(), "a/b");
         // The length of the whole name counts.
         let mut deep = Name::ROOT;
-        while deep.len() + 2 * (long.len() + 1) <= Name::MAX_LEN {
+        while deep.as_str().len() + 2 * (long.len() + 1) <= Name::MAX_LEN {
             deep = deep.join(&long).unwrap();
         }
-        let room = Name::MAX_LEN - (deep.len() + 1);
+        let room = Name::MAX_LEN - (deep.as_str().len() + 1);
         assert!(room > 0);
-        assert_eq!(deep.join(&"y".repeat(room)).unwrap().len(), Name::MAX_LEN);
+        assert_eq!(deep.join(&"y".repeat(room)).unwrap().as_str().len(), Name::MAX_LEN);
         assert_eq!(deep.join(&"y".repeat(room + 1)), Err(NameProblem::TooLong));
         // A component that is too long, and wrong in another way too, is
         // refused for its length, as the whole name is.

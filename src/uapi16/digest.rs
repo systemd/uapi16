@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! The hashes a manifest gives for the contents of files.
+//! The hashes a manifest gives for the data of files.
 
 use std::fmt;
 use std::io;
@@ -8,33 +8,6 @@ use std::str::FromStr;
 use sha2::Digest as _;
 
 use crate::hex::Hex;
-
-/// A hash a manifest gives for contents.
-///
-/// The specification defines one algorithm, SHA-256, which is [`Sha256`],
-/// and says that another one gets fields of its own next to the SHA-256
-/// ones. A type with this trait gives the hash of no data and a context
-/// that computes the hash of data that comes in pieces.
-pub trait Digest: Copy + Eq {
-    /// The hash of no data. Contents of size 0 have this hash, and only
-    /// they do.
-    const EMPTY: Self;
-
-    /// Computes the hash of data that comes in pieces. What is written to
-    /// it is the data, and [`Finalize::finalize`] gives the hash of all of
-    /// it.
-    type Context: Default + io::Write + Finalize<Digest = Self>;
-}
-
-/// The computation of a hash, which ends with the hash of all the data,
-/// such as [`Digest::Context`].
-pub trait Finalize {
-    /// The hash it computes.
-    type Digest: Digest;
-
-    /// Ends the computation and gives the hash of all the data.
-    fn finalize(self) -> Self::Digest;
-}
 
 /// A SHA-256 hash, as the `sha256` field of a file object and the
 /// `encodedSha256` and `originalSha256` fields of a contents object have
@@ -45,7 +18,7 @@ pub trait Finalize {
 /// the digits, is refused.
 ///
 /// ```
-/// use uapi16::{Digest, Sha256};
+/// use uapi16::Sha256;
 ///
 /// let hash = Sha256::digest(b"hello");
 /// assert_eq!(
@@ -75,6 +48,12 @@ impl std::error::Error for InvalidDigest {}
 impl Sha256 {
     /// The size of the hash in bytes.
     pub const SIZE: usize = 32;
+    /// The hash of no data. Data of size 0 has this hash, and only it
+    /// does.
+    pub const EMPTY: Sha256 = Sha256([
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae,
+        0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    ]);
 
     /// The hash of `data`.
     pub fn digest(data: &[u8]) -> Sha256 {
@@ -85,15 +64,6 @@ impl Sha256 {
     pub fn as_bytes(&self) -> &[u8; Sha256::SIZE] {
         &self.0
     }
-}
-
-impl Digest for Sha256 {
-    const EMPTY: Sha256 = Sha256([
-        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae,
-        0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
-    ]);
-
-    type Context = Sha256Context;
 }
 
 impl From<[u8; Sha256::SIZE]> for Sha256 {
@@ -135,13 +105,13 @@ impl FromStr for Sha256 {
 }
 
 /// Computes the [`Sha256`] of data that comes in pieces, such as the
-/// contents of a file a manifest is written for.
+/// data of a file a manifest is written for.
 ///
 /// ```
 /// use std::io::Write;
-/// use uapi16::{Finalize, Sha256, Sha256Context};
+/// use uapi16::{Sha256, Sha256Context};
 ///
-/// let mut context = Sha256Context::default();
+/// let mut context = Sha256Context::new();
 /// context.update(b"hel");
 /// context.write_all(b"lo")?;
 /// assert_eq!(context.finalize(), Sha256::digest(b"hello"));
@@ -151,16 +121,19 @@ impl FromStr for Sha256 {
 pub struct Sha256Context(sha2::Sha256);
 
 impl Sha256Context {
+    /// A computation that has taken no data yet, the same as the default
+    /// one.
+    pub fn new() -> Sha256Context {
+        Sha256Context::default()
+    }
+
     /// Takes more of the data.
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data);
     }
-}
 
-impl Finalize for Sha256Context {
-    type Digest = Sha256;
-
-    fn finalize(self) -> Sha256 {
+    /// Ends the computation and gives the hash of all the data.
+    pub fn finalize(self) -> Sha256 {
         Sha256(self.0.finalize().into())
     }
 }
@@ -207,20 +180,19 @@ mod tests {
         assert_eq!(Sha256::digest(b""), Sha256::EMPTY);
     }
 
-    /// The hash of `data` computed with nothing but what [`Digest`] gives:
-    /// a context that takes the data and is then finalized.
-    fn computed<D: Digest>(data: &[u8]) -> D {
+    /// The hash of `data` computed with a context the data is written to.
+    fn computed(data: &[u8]) -> Sha256 {
         use std::io::Write;
 
-        let mut context = D::Context::default();
+        let mut context = Sha256Context::default();
         context.write_all(data).unwrap();
         context.finalize()
     }
 
     #[test]
     fn contexts() {
-        assert_eq!(computed::<Sha256>(b""), Sha256::EMPTY);
-        assert_eq!(computed::<Sha256>(b"hello"), Sha256::digest(b"hello"));
+        assert_eq!(computed(b""), Sha256::EMPTY);
+        assert_eq!(computed(b"hello"), Sha256::digest(b"hello"));
     }
 
     #[test]
