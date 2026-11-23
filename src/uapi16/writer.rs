@@ -469,9 +469,13 @@ impl FileObject {
         if self.contents.len() > MAX_CONTENTS {
             return Err(Error::too_many_contents(subject));
         }
+        // What each contents object says of its data. The check of the
+        // object below takes it from here, so that no literal is hashed
+        // twice.
+        let mut contents_data = Vec::with_capacity(self.contents.len());
         for contents in &self.contents {
             contents.check(subject)?;
-            contents.check_consistency(subject)?;
+            contents_data.push(contents.check_consistency(subject)?);
         }
         let inode = &self.inode;
         inode.check_xattr_names(subject)?;
@@ -496,7 +500,7 @@ impl FileObject {
         self.check_permitted_fields(subject)?;
         // The contents objects were checked above. This is for what
         // follows from them.
-        self.check_consistency(subject, |contents| contents.check_consistency(subject))?;
+        self.check_consistency(subject, contents_data.iter().copied())?;
         Ok(())
     }
 
@@ -829,7 +833,7 @@ mod tests {
     use crate::object::{ContentsSource, DosFlags, FatSerial, InodeFlags, Mode, Uuid};
     use crate::testing::{
         directory, everything, json, name, read_whole, record, recording_all, sequence, write_whole, written, Whole,
-        EMPTY, HELLO, ROOT, SIGNATURE, TRAILER,
+        EMPTY, HELLO, ROOT, SIGNATURE, TRAILER, WORLD,
     };
     use crate::{Sha256, Writer};
     use std::collections::BTreeMap;
@@ -1613,6 +1617,22 @@ mod tests {
                 },
                 Problem::InvalidContents,
             ),
+            // A literal against its hash, before the value of a field
+            // behind it.
+            (
+                format!(
+                    r#"{{"contents":[{{"literal":"aGVsbG8=","originalSha256":"{}"}}],"name":"x","uid":65535}}"#,
+                    WORLD
+                ),
+                |o| {
+                    o.contents = vec![ContentsObject {
+                        original_sha256: WORLD.parse().ok(),
+                        ..ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()))
+                    }];
+                    o.inode.uid = Some(65535);
+                },
+                Problem::Contradiction,
+            ),
             // A value, before a missing name.
             (
                 r#"{"uid":65535}"#.into(),
@@ -1912,7 +1932,11 @@ mod tests {
         fn file() -> ContentsObject {
             ContentsObject::new(ContentsSource::File(name("x")))
         }
-        let cases: [(Give, Problem, Option<Field>); 17] = [
+        /// The literal "hello".
+        fn hello() -> ContentsObject {
+            ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()))
+        }
+        let cases: [(Give, Problem, Option<Field>); 22] = [
             // Fields the inode type does not permit.
             (
                 |o| (o.inode_type, o.size) = (InodeType::Fifo, Some(1)),
@@ -2018,6 +2042,50 @@ mod tests {
                 Problem::Contradiction,
                 Some(Field::Offset),
             ),
+            // A literal against the hashes of its contents object, without
+            // and with an encoding, and against the hash of the object, all
+            // of the data and a part of it.
+            (
+                |o| {
+                    o.contents = vec![ContentsObject {
+                        original_sha256: WORLD.parse().ok(),
+                        ..hello()
+                    }];
+                },
+                Problem::Contradiction,
+                Some(Field::Literal),
+            ),
+            (
+                |o| {
+                    o.contents = vec![ContentsObject {
+                        encoded_sha256: WORLD.parse().ok(),
+                        ..hello()
+                    }];
+                },
+                Problem::Contradiction,
+                Some(Field::Literal),
+            ),
+            (
+                |o| {
+                    o.contents = vec![ContentsObject {
+                        encoding: Some("gzip".into()),
+                        encoded_sha256: WORLD.parse().ok(),
+                        ..hello()
+                    }];
+                },
+                Problem::Contradiction,
+                Some(Field::Literal),
+            ),
+            (
+                |o| (o.sha256, o.contents) = (WORLD.parse().ok(), vec![hello()]),
+                Problem::Contradiction,
+                Some(Field::Literal),
+            ),
+            (
+                |o| (o.size, o.sha256, o.contents) = (Some(2), HELLO.parse().ok(), vec![hello()]),
+                Problem::Contradiction,
+                Some(Field::Literal),
+            ),
         ];
         let (root, _) = recording_all();
         for (give, problem, field) in cases {
@@ -2034,6 +2102,68 @@ mod tests {
             );
             // Nothing of it was written.
             assert_eq!(writer.finish().unwrap(), sequence(&[&recording_all().1, TRAILER]));
+        }
+    }
+
+    /// A literal is the data as it is stored, so the writer refuses what a
+    /// reader refuses of it: a literal that does not match a hash of its
+    /// contents object or the hash of the object. The literal "hello" with
+    /// the hash of "world" was written and read back once, and only a copy
+    /// of its data failed.
+    #[test]
+    fn checks_literals_against_their_hashes() {
+        let world = Sha256::digest(b"world");
+        let hello = || vec![ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()))];
+        let mut contents_first = FileObject::new(name("x"));
+        contents_first.set_contents(hello());
+        contents_first.set_sha256(Some(world));
+        let mut hash_first = FileObject::new(name("x"));
+        hash_first.set_sha256(Some(world));
+        hash_first.set_contents(hello());
+        let facts = |e: Error| (e.kind(), e.field(), e.record_number(), e.to_string());
+        let expected = (
+            ErrorKind::Manifest(Problem::Contradiction),
+            Some(Field::Literal),
+            Some(1),
+            "manifest object 1 (x): the data in literal contents does not match 'sha256'".to_string(),
+        );
+        for object in [&contents_first, &hash_first] {
+            let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
+            assert_eq!(facts(writer.file(object).unwrap_err()), expected, "{:?}", object);
+        }
+        let record = format!(
+            r#"{{"contents":[{{"literal":"aGVsbG8="}}],"name":"x","sha256":"{}"}}"#,
+            WORLD
+        );
+        assert_eq!(
+            facts(read_whole(&sequence(&[ROOT, &record, TRAILER])).unwrap_err()),
+            expected
+        );
+        // What agrees is read and written back: a literal with the hash of
+        // its contents object, a part of one with the hash of the object,
+        // one with the hash another contents object gives, and an encoded
+        // one, whose hash of the decoded data is not checked.
+        for record in [
+            format!(
+                r#"{{"contents":[{{"literal":"aGVsbG8=","originalSha256":"{}"}}],"name":"x"}}"#,
+                HELLO
+            ),
+            format!(
+                r#"{{"contents":[{{"literal":"aGVsbG8=","offset":1}}],"name":"x","sha256":"{}"}}"#,
+                Sha256::digest(b"ello")
+            ),
+            format!(
+                r#"{{"contents":[{{"literal":"aGVsbG8="}},{{"file":"a","originalSha256":"{}","originalSize":5}}],"name":"x"}}"#,
+                HELLO
+            ),
+            format!(
+                r#"{{"contents":[{{"encoding":"gzip","literal":"Z3o=","originalSha256":"{}"}}],"name":"x"}}"#,
+                WORLD
+            ),
+        ] {
+            let bytes = sequence(&[ROOT, &record, TRAILER]);
+            let m = read_whole(&bytes).unwrap_or_else(|e| panic!("{}: {}", record, e));
+            assert_eq!(write_whole(&m).unwrap(), bytes, "{}", record);
         }
     }
 

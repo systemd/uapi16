@@ -388,7 +388,7 @@ impl Draft {
         }
         // The contents objects were checked when they were read, and hold
         // what follows from their fields.
-        let data = object.check_consistency(subject, |contents| Ok(contents.data()))?;
+        let data = object.check_consistency(subject, object.contents.iter().map(ContentsObject::data))?;
         object.fill_in_data(data);
         Ok(())
     }
@@ -483,25 +483,27 @@ impl FileObject {
             }
         }
         let subject = Subject::new(self, ROOT_RECORD);
-        if let Ok(data) = self.check_consistency(subject, |contents| Ok(contents.data())) {
+        if let Ok(data) = self.check_consistency(subject, self.contents.iter().map(ContentsObject::data)) {
             self.fill_in_data(data);
         }
     }
 
     /// Checks that the fields of the object agree with each other, as the
-    /// specification requires: `readOnly` and `mode`, and the size and the
-    /// hash of the object and those of its contents objects. `contents_data`
-    /// gives what each contents object says of its data: what
-    /// [`ContentsObject::check_consistency`] returns for it, or what its fields
-    /// hold once a reader checked and filled it in. Returns the size and the
-    /// hash of the data of the object: those it gives, and those that follow
-    /// from its contents objects and from each other. Whether `gptFlags`
-    /// agrees with the fields that give its flags one by one depends on what
-    /// the manifest records, see [`FileObject::check_partition_flags`].
+    /// specification requires: `readOnly` and `mode`, the size and the
+    /// hash of the object and those of its contents objects, and the hash
+    /// of the object and the data in its literals. `contents_data` gives
+    /// what each contents object says of its data, in their order: what
+    /// [`ContentsObject::check_consistency`] returned for it, or what its
+    /// fields hold once a reader checked and filled it in. Returns the size
+    /// and the hash of the data of the object: those it gives, and those
+    /// that follow from its contents objects and from each other. Whether
+    /// `gptFlags` agrees with the fields that give its flags one by one
+    /// depends on what the manifest records, see
+    /// [`FileObject::check_partition_flags`].
     pub(crate) fn check_consistency(
         &self,
         subject: Subject<'_>,
-        contents_data: impl Fn(&ContentsObject) -> Result<ContentsData, Error>,
+        contents_data: impl Iterator<Item = ContentsData> + Clone,
     ) -> Result<SizeAndHash, Error> {
         self.inode.check_read_only(subject)?;
         // The size and the hash of the object and those of its contents
@@ -515,8 +517,8 @@ impl FileObject {
             size: self.size,
             sha256: self.sha256,
         };
-        for contents in &self.contents {
-            let original = contents_data(contents)?.original;
+        for (contents, contents_data) in self.contents.iter().zip(contents_data.clone()) {
+            let original = contents_data.original;
             let Some(total) = original.size else {
                 continue;
             };
@@ -566,7 +568,47 @@ impl FileObject {
         // What the size and the hash were given or follow from has to agree.
         data.reconcile()
             .map_err(|conflict| conflict.into_error(subject, Field::Sha256, Field::Size))?;
+        if let Some(sha256) = data.sha256 {
+            self.check_literals(sha256, contents_data, subject)?;
+        }
         Ok(data)
+    }
+
+    /// Checks that the data of the object in each of its literals without an
+    /// encoding has the hash `sha256`, the one
+    /// [`FileObject::check_consistency`] found for the object. The data is
+    /// the part of the literal that [`FileObject::data_location`] takes:
+    /// from the offset on, as long as the object is. `contents_data` gives
+    /// what each contents object says of its data. A literal that is all of
+    /// the data and has a hash of its own was held against that hash, which
+    /// the hash of the object agrees with, and is not hashed again.
+    fn check_literals(
+        &self,
+        sha256: Sha256,
+        contents_data: impl Iterator<Item = ContentsData>,
+        subject: Subject<'_>,
+    ) -> Result<(), Error> {
+        for (contents, contents_data) in self.contents.iter().zip(contents_data) {
+            let Some(literal) = contents.literal().filter(|_| contents.encoding.is_none()) else {
+                continue;
+            };
+            let part = self.data_in_literal(literal, contents.offset);
+            if part.len() == literal.len() && contents_data.original.sha256.is_some() {
+                continue;
+            }
+            if Sha256::digest(part) != sha256 {
+                return Err(Error::manifest(
+                    Problem::Contradiction,
+                    format!(
+                        "{}: the data in literal contents does not match '{}'",
+                        subject,
+                        Field::Sha256
+                    ),
+                )
+                .at(Field::Literal));
+            }
+        }
+        Ok(())
     }
 
     /// Checks that the attribute flags of the partition the object
@@ -715,8 +757,9 @@ impl ContentsObject {
     /// its data with what follows from them: a literal gives the size of
     /// the stored data, and without an encoding the stored data is the
     /// data. A size of 0 and the hash of no data go together. `httpHeaders`
-    /// come with a URL only, and the offset is inside the data. `subject`
-    /// names the file object the contents object belongs to.
+    /// come with a URL only, and the offset is inside the data. A literal
+    /// has the hash given for the data as it is stored. `subject` names the
+    /// file object the contents object belongs to.
     pub(crate) fn check_consistency(&self, subject: Subject<'_>) -> Result<ContentsData, Error> {
         if !self.http_headers.is_empty() && self.url().is_none() {
             return Err(Error::manifest(
@@ -784,6 +827,23 @@ impl ContentsObject {
         if let Some(total) = data.original.size {
             if self.offset > total {
                 return Err(Error::offset_beyond_data(subject, self.offset, total));
+            }
+        }
+        // A literal is the data as it is stored. Its hash is the encoded
+        // hash, and without an encoding the original hash, which is the
+        // same by now. The original hash of an encoded literal is that of
+        // the decoded data, which is not checked.
+        if let (Some(literal), Some(sha256)) = (self.literal(), data.encoded.sha256) {
+            if Sha256::digest(literal) != sha256 {
+                let given = match self.encoded_sha256 {
+                    Some(_) => Field::EncodedSha256,
+                    None => Field::OriginalSha256,
+                };
+                return Err(Error::manifest(
+                    Problem::Contradiction,
+                    format!("{}: literal contents do not match '{}'", subject, given),
+                )
+                .at(Field::Literal));
             }
         }
         Ok(data)
@@ -2396,7 +2456,7 @@ mod tests {
         let subject = Subject::new(object, 1);
         assert_eq!(
             object
-                .check_consistency(subject, |contents| contents.check_consistency(subject))
+                .check_consistency(subject, object.contents.iter().map(ContentsObject::data))
                 .unwrap(),
             SizeAndHash::default()
         );
@@ -2408,7 +2468,7 @@ mod tests {
         let mut given = object.clone();
         given.inode.filled_in.remove(Field::ReadOnly);
         let e = given
-            .check_consistency(Subject::new(&given, 1), |contents| Ok(contents.data()))
+            .check_consistency(Subject::new(&given, 1), given.contents.iter().map(ContentsObject::data))
             .unwrap_err();
         assert_eq!(
             (e.kind(), e.field()),
@@ -2423,7 +2483,12 @@ mod tests {
     fn consistency_of_objects_not_read() {
         let check = |object: &FileObject| {
             let subject = Subject::new(object, 1);
-            object.check_consistency(subject, |contents| contents.check_consistency(subject))
+            let contents_data = object
+                .contents
+                .iter()
+                .map(|contents| contents.check_consistency(subject))
+                .collect::<Result<Vec<_>, _>>()?;
+            object.check_consistency(subject, contents_data.into_iter())
         };
         let file = |size: Option<u64>, contents: ContentsObject| {
             let mut object = FileObject::new(Name::new("x").unwrap());
