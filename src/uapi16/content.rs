@@ -183,7 +183,9 @@ impl FileObject {
     /// directory refers to.
     ///
     /// A literal is taken first, as the specification suggests: the
-    /// manifest carries the data itself. Otherwise the data is in the file
+    /// manifest carries the data itself. A reader and a writer refuse a
+    /// literal that does not match the hashes the manifest gives for it and
+    /// for the data of the object. Otherwise the data is in the file
     /// next to the manifest that the first contents object without an
     /// encoding names, or in the file of the object's own name where that
     /// contents object names no place. A regular file without contents
@@ -267,7 +269,7 @@ impl FileObject {
     /// The data of the file in the literal `literal`: from `offset` on, as
     /// many bytes as the object says it has. An offset or a size beyond the
     /// literal takes all there is, which the size of the object then finds.
-    fn data_in_literal<'a>(&self, literal: &'a [u8], offset: u64) -> &'a [u8] {
+    pub(crate) fn data_in_literal<'a>(&self, literal: &'a [u8], offset: u64) -> &'a [u8] {
         let offset = usize::try_from(offset).unwrap_or(usize::MAX);
         let data = literal.get(offset..).unwrap_or(&[]);
         match self.size.map(usize::try_from) {
@@ -1186,6 +1188,7 @@ impl<R: Read> DataProvider for StreamProvider<R> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::error::Problem;
     use crate::testing::{json, manifest, read_whole, sequence, HELLO, TRAILER, WORLD};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -1693,7 +1696,14 @@ mod tests {
         assert_eq!(files.read(), 5);
         // A part of a literal is held against the hash of all of the
         // literal the manifest gives, as a part of a file is, unless the
-        // object has a hash of its own.
+        // object has a hash of its own. A reader refuses a literal that
+        // does not match a hash the manifest gives for it, so only an object
+        // changed after it was read gets here.
+        let refused = |record: &str| {
+            let e = read_whole(&manifest(&[record])).unwrap_err();
+            (e.kind(), e.field())
+        };
+        let contradiction = (ErrorKind::Manifest(Problem::Contradiction), Some(Field::Literal));
         for (record, data) in [
             (
                 r#"{"name":"x","contents":[{"literal":"aGVsbG8=","offset":1,"originalSha256":"#,
@@ -1704,9 +1714,10 @@ mod tests {
                 "he",
             ),
         ] {
-            let o = object(&format!(r#"{}"{}"}}]}}"#, record, HELLO));
+            let mut o = object(&format!(r#"{}"{}"}}]}}"#, record, HELLO));
             assert_eq!(copy(&o, &mut provider).unwrap(), data.as_bytes());
-            let o = object(&format!(r#"{}"{}"}}]}}"#, record, WORLD));
+            assert_eq!(refused(&format!(r#"{}"{}"}}]}}"#, record, WORLD)), contradiction);
+            o.contents[0].original_sha256 = WORLD.parse().ok();
             let e = copy(&o, &mut provider).unwrap_err();
             assert_eq!(
                 facts(&e),
@@ -1719,16 +1730,25 @@ mod tests {
                 )
             );
         }
-        let o = object(&format!(
-            r#"{{"name":"x","size":2,"sha256":"{}","contents":[{{"literal":"aGVsbG8=","originalSha256":"{}"}}]}}"#,
-            Sha256::digest(b"he"),
-            WORLD
-        ));
+        let record = |original: &str| {
+            format!(
+                r#"{{"name":"x","size":2,"sha256":"{}","contents":[{{"literal":"aGVsbG8=","originalSha256":"{}"}}]}}"#,
+                Sha256::digest(b"he"),
+                original
+            )
+        };
+        assert_eq!(refused(&record(WORLD)), contradiction);
+        let mut o = object(&record(HELLO));
+        o.contents[0].original_sha256 = WORLD.parse().ok();
         assert_eq!(copy(&o, &mut provider).unwrap(), b"he");
         // A literal that is not what the object says.
-        let o = object(
-            r#"{"name":"x","size":5,"contents":[{"literal":"aGVsbG8="}],"sha256":"486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"}"#,
+        let record = format!(
+            r#"{{"name":"x","size":5,"contents":[{{"literal":"aGVsbG8="}}],"sha256":"{}"}}"#,
+            WORLD
         );
+        assert_eq!(refused(&record), contradiction);
+        let mut o = object(r#"{"name":"x","size":5,"contents":[{"literal":"aGVsbG8="}]}"#);
+        o.sha256 = WORLD.parse().ok();
         assert_eq!(copy(&o, &mut provider).unwrap_err().kind(), hash);
         let mut o = object(r#"{"name":"x","contents":[{"literal":"aGVsbG8="}]}"#);
         o.size = Some(6);
