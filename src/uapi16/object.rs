@@ -794,6 +794,15 @@ impl<F: FlagSet> FlagStates<F> {
                 filled_in
             })
     }
+
+    /// Whether `other` says the same of every flag: set, cleared or not
+    /// known. Which flags a reader filled in does not count.
+    pub(crate) fn eq_ignore_filled_in(&self, other: &FlagStates<F>) -> bool {
+        // Every field is named, so that a new field breaks the build here
+        // until it is compared.
+        let FlagStates { stated, set, filled: _ } = self;
+        *stated == other.stated && *set == other.set
+    }
 }
 
 /// The fields of an object of a manifest that a reader filled in, which
@@ -818,6 +827,13 @@ impl<F: FlagSet> FlagStates<F> {
 /// manifest fills them in again. The contents objects of a file object
 /// fill in again what follows from them when they are set, see
 /// [`FileObject::set_contents`].
+///
+/// `==` of the objects compares these marks too. Equal objects are the
+/// same record, and a writer writes or refuses them alike. An object with a
+/// value a reader filled in is not equal to one with the same value set.
+/// [`FileObject::eq_ignore_filled_in`], [`RootObject::eq_ignore_filled_in`],
+/// [`InodeAttributes::eq_ignore_filled_in`] and
+/// [`ContentsObject::eq_ignore_filled_in`] compare the values alone.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FilledIn(u16);
 
@@ -1092,6 +1108,10 @@ pub enum ContentsSource {
 /// and hashes are those of the data as it is stored, the original ones
 /// those of the decoded data. The file object's data is the part of the
 /// decoded data that starts at `offset`.
+///
+/// `==` compares which values a reader filled in as well, see
+/// [`FilledIn`]. [`ContentsObject::eq_ignore_filled_in`] compares the
+/// values alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContentsObject {
@@ -1243,6 +1263,33 @@ impl ContentsObject {
         self.filled_in
     }
 
+    /// Whether `other` has the same values: what the getters return. Unlike
+    /// `==` it leaves out which values a reader filled in, see
+    /// [`FilledIn`].
+    pub fn eq_ignore_filled_in(&self, other: &ContentsObject) -> bool {
+        // Every field is named, so that a new field breaks the build here
+        // until it is compared.
+        let ContentsObject {
+            source,
+            http_headers,
+            encoding,
+            encoded_size,
+            encoded_sha256,
+            original_size,
+            original_sha256,
+            offset,
+            filled_in: _,
+        } = self;
+        *source == other.source
+            && *http_headers == other.http_headers
+            && *encoding == other.encoding
+            && *encoded_size == other.encoded_size
+            && *encoded_sha256 == other.encoded_sha256
+            && *original_size == other.original_size
+            && *original_sha256 == other.original_sha256
+            && *offset == other.offset
+    }
+
     /// Drops the sizes and hashes a reader filled in, which follow from the
     /// other fields: they are None, and none is noted as filled in.
     fn drop_filled_in(&mut self) {
@@ -1277,6 +1324,10 @@ impl ContentsObject {
 /// `chattr(1)` changes, have a field each, such as `flagImmutable`. Only
 /// regular files and directories have them, the root directory among
 /// them.
+///
+/// `==` compares which values a reader filled in as well, see
+/// [`FilledIn`]. [`InodeAttributes::eq_ignore_filled_in`] compares the
+/// values alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InodeAttributes {
@@ -1485,6 +1536,35 @@ impl InodeAttributes {
         self.filled_in.union(self.flags.filled_in())
     }
 
+    /// Whether `other` has the same values: what the getters return. Unlike
+    /// `==` it leaves out which values a reader filled in, see
+    /// [`FilledIn`].
+    pub fn eq_ignore_filled_in(&self, other: &InodeAttributes) -> bool {
+        // Every field is named, so that a new field breaks the build here
+        // until it is compared.
+        let InodeAttributes {
+            mode,
+            uid,
+            gid,
+            user_name,
+            group_name,
+            mtime_nsec,
+            user_xattrs,
+            read_only,
+            flags,
+            filled_in: _,
+        } = self;
+        *mode == other.mode
+            && *uid == other.uid
+            && *gid == other.gid
+            && *user_name == other.user_name
+            && *group_name == other.group_name
+            && *mtime_nsec == other.mtime_nsec
+            && *user_xattrs == other.user_xattrs
+            && *read_only == other.read_only
+            && flags.eq_ignore_filled_in(&other.flags)
+    }
+
     /// The modification time, if the attributes have one.
     pub fn mtime(&self) -> Option<SystemTime> {
         self.mtime_nsec.map(|nsec| UNIX_EPOCH + Duration::from_nanos(nsec))
@@ -1613,6 +1693,10 @@ impl InodeAttributes {
 /// [`InodeAttributes::read_only()`]. Only regular files and directories
 /// have DOS attributes, and the root directory has none: the root
 /// directory of FAT has no directory entry to keep them in.
+///
+/// `==` compares which values a reader filled in as well, see
+/// [`FilledIn`]. [`FileObject::eq_ignore_filled_in`] compares the values
+/// alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileObject {
@@ -1836,6 +1920,67 @@ impl FileObject {
             .union(self.inode.filled_in())
     }
 
+    /// Whether `other` has the same values: what the getters return, those
+    /// of the contents objects and of the inode attributes among them.
+    /// Unlike `==` it leaves out which values a reader filled in, see
+    /// [`FilledIn`].
+    ///
+    /// ```
+    /// use uapi16::{FileObject, Name, Object, Reader, Sha256};
+    ///
+    /// let manifest = concat!(
+    ///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
+    ///     "\x1e{\"name\":\"e\",\"size\":0}\n",
+    ///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+    /// );
+    /// let mut reader = Reader::open(manifest.as_bytes())?;
+    /// let Some(Object::File(read)) = reader.next().transpose()? else {
+    ///     panic!("no file object");
+    /// };
+    /// // The reader filled in the hash of no data for the size 0.
+    /// let mut set = FileObject::new(Name::new("e")?);
+    /// set.set_size(Some(0));
+    /// set.set_sha256(Some(Sha256::EMPTY));
+    /// assert!(read.eq_ignore_filled_in(&set));
+    /// assert_ne!(*read, set);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn eq_ignore_filled_in(&self, other: &FileObject) -> bool {
+        // Every field is named, so that a new field breaks the build here
+        // until it is compared.
+        let FileObject {
+            name,
+            inode_type,
+            size,
+            sha256,
+            contents,
+            inode_token,
+            major,
+            minor,
+            gpt,
+            dos_flags,
+            inode,
+            validity,
+            filled_in: _,
+        } = self;
+        *name == other.name
+            && *inode_type == other.inode_type
+            && *size == other.size
+            && *sha256 == other.sha256
+            && contents.len() == other.contents.len()
+            && contents
+                .iter()
+                .zip(&other.contents)
+                .all(|(contents, other)| contents.eq_ignore_filled_in(other))
+            && *inode_token == other.inode_token
+            && *major == other.major
+            && *minor == other.minor
+            && *gpt == other.gpt
+            && dos_flags.eq_ignore_filled_in(&other.dos_flags)
+            && inode.eq_ignore_filled_in(&other.inode)
+            && *validity == other.validity
+    }
+
     /// Drops the size and the hash a reader filled in, which follow from
     /// each other and from the contents objects: they are None, and
     /// neither is noted as filled in.
@@ -1978,6 +2123,10 @@ impl FileObject {
 /// what the manifest records and the order it lists its file objects in,
 /// and the identity of the file system or of the partition table the file
 /// objects are placed in.
+///
+/// `==` compares which values a reader filled in as well, see
+/// [`FilledIn`]. [`RootObject::eq_ignore_filled_in`] compares the values
+/// alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RootObject {
@@ -2062,6 +2211,28 @@ impl RootObject {
     /// Sets `validSinceUSec`, `validUntilUSec` and `validity`.
     pub fn set_validity(&mut self, validity: ValidityWindow) {
         self.validity = validity;
+    }
+
+    /// Whether `other` has the same values: what the getters return, those
+    /// of the inode attributes among them. Unlike `==` it leaves out which
+    /// values a reader filled in, see [`FilledIn`].
+    pub fn eq_ignore_filled_in(&self, other: &RootObject) -> bool {
+        // Every field is named, so that a new field breaks the build here
+        // until it is compared.
+        let RootObject {
+            inode,
+            file_system,
+            gpt_disk_uuid,
+            order,
+            features,
+            validity,
+        } = self;
+        inode.eq_ignore_filled_in(&other.inode)
+            && *file_system == other.file_system
+            && *gpt_disk_uuid == other.gpt_disk_uuid
+            && *order == other.order
+            && *features == other.features
+            && *validity == other.validity
     }
 
     /// Whether the object has `field`, one of
@@ -2831,5 +3002,161 @@ mod tests {
         assert_eq!(inode.insert_user_xattr("comment", b"two"), Some(b"one".to_vec()));
         assert_eq!(inode.remove_user_xattr("comment"), Some(b"two".to_vec()));
         assert_eq!(inode.user_xattrs().map(|xattrs| xattrs.len()), Some(0));
+    }
+
+    /// eq_ignore_filled_in() compares every value and none of the marks of
+    /// what a reader filled in, which == compares too. The objects are built
+    /// with every field named, so that a new field breaks the build here
+    /// until it has a case below.
+    #[test]
+    fn compares_the_values_without_the_marks() {
+        /// Checks that each of `changes`, which changes one value, makes an
+        /// object differ from `object` for `eq`, both ways around.
+        fn each_differs<T: Clone + fmt::Debug>(object: &T, changes: &[Give<T>], eq: fn(&T, &T) -> bool) {
+            assert!(eq(object, object));
+            for change in changes {
+                let mut changed = object.clone();
+                change(&mut changed);
+                assert!(!eq(object, &changed) && !eq(&changed, object), "{:?}", changed);
+            }
+        }
+        let contents = ContentsObject {
+            source: ContentsSource::Literal(b"hello".to_vec()),
+            http_headers: Vec::new(),
+            encoding: None,
+            encoded_size: Some(5),
+            encoded_sha256: None,
+            original_size: Some(5),
+            original_sha256: None,
+            offset: 0,
+            filled_in: FilledIn::default(),
+        };
+        let inode = InodeAttributes {
+            mode: Some(Mode::new(0o644).unwrap()),
+            uid: Some(1),
+            gid: Some(2),
+            user_name: Some("u".into()),
+            group_name: Some("g".into()),
+            mtime_nsec: Some(3),
+            user_xattrs: Some(Box::default()),
+            read_only: Some(false),
+            flags: FlagStates {
+                stated: InodeFlags::IMMUTABLE | InodeFlags::NO_DUMP,
+                set: InodeFlags::IMMUTABLE,
+                filled: InodeFlags::default(),
+            },
+            filled_in: FilledIn::default(),
+        };
+        let object = FileObject {
+            name: Name::new("f").unwrap(),
+            inode_type: InodeType::Regular,
+            size: Some(5),
+            sha256: Some(Sha256::digest(b"hello")),
+            contents: vec![contents.clone()],
+            inode_token: NonZeroU64::new(1),
+            major: None,
+            minor: None,
+            gpt: None,
+            dos_flags: FlagStates {
+                stated: DosFlags::HIDDEN,
+                set: DosFlags::default(),
+                filled: DosFlags::default(),
+            },
+            inode: inode.clone(),
+            validity: ValidityWindow::default(),
+            filled_in: FilledIn::default(),
+        };
+        let root = RootObject {
+            inode: inode.clone(),
+            file_system: FileSystemIdentity::default(),
+            gpt_disk_uuid: None,
+            order: None,
+            features: None,
+            validity: ValidityWindow::default(),
+        };
+        each_differs(
+            &contents,
+            &[
+                |c| c.source = ContentsSource::Url("https://example.com/x".into()),
+                |c| c.http_headers = vec![("A".into(), "b".into())],
+                |c| c.encoding = Some("gzip".into()),
+                |c| c.encoded_size = None,
+                |c| c.encoded_sha256 = Some(Sha256::EMPTY),
+                |c| c.original_size = None,
+                |c| c.original_sha256 = Some(Sha256::EMPTY),
+                |c| c.offset = 1,
+            ],
+            ContentsObject::eq_ignore_filled_in,
+        );
+        each_differs(
+            &inode,
+            &[
+                |i| i.mode = None,
+                |i| i.uid = None,
+                |i| i.gid = None,
+                |i| i.user_name = None,
+                |i| i.group_name = None,
+                |i| i.mtime_nsec = None,
+                |i| i.user_xattrs = None,
+                |i| i.read_only = None,
+                // A flag not known any more, and one set instead of cleared.
+                |i| i.flags.put(InodeFlags::NO_DUMP, None),
+                |i| i.flags.put(InodeFlags::NO_DUMP, Some(true)),
+            ],
+            InodeAttributes::eq_ignore_filled_in,
+        );
+        each_differs(
+            &object,
+            &[
+                |o| o.name = Name::new("g").unwrap(),
+                |o| o.inode_type = InodeType::Symlink,
+                |o| o.size = None,
+                |o| o.sha256 = None,
+                |o| o.contents.clear(),
+                |o| o.contents[0].offset = 1,
+                |o| o.inode_token = None,
+                |o| o.major = Some(1),
+                |o| o.minor = Some(1),
+                |o| o.gpt = Some(Box::default()),
+                |o| o.dos_flags.put(DosFlags::HIDDEN, None),
+                |o| o.dos_flags.put(DosFlags::HIDDEN, Some(true)),
+                |o| o.inode.uid = None,
+                |o| o.validity.state = Validity::Revoked,
+            ],
+            FileObject::eq_ignore_filled_in,
+        );
+        each_differs(
+            &root,
+            &[
+                |r| r.inode.uid = None,
+                |r| r.file_system.label = Some("ESP".into()),
+                |r| r.gpt_disk_uuid = Some(Uuid::new([1; Uuid::SIZE])),
+                |r| r.order = Some(Order::CodePoint),
+                |r| r.features = Some(Features::ALL),
+                |r| r.validity.until_usec = Some(1),
+            ],
+            RootObject::eq_ignore_filled_in,
+        );
+        // The same values, filled in by a reader on one side and set on the
+        // other.
+        let mut filled = contents.clone();
+        filled.filled_in.insert(Field::EncodedSize);
+        assert!(filled.eq_ignore_filled_in(&contents) && filled != contents);
+        let (mut filled, mut set) = (inode.clone(), inode.clone());
+        filled.filled_in.insert(Field::ReadOnly);
+        filled.filled_in.insert(Field::ExtendedAttributes);
+        filled.flags.fill_in(Features::FLAG_NO_COW, InodeType::Regular);
+        set.set_flag_no_cow(Some(false));
+        assert!(filled.eq_ignore_filled_in(&set) && filled != set);
+        let (mut filled, mut set) = (object.clone(), object.clone());
+        filled.filled_in.insert(Field::Size);
+        filled.contents[0].filled_in.insert(Field::OriginalSize);
+        filled.inode.filled_in.insert(Field::ReadOnly);
+        filled.dos_flags.fill_in(Features::FLAG_ARCHIVE, InodeType::Regular);
+        set.set_flag_archive(Some(false));
+        assert!(filled.eq_ignore_filled_in(&set) && filled != set);
+        let mut filled = root.clone();
+        filled.inode.filled_in.insert(Field::ExtendedAttributes);
+        assert!(filled.eq_ignore_filled_in(&root) && filled != root);
     }
 }

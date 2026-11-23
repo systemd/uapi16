@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Manifests written by systemd's own tool, read and written back. They
 //! are copies of the fixtures of ufat, whose tests/fixtures/README.md says
-//! how they were made.
+//! how they were made. Only the file `empty` of the special case
+//! differs: it has the hash of no data next to its size 0, as
+//! systemd-manifest wrote it.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use uapi16::{Error, Field, FileObject, InodeType, Object, Order, Reader, RootObject, SignatureObject, Writer};
+use uapi16::{Error, FileObject, InodeType, Object, Order, Reader, RootObject, Sha256, SignatureObject, Writer};
 
 /// A manifest read to its end: its root file object, its file objects and
 /// its signature objects.
@@ -43,17 +44,17 @@ impl Manifest {
         Manifest::read(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
     }
 
-    /// The manifest with the extended attributes a reader filled in taken
-    /// as ones the objects state. systemd-manifest states the empty ones,
-    /// which the writer leaves out and a reader fills in again.
-    fn with_stated_xattrs(mut self) -> Manifest {
-        let files = self.files.iter_mut().map(FileObject::inode_mut);
-        for inode in std::iter::once(self.root.inode_mut()).chain(files) {
-            if inode.filled_in().contains(Field::ExtendedAttributes) {
-                inode.set_user_xattrs(Some(BTreeMap::new()));
-            }
-        }
-        self
+    /// Whether `other` has the same objects with the same values, whatever
+    /// a reader filled in of them.
+    fn eq_ignore_filled_in(&self, other: &Manifest) -> bool {
+        self.root.eq_ignore_filled_in(&other.root)
+            && self.files.len() == other.files.len()
+            && self
+                .files
+                .iter()
+                .zip(&other.files)
+                .all(|(file, other)| file.eq_ignore_filled_in(other))
+            && self.signatures == other.signatures
     }
 
     /// The manifest the writer writes for the objects.
@@ -162,6 +163,9 @@ fn every_fixture_parses() {
     assert_eq!(readonly.inode().mode().map(u32::from), Some(0o444));
     assert!(readonly.inode().is_read_only());
     assert!(special.names().contains(&"sub/\u{fc}mlaut \u{221e}.txt"));
+    let empty = special.files.iter().find(|e| e.name() == "empty").unwrap();
+    assert_eq!((empty.size(), empty.sha256()), (Some(0), Some(Sha256::EMPTY)));
+    assert!(empty.filled_in().is_empty());
 
     let empty = Manifest::load("empty", "Uapi16Manifest");
     assert!(empty.files.is_empty());
@@ -169,11 +173,9 @@ fn every_fixture_parses() {
 }
 
 /// The reader reads every manifest systemd-manifest wrote, and what the
-/// writer writes for one reads back as the same manifest. That holds since
-/// ufat's make-fixtures.sh took the hash of no data out of the empty file
-/// of the special case: the writer leaves out a hash given next to the
-/// size 0, and the reader marks the one it fills in as filled in, so the
-/// objects would differ in that mark.
+/// writer writes for one reads back with the same values. systemd-manifest
+/// writes empty extended attributes and the hash of no data next to the
+/// size 0. The writer leaves both out, and a reader fills them in again.
 #[test]
 fn reads_and_writes_back_every_fixture() {
     for (case, name, files, signatures) in [
@@ -194,11 +196,13 @@ fn reads_and_writes_back_every_fixture() {
         );
         assert_eq!(read.root.order(), Some(Order::CodePoint), "{}", path.display());
         let written = read.write().unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
-        assert_eq!(
-            Manifest::read(&written).unwrap().with_stated_xattrs(),
-            read.with_stated_xattrs(),
-            "{}",
-            path.display()
+        let back = Manifest::read(&written).unwrap();
+        assert!(
+            back.eq_ignore_filled_in(&read),
+            "{}:\n{:#?}\n{:#?}",
+            path.display(),
+            back,
+            read
         );
     }
 }
