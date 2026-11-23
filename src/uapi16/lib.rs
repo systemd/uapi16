@@ -19,6 +19,10 @@
 //!   hash of data the caller passes it, such as a file while the caller
 //!   copies it, and does no I/O of its own. [`Sha256Context::finalize`]
 //!   returns the hash.
+//! - [`ManifestOptions`] builds the manifest of a tree of files on the
+//!   host, which it reads through descriptors, and [`ManifestWriter`] one
+//!   of file objects that the caller made. [`ManifestReport`] says what it
+//!   lists.
 //! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
 //!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
 //!   [`Mode`], [`Sha256`] and [`Uuid`] what their fields hold. Each field
@@ -104,11 +108,8 @@ mod hex;
 // Only the module sys calls them.
 #[allow(unsafe_code)]
 mod ioctl;
-// Only the tests use the modules of the manifest builder until
-// ManifestWriter does. A module with something that no other module uses
-// expects dead code.
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod listing;
+mod manifest;
 mod metadata;
 mod name;
 #[allow(unsafe_code)]
@@ -117,14 +118,12 @@ mod object;
 mod optional;
 mod reader;
 mod record;
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod scratch;
 mod sequence;
 mod sort;
 mod strict;
 mod sys;
 mod tree;
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod walk;
 mod writer;
 
@@ -136,6 +135,7 @@ pub use error::{
     DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, TreeProblem, UnsupportedData, ValidityProblem,
 };
 pub use features::{Features, Order, UnknownFeature};
+pub use manifest::{ManifestOptions, ManifestReport, ManifestWriter};
 pub use name::{Name, NameBuf, NameError, NameProblem};
 pub use object::{
     ContentsObject, ContentsSource, FatSerial, FileObject, FileSystemIdentity, FilledIn, GptPartition, InodeAttributes,
@@ -143,6 +143,7 @@ pub use object::{
     Validity, ValidityWindow,
 };
 pub use reader::Object;
+pub use walk::AddFlags;
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";
@@ -191,7 +192,7 @@ pub(crate) mod testing {
     use std::collections::BTreeMap;
     use std::fs;
     use std::num::NonZeroU64;
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, PoisonError};
@@ -284,6 +285,8 @@ pub(crate) mod testing {
         pub(crate) inode: InodeId,
         pub(crate) size: u64,
         pub(crate) status: Status,
+        /// The descriptor the process has of it.
+        pub(crate) descriptor: RawFd,
     }
 
     impl OpenFile {
@@ -302,9 +305,10 @@ pub(crate) mod testing {
             let flags = OFlags::PATH | OFlags::CLOEXEC;
             let mut files = Vec::new();
             for entry in fs::read_dir("/proc/self/fd").unwrap() {
+                let entry = entry.unwrap();
                 // Other tests close their descriptors meanwhile. A handle
                 // of the file stays the file it is while it is looked at.
-                let Ok(handle) = rustix::fs::open(entry.unwrap().path(), flags, rustix::fs::Mode::empty()) else {
+                let Ok(handle) = rustix::fs::open(entry.path(), flags, rustix::fs::Mode::empty()) else {
                     continue;
                 };
                 // Another test can have a file open that is so deep in a
@@ -318,6 +322,7 @@ pub(crate) mod testing {
                         inode: status.identity.inode_id(),
                         size: status.size,
                         status,
+                        descriptor: entry.file_name().to_str().unwrap().parse().unwrap(),
                     });
                 }
             }

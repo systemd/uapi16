@@ -14,10 +14,15 @@ uapi16 can:
   specification,
 - write a manifest and check it the same way,
 - copy the data of the files a manifest describes and check its size and
-  hash.
+  hash,
+- build a manifest from the file objects a tool makes, in any order, for
+  example while it writes a file system image,
+- build the manifest of a tree of files on the host, which it reads
+  through descriptors.
 
 A manifest is read one record at a time. Memory use does not grow with
-the size of the manifest.
+the size of the manifest. Building a large manifest takes room on disk
+instead of memory.
 
 Two checks are up to the caller: whether a manifest declares the order
 of its file objects (RootObject::require_order) and whether an object

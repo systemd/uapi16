@@ -41,7 +41,8 @@ use std::hash::BuildHasher;
 use std::io;
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -50,13 +51,14 @@ use pathrs::error::{Error as PathrsError, ErrorKind as PathrsErrorKind};
 use pathrs::flags::OpenFlags;
 use pathrs::HandleRef;
 use rustix::fs::{
-    AtFlags, FallocateFlags, FileType, FsWord, IFlags, OFlags, RawDir, Statx, StatxAttributes, StatxFlags,
+    AtFlags, FallocateFlags, FileType, FsWord, IFlags, OFlags, RawDir, RenameFlags, Statx, StatxAttributes, StatxFlags,
     StatxTimestamp, CWD,
 };
 use rustix::io::{retry_on_intr, Errno};
 use rustix::mount::OpenTreeFlags;
 
 use crate::digest::Sha256Context;
+use crate::error::Error;
 use crate::ioctl;
 pub(crate) use crate::ioctl::{DosAttributes, FsLabel, FsUuid};
 pub(crate) use crate::nss::UserDatabase;
@@ -190,7 +192,9 @@ impl<'fd> PinnedFile<'fd> {
 /// such a /proc can do, but it doesn't close it: it can lead to the file
 /// for the two checks and elsewhere in between. So only the extended
 /// attributes of a file that is not open for reading are read through the
-/// path, see [`UserXattrs`].
+/// path, see [`UserXattrs`]. A link that a new file gets through it is
+/// checked at the name the link made instead, see
+/// [`NewFile::link_through`].
 #[derive(Debug)]
 pub(crate) struct FdLink<'fd> {
     fd: BorrowedFd<'fd>,
@@ -209,6 +213,12 @@ impl<'fd> FdLink<'fd> {
         }
     }
 
+    /// The error for a link that leads to another file than that of the
+    /// descriptor.
+    fn elsewhere() -> io::Error {
+        io::Error::other("the link of /proc/thread-self/fd leads to another file")
+    }
+
     /// The path of the link, for what goes through it once it was checked.
     pub(crate) fn path(&self) -> &str {
         &self.path
@@ -220,9 +230,7 @@ impl<'fd> FdLink<'fd> {
         let statx =
             retry_on_intr(|| rustix::fs::statx(CWD, self.path.as_str(), AtFlags::NO_AUTOMOUNT, InodeId::REQUEST))?;
         if InodeId::from_statx(&statx) != InodeId::of(self.fd)? {
-            return Err(io::Error::other(
-                "the link of /proc/thread-self/fd leads to another file",
-            ));
+            return Err(FdLink::elsewhere());
         }
         Ok(())
     }
@@ -891,6 +899,27 @@ impl TemporaryName {
         flags: OFlags,
         mode: rustix::fs::Mode,
     ) -> io::Result<(OwnedFd, TemporaryName)> {
+        TemporaryName::make(dir, prefix, |name| rustix::fs::openat(dir, name, flags, mode))
+    }
+
+    /// Links the file `path` leads to into the directory `dir`, with a name
+    /// that starts with `prefix` and that nothing has. A symbolic link at
+    /// the end of `path` is followed, as the link procfs has for a
+    /// descriptor has to be.
+    fn link(dir: BorrowedFd<'_>, prefix: &str, path: &str) -> io::Result<TemporaryName> {
+        let flags = AtFlags::SYMLINK_FOLLOW;
+        let ((), name) = TemporaryName::make(dir, prefix, |name| rustix::fs::linkat(CWD, path, dir, name, flags))?;
+        Ok(name)
+    }
+
+    /// Makes something with a name in the directory `dir` that starts with
+    /// `prefix` and that nothing has, with `make`, which fails with EEXIST
+    /// where something has the name it is given.
+    fn make<T>(
+        dir: BorrowedFd<'_>,
+        prefix: &str,
+        mut make: impl FnMut(&CStr) -> rustix::io::Result<T>,
+    ) -> io::Result<(T, TemporaryName)> {
         // The keys of a hasher of std are random, and so is what it makes
         // of a number.
         let random = RandomState::new();
@@ -898,17 +927,17 @@ impl TemporaryName {
         for number in 0_u64.. {
             let name = format!("{}{:016x}", prefix, random.hash_one(number));
             let name = TemporaryName(CString::new(name).expect("a formatted name has no NUL"));
-            match rustix::fs::openat(dir, name.as_c_str(), flags, mode) {
-                Ok(file) => return Ok((file, name)),
+            match make(name.as_c_str()) {
+                Ok(made) => return Ok((made, name)),
                 Err(Errno::EXIST) => {
                     taken += 1;
                     if taken == TemporaryName::ATTEMPTS {
                         break;
                     }
                 }
-                // An open that was interrupted can have made the file
-                // before it failed, and the same open again fails with
-                // EEXIST then. So it is not made again: the name is
+                // What was interrupted can have made the name before it
+                // failed, and the same again fails with EEXIST then. So it
+                // is not made again: the name, which nobody else has, is
                 // removed, and the next one is tried. That is no name
                 // something else has, and does not count as one.
                 Err(Errno::INTR) => name.remove(dir)?,
@@ -968,6 +997,10 @@ impl TemporaryName {
 /// takes a descriptor and nothing else until it is handed out again, which
 /// it is before a new file is made, see
 /// [`Scratch::file`](crate::scratch::Scratch::file).
+///
+/// The file a manifest is written to is one of them as well, while it has a
+/// name of its own until it gets its name, see [`NewFile::named_file`]. It
+/// is kept through the descriptor its [`NewFile`] has of it.
 #[derive(Debug, Default)]
 pub(crate) struct OwnFiles {
     /// The files by their inodes, each of them open. An inode has every
@@ -1188,6 +1221,549 @@ impl ScratchFile {
     }
 }
 
+/// Why a new file did not get its name, with the error of what failed:
+/// the errno of a call that was to give it the name, see
+/// [`NewFile::give_name`], or the I/O error of the half of
+/// [`NewFile::link`] that makes those calls, see
+/// [`NewFile::sync_and_name`].
+#[derive(Debug, PartialEq, Eq)]
+enum Unnamed<E = io::Error> {
+    /// The file has no name, as far as the calls that give it say, see
+    /// [`NewFile::link`].
+    Failed(E),
+    /// Nobody can tell whether the file has its name: a call that was to
+    /// give it was interrupted and failed when it was made again, see
+    /// [`NewFile::give_name`].
+    Unknown(E),
+}
+
+impl From<Unnamed<Errno>> for Unnamed {
+    /// What a call came to, for the half that made it.
+    fn from(unnamed: Unnamed<Errno>) -> Unnamed {
+        match unnamed {
+            Unnamed::Failed(e) => Unnamed::Failed(e.into()),
+            Unnamed::Unknown(e) => Unnamed::Unknown(e.into()),
+        }
+    }
+}
+
+impl<E: Into<io::Error>> From<E> for Unnamed {
+    /// Whatever else fails in that half fails before the file has its
+    /// name.
+    fn from(error: E) -> Unnamed {
+        Unnamed::Failed(error.into())
+    }
+}
+
+/// A file a manifest is written to, which gets its name in a directory once
+/// the manifest is complete. Until then it has no name. Where the file
+/// system cannot make a file without one, it has a name nobody can guess,
+/// which it loses when it is dropped.
+#[derive(Debug)]
+pub(crate) struct NewFile {
+    /// The directory the file gets its name in, which whoever keeps other
+    /// files in it shares.
+    directory: Arc<OwnedFd>,
+    /// The name it gets there.
+    name: CString,
+    /// The name it was created at, as the caller gave it, which its errors
+    /// name.
+    path: PathBuf,
+    /// The file, which is linked in. The files of the manifest's own have
+    /// this descriptor as well where the file has a name until then, see
+    /// [`NewFile::named_file`].
+    file: Arc<File>,
+    /// The temporary name it has, if it has one: until it gets its own
+    /// name, and next to that where a link gave it its own.
+    temporary: Option<TemporaryName>,
+    /// Whether the file is synced before it gets its name, and the file
+    /// and its directory once it has it.
+    sync: bool,
+}
+
+impl NewFile {
+    /// What separates the components of a path.
+    const SEPARATOR: u8 = b'/';
+    /// The names a directory has for itself and for the one above it, which
+    /// no file gets.
+    const ITSELF_AND_PARENT: [&'static [u8]; 2] = [b".", b".."];
+    /// How a directory on the way to the file is opened, and the one the
+    /// file is in: as a handle, for a directory and nothing else, and not
+    /// through a symbolic link.
+    const DIRECTORY_FLAGS: OFlags = OFlags::PATH
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    /// How a name on the way that is no directory is looked at: the name
+    /// itself, a symbolic link too, and without mounting anything.
+    const LOOK_FLAGS: AtFlags = AtFlags::SYMLINK_NOFOLLOW.union(AtFlags::NO_AUTOMOUNT);
+    /// How the directory is opened again to be synced: for reading, which
+    /// fsync() takes and a handle is not.
+    const SYNC_FLAGS: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
+    /// How a file without a name is made that can get one later: with
+    /// O_TMPFILE and without O_EXCL, for reading and writing.
+    const UNNAMED_FLAGS: OFlags = OFlags::TMPFILE.union(OFlags::RDWR).union(OFlags::CLOEXEC);
+    /// How a file with a name nobody can guess is made: only if nothing has
+    /// that name, a symbolic link included.
+    const NAMED_FLAGS: OFlags = OFlags::CREATE
+        .union(OFlags::EXCL)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::RDWR)
+        .union(OFlags::CLOEXEC);
+    /// The access mode of the file: read and write for everybody, less what
+    /// the umask takes away, as for a file that File::create() makes.
+    const MODE: rustix::fs::Mode = rustix::fs::Mode::RUSR
+        .union(rustix::fs::Mode::WUSR)
+        .union(rustix::fs::Mode::RGRP)
+        .union(rustix::fs::Mode::WGRP)
+        .union(rustix::fs::Mode::ROTH)
+        .union(rustix::fs::Mode::WOTH);
+    /// The name a directory has in itself, which a file without a name is
+    /// made in.
+    const ITSELF: &'static CStr = c".";
+    /// What a name nobody can guess starts with.
+    const NAME_PREFIX: &'static str = ".#uapi16-";
+
+    /// Splits the name `name` of a new file below a directory into the
+    /// directories on the way to it, if it names any, and the name of the
+    /// file in the last of them. A name names no file below a directory and
+    /// has neither where it is empty or ends in a slash, `.` or `..`, where
+    /// it is absolute, and where `.` or `..` is on the way.
+    pub(crate) fn split(name: &Path) -> Option<(Option<&[u8]>, &[u8])> {
+        let path = name.as_os_str().as_bytes();
+        let (parent, file_name) = match path.iter().rposition(|&byte| byte == NewFile::SEPARATOR) {
+            Some(at) => (Some(&path[..at]), &path[at + 1..]),
+            None => (None, path),
+        };
+        let names_file = !file_name.is_empty() && !NewFile::ITSELF_AND_PARENT.contains(&file_name);
+        let absolute = path.first() == Some(&NewFile::SEPARATOR);
+        let below = parent.is_none_or(|parent| {
+            NewFile::components(parent).all(|component| !NewFile::ITSELF_AND_PARENT.contains(&component))
+        });
+        (names_file && !absolute && below).then_some((parent, file_name))
+    }
+
+    /// The components of `parent`, the directories on the way to a new
+    /// file. Slashes that follow each other separate as one does, as in
+    /// every path.
+    fn components(parent: &[u8]) -> impl Iterator<Item = &[u8]> {
+        parent
+            .split(|&byte| byte == NewFile::SEPARATOR)
+            .filter(|component| !component.is_empty())
+    }
+
+    /// Opens the directories `parent` on the way to a new file below the
+    /// directory `dir`, one component at a time, and returns the last one,
+    /// which the file is in. No component is opened through a symbolic
+    /// link, so with what [`NewFile::split`] refuses the file is below
+    /// `dir`, whatever the names on the way lead to by now. A mount point
+    /// on the way is gone through, and an automount point has its file
+    /// system mounted, as for any path a file is created at.
+    fn open_parent(dir: BorrowedFd<'_>, parent: &[u8]) -> io::Result<OwnedFd> {
+        let mut directory = None;
+        for component in NewFile::components(parent) {
+            let within = directory.as_ref().map_or(dir, OwnedFd::as_fd);
+            directory = Some(NewFile::open_component(within, component)?);
+        }
+        match directory {
+            Some(directory) => Ok(directory),
+            None => dir.try_clone_to_owned(),
+        }
+    }
+
+    /// Opens the directory `component` of the directory `dir`, one
+    /// component on the way to a new file. A symbolic link fails with
+    /// ELOOP, and anything else that is no directory with ENOTDIR. The
+    /// kernel fails the open with ENOTDIR for both, so the name is looked
+    /// at once more then.
+    fn open_component(dir: BorrowedFd<'_>, component: &[u8]) -> rustix::io::Result<OwnedFd> {
+        let opened =
+            retry_on_intr(|| rustix::fs::openat(dir, component, NewFile::DIRECTORY_FLAGS, rustix::fs::Mode::empty()));
+        if !matches!(opened, Err(Errno::NOTDIR)) {
+            return opened;
+        }
+        let found = retry_on_intr(|| rustix::fs::statx(dir, component, NewFile::LOOK_FLAGS, StatxFlags::TYPE))?;
+        match FileType::from_raw_mode(found.stx_mode.into()) {
+            FileType::Symlink => Err(Errno::LOOP),
+            _ => Err(Errno::NOTDIR),
+        }
+    }
+
+    /// Makes a file that gets the name `name` once it is complete, below the
+    /// directory `dir`. The file goes into the directory the name is in,
+    /// which is `dir` itself where the name has one component, and which is
+    /// opened one component at a time otherwise, none of them through a
+    /// symbolic link, see [`NewFile::open_parent`]. Something that has the
+    /// name already fails with EEXIST. A name that names no file below a
+    /// directory fails with EINVAL, see [`NewFile::split`], a symbolic link
+    /// on the way with ELOOP, and anything else on the way that is no
+    /// directory with ENOTDIR. A `dir` that is no descriptor fails with
+    /// EBADF, also AT_FDCWD. Where `sync` is true, the file is synced as it
+    /// gets its name, see [`NewFile::link`]. An error says which file it is
+    /// of.
+    pub(crate) fn create_at(dir: BorrowedFd<'_>, name: &Path, sync: bool) -> io::Result<(File, NewFile)> {
+        NewFile::create(dir, name, sync).map_err(|e| NewFile::about(name, e))
+    }
+
+    /// The I/O error `error` of the new file `name`, which says so.
+    fn about(name: &Path, error: io::Error) -> io::Error {
+        Error::io_about(format!("the manifest file '{}'", name.display()), error)
+    }
+
+    /// What [`NewFile::create_at`] does, for the name `path`.
+    fn create(dir: BorrowedFd<'_>, path: &Path, sync: bool) -> io::Result<(File, NewFile)> {
+        let (parent, file_name) = NewFile::split(path).ok_or(Errno::INVAL)?;
+        // A negative number is no descriptor, and fails before anything is
+        // opened or duplicated. AT_FDCWD is such a number, which rustix has
+        // as a descriptor, `CWD`. It stands for the current directory only
+        // where a path is looked up, so openat() would take it for a name
+        // of more than one component.
+        if dir.as_raw_fd().is_negative() {
+            return Err(Errno::BADF.into());
+        }
+        let directory = match parent {
+            Some(parent) => NewFile::open_parent(dir, parent)?,
+            None => dir.try_clone_to_owned()?,
+        };
+        let name = CString::new(file_name).map_err(|_| Errno::INVAL)?;
+        // Something that has the name fails now and not once the manifest
+        // is complete. Giving the file its name checks again.
+        let found = retry_on_intr(|| {
+            rustix::fs::statx(&directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE)
+        });
+        match found {
+            Ok(_) => return Err(Errno::EXIST.into()),
+            Err(Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let unnamed =
+            retry_on_intr(|| rustix::fs::openat(&directory, NewFile::ITSELF, NewFile::UNNAMED_FLAGS, NewFile::MODE));
+        let (file, temporary) = match unnamed {
+            Ok(file) => (file, None),
+            // A file system without O_TMPFILE, and a kernel that does not
+            // know it and opens the directory for writing, as for
+            // ScratchFile::create_in().
+            Err(Errno::OPNOTSUPP | Errno::ISDIR) => {
+                let (file, temporary) = TemporaryName::create(
+                    directory.as_fd(),
+                    NewFile::NAME_PREFIX,
+                    NewFile::NAMED_FLAGS,
+                    NewFile::MODE,
+                )?;
+                (file, Some(temporary))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The file owns its temporary name from here on, which goes when it
+        // is dropped, also when there is no descriptor left to write it
+        // through.
+        let new = NewFile {
+            directory: Arc::new(directory),
+            name,
+            path: path.to_path_buf(),
+            file: Arc::new(File::from(file)),
+            temporary,
+            sync,
+        };
+        let written = new.file.try_clone()?;
+        Ok((written, new))
+    }
+
+    /// The directory the file gets its name in, for what else is kept in
+    /// it while the file is written: the same descriptor, and no duplicate
+    /// of it.
+    pub(crate) fn directory(&self) -> Arc<OwnedFd> {
+        Arc::clone(&self.directory)
+    }
+
+    /// The I/O error `error` of a write to the file, which says which file
+    /// it is of.
+    pub(crate) fn failed(&self, error: io::Error) -> io::Error {
+        NewFile::about(&self.path, error)
+    }
+
+    /// The file with its inode, if it has a name until it gets its own,
+    /// which a walk of its directory has to pass over. It is the descriptor
+    /// this has of the file, and no duplicate of it.
+    pub(crate) fn named_file(&self) -> Result<Option<(InodeId, Arc<File>)>, Failure> {
+        if self.temporary.is_none() {
+            return Ok(None);
+        }
+        let inode = Status::of(self.file.as_fd())?.identity.inode_id();
+        Ok(Some((inode, Arc::clone(&self.file))))
+    }
+
+    /// Gives the file its name, without replacing anything: where something
+    /// has the name, this fails with EEXIST, and the file gets none.
+    ///
+    /// A file that is synced is synced as systemd's link_tmpfile_at() syncs
+    /// one with LINK_TMPFILE_SYNC: before it gets its name, so that the name
+    /// never leads to data that is not on disk yet, and once more after,
+    /// with the directory it is in, so that the name is on disk as well.
+    /// That holds for every way the file gets its name.
+    ///
+    /// The file gets its name in [`NewFile::sync_and_name`]. Where that
+    /// fails, it got none and is emptied, see [`NewFile::give_up`]. What
+    /// comes once it has its name is [`NewFile::sync_named`]. Where that
+    /// fails, as the second sync can, the file keeps its name and what it
+    /// holds, and this fails all the same. So where this failed says
+    /// whether the file has its name, as long as the call that gives the
+    /// name says what it did. A look at the name would not: another
+    /// process can rename the file as soon as it has it, and a file
+    /// system can show the names of one file with inode numbers of their
+    /// own, as libfuse does on its high-level interface without use_ino.
+    /// A call that gave the name and fails all the same is taken for one
+    /// that gave none, and the file is emptied under its name. link(2)
+    /// documents that for NFS, where a server can make the link and die
+    /// before it can say so. Nobody can tell in one case that the calls
+    /// show, a call that was interrupted and failed when it was made
+    /// again, as [`NewFile::give_name`] has it, see [`Unnamed::Unknown`].
+    /// The file stays as it is then, and this fails. An error says which
+    /// file it is of.
+    pub(crate) fn link(mut self) -> io::Result<()> {
+        let named = self.sync_and_name();
+        self.linked(named)
+    }
+
+    /// What [`NewFile::link`] does once its first half came to `named`.
+    /// Where that says that the file has its name, the second half
+    /// follows, see [`NewFile::sync_named`]. Where it says that the file
+    /// got none, the file is given up, and where it says that nobody can
+    /// tell, the file stays as it is. Both fail with the error of the
+    /// first half. An error says which file it is of.
+    fn linked(mut self, named: Result<(), Unnamed>) -> io::Result<()> {
+        let linked = match named {
+            Ok(()) => self.sync_named(),
+            Err(Unnamed::Failed(e)) => {
+                self.give_up();
+                Err(e)
+            }
+            // The file can have its name, so it keeps what it holds. A
+            // temporary name it still has goes when this is dropped.
+            Err(Unnamed::Unknown(e)) => Err(e),
+        };
+        linked.map_err(|e| NewFile::about(&self.path, e))
+    }
+
+    /// Empties the file for whoever gives it up before it has its name:
+    /// what was written of the manifest goes before the name the file has
+    /// until then does, so that nothing of it is left where a file system
+    /// keeps a file that was unlinked while it is open under a name until
+    /// it is released. Nobody gives up a file that has its name or can
+    /// have it, as far as the calls that give it say, see
+    /// [`NewFile::link`]: it stays as it is, also where a sync of it
+    /// failed. A truncation that fails is ignored. Dropping the file
+    /// empties nothing.
+    pub(crate) fn give_up(&self) {
+        let _ = retry_on_intr(|| rustix::fs::ftruncate(&self.file, 0));
+    }
+
+    /// The first half of what [`NewFile::link`] does: the sync of the file
+    /// before it gets its name, and the name. Where this fails, the file
+    /// got no name, as far as the calls that give it say, which is
+    /// [`Unnamed::Failed`], but for a call that was interrupted, failed
+    /// when it was made again and of which nobody can tell whether it gave
+    /// the name, which is [`Unnamed::Unknown`], see
+    /// [`NewFile::give_name`]. A file that got its name by a link, see
+    /// [`NewFile::rename`], has a temporary name next to it then, which is
+    /// kept for [`NewFile::sync_named`] to remove.
+    fn sync_and_name(&mut self) -> Result<(), Unnamed> {
+        if self.sync {
+            retry_on_intr(|| rustix::fs::fsync(&self.file))?;
+        }
+        match &self.temporary {
+            None => self.temporary = self.link_unnamed()?,
+            // A name that was not renamed is still there. It is removed
+            // once the file has its own, or when this is dropped.
+            Some(temporary) => {
+                if self.rename(temporary)? {
+                    self.temporary = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The second half, for a file that has its name: the temporary name
+    /// it still has is removed, and the file and its directory are synced.
+    /// Where the temporary name can't be removed, the file has both names,
+    /// and this fails. Its own name is not removed again: nothing removes a
+    /// name only while it leads to a given file, and another file can take
+    /// the name in between. The temporary name is removed once more when
+    /// the file is dropped.
+    fn sync_named(&mut self) -> io::Result<()> {
+        if let Some(temporary) = &self.temporary {
+            temporary.remove(self.directory.as_fd())?;
+            self.temporary = None;
+        }
+        if self.sync {
+            retry_on_intr(|| rustix::fs::fsync(&self.file))?;
+            let directory = retry_on_intr(|| {
+                rustix::fs::openat(
+                    &self.directory,
+                    NewFile::ITSELF,
+                    NewFile::SYNC_FLAGS,
+                    rustix::fs::Mode::empty(),
+                )
+            })?;
+            retry_on_intr(|| rustix::fs::fsync(&directory))?;
+        }
+        Ok(())
+    }
+
+    /// Links the file without a name in, the way systemd's link_fd() does.
+    /// Linux before 6.10 takes linkat() of a descriptor only from a process
+    /// that may look up any name, and fails with ENOENT for any other. The
+    /// link procfs has for the descriptor is linked then, which can leave
+    /// the file a temporary name next to its own. Returns that name, see
+    /// [`NewFile::link_through`].
+    fn link_unnamed(&self) -> Result<Option<TemporaryName>, Unnamed> {
+        let (directory, name) = (&self.directory, self.name.as_c_str());
+        let linked = self.give_name(|| rustix::fs::linkat(&self.file, c"", directory, name, AtFlags::EMPTY_PATH));
+        match linked {
+            Ok(()) => Ok(None),
+            Err(Unnamed::Failed(Errno::NOENT)) => self.link_through_procfs(),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Links the file in through the link procfs has for its descriptor,
+    /// see [`FdLink`], which is checked to lead to the file first. Returns
+    /// what [`NewFile::link_through`] returns.
+    fn link_through_procfs(&self) -> Result<Option<TemporaryName>, Unnamed> {
+        let link = FdLink::new(self.file.as_fd());
+        link.check()?;
+        self.link_through(link.path())
+    }
+
+    /// Links the file in through `path`, which was checked to lead to it.
+    /// A /proc that is not what it should be can lead elsewhere by then, so
+    /// the link goes to a name nobody can guess first, see
+    /// [`TemporaryName::link`], which has to lead to the file before it is
+    /// renamed to the name of the file, see [`NewFile::rename`]. Where it
+    /// leads to another file, or the rename fails, the temporary name is
+    /// removed, which is nobody else's whatever it leads to. The name of
+    /// the file only ever gets a link that was checked to lead to the file,
+    /// and it is never removed. Returns the temporary name where the file
+    /// still has it next to its own.
+    fn link_through(&self, path: &str) -> Result<Option<TemporaryName>, Unnamed> {
+        let directory = self.directory.as_fd();
+        let temporary = TemporaryName::link(directory, NewFile::NAME_PREFIX, path)?;
+        let renamed = match self.names_file(temporary.as_c_str()) {
+            Ok(true) => self.rename(&temporary),
+            Ok(false) => Err(FdLink::elsewhere().into()),
+            Err(e) => Err(e.into()),
+        };
+        match renamed {
+            Ok(gone) => Ok((!gone).then_some(temporary)),
+            Err(e) => {
+                // Where it can't be removed, the file it leads to keeps it.
+                let _ = temporary.remove(directory);
+                Err(e)
+            }
+        }
+    }
+
+    /// Renames the file from its name `temporary` to its own, without
+    /// replacing anything, and returns whether the temporary name is gone
+    /// by that. A file system without RENAME_NOREPLACE gets a link of the
+    /// new name instead, see [`NewFile::link_instead`], after which the
+    /// file has both names.
+    fn rename(&self, temporary: &TemporaryName) -> Result<bool, Unnamed> {
+        let (directory, name) = (&self.directory, self.name.as_c_str());
+        let (from, flags) = (temporary.as_c_str(), RenameFlags::NOREPLACE);
+        match self.give_name(|| rustix::fs::renameat_with(directory, from, directory, name, flags)) {
+            Ok(()) => Ok(true),
+            Err(Unnamed::Failed(e)) if NewFile::no_such_call(e) => self.link_instead(temporary).map(|()| false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Gives the file its own name from its name `temporary` where the file
+    /// system has no RENAME_NOREPLACE: a link of the new name, which
+    /// replaces nothing either, as for systemd's rename_noreplace(). The
+    /// temporary name is not removed here: that comes once the file has
+    /// its own name, see [`NewFile::sync_named`], so that what fails here
+    /// is the call that gives the name, and nothing after it.
+    fn link_instead(&self, temporary: &TemporaryName) -> Result<(), Unnamed> {
+        let (directory, name) = (&self.directory, self.name.as_c_str());
+        let from = temporary.as_c_str();
+        Ok(self.give_name(|| rustix::fs::linkat(directory, from, directory, name, AtFlags::empty()))?)
+    }
+
+    /// Whether the errno `e` says that the file system has no such call:
+    /// EINVAL, ENOSYS and EOPNOTSUPP, which renameat2() fails with where
+    /// the file system has no RENAME_NOREPLACE. A call that fails with one
+    /// of them did nothing.
+    fn no_such_call(e: Errno) -> bool {
+        matches!(e, Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP)
+    }
+
+    /// Makes `give`, which gives the file its name without replacing
+    /// anything, again where it fails with EINTR. One that was interrupted
+    /// can have given the file the name before it failed. The same call
+    /// again fails then: with EEXIST for the name, with ENOENT for the
+    /// name that was renamed, or with anything else that goes wrong by
+    /// then, such as EIO or EACCES. So once a call was interrupted, the
+    /// name is looked at whatever the call fails with when it is made
+    /// again, and the file has it where it leads to the file. Where it
+    /// does not, or can't be looked at, nobody can tell, which is
+    /// [`Unnamed::Unknown`]: the call can have given the name all the
+    /// same, since another process can have renamed the file by then, and
+    /// a file system can show the names of one file with inode numbers of
+    /// their own. The name is not looked at where the call made again
+    /// says that the file system has no such call, see
+    /// [`NewFile::no_such_call`]: the call that was interrupted gave no
+    /// name either then, and [`NewFile::rename`] falls back on that. That
+    /// is [`Unnamed::Failed`], as is every failure of a call that was not
+    /// interrupted: such a call is taken to have left the file without
+    /// the name, see [`NewFile::link`] for one that did not.
+    fn give_name(&self, mut give: impl FnMut() -> rustix::io::Result<()>) -> Result<(), Unnamed<Errno>> {
+        let mut interrupted = false;
+        loop {
+            match give() {
+                Ok(()) => return Ok(()),
+                Err(Errno::INTR) => interrupted = true,
+                Err(e) if interrupted && !NewFile::no_such_call(e) => {
+                    return match self.has_name() {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(Unnamed::Unknown(e)),
+                        Err(look) => Err(Unnamed::Unknown(look)),
+                    };
+                }
+                Err(e) => return Err(Unnamed::Failed(e)),
+            }
+        }
+    }
+
+    /// Whether the name of the file in its directory leads to the file.
+    fn has_name(&self) -> rustix::io::Result<bool> {
+        self.names_file(&self.name)
+    }
+
+    /// Whether the name `name` in the directory of the file leads to the
+    /// file.
+    fn names_file(&self, name: &CStr) -> rustix::io::Result<bool> {
+        let found =
+            retry_on_intr(|| rustix::fs::statx(&self.directory, name, AtFlags::SYMLINK_NOFOLLOW, InodeId::REQUEST));
+        match found {
+            Ok(statx) => Ok(InodeId::from_statx(&statx) == InodeId::of(self.file.as_fd())?),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Drop for NewFile {
+    /// Removes the temporary name of the file, if it has one: the name it
+    /// has until it gets its own, or one that could not be removed then.
+    fn drop(&mut self) {
+        if let Some(temporary) = self.temporary.take() {
+            let _ = temporary.remove(self.directory.as_fd());
+        }
+    }
+}
+
 /// The hash of the data of a regular file, read a part at a time, so that
 /// a large file takes several steps: the file, opened again through the
 /// handle of its entry, its status when the entry was opened, the hash of
@@ -1312,12 +1888,12 @@ mod tests {
     use crate::testing::{OpenFile, TempDir, ST_BLOCKS_UNIT};
     use rustix::fs::{inotify, MemfdFlags, SealFlags, CWD};
     use rustix::io::FdFlags;
-    use std::ffi::CString;
     use std::fmt;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::mem::MaybeUninit;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
@@ -2288,6 +2864,536 @@ mod tests {
         }
     }
 
+    /// A new file has no name until it gets its own, which replaces
+    /// nothing. Where the file system has O_TMPFILE it has none, also not
+    /// one a walk would have to pass over. A link through procfs goes to a
+    /// temporary name first, and one that leads to another file by then
+    /// leaves no name behind: the name of the file never appears, as
+    /// inotify sees it, and the temporary name is gone again.
+    #[test]
+    fn new_files_without_names() {
+        let tmp = TempDir::new("sys-new-unnamed");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let (mut file, new) = NewFile::create_at(directory.as_fd(), Path::new("m"), false).unwrap();
+        if new.temporary.is_some() {
+            eprintln!("skipping: the temporary directory has no O_TMPFILE");
+            return;
+        }
+        assert!(new.named_file().unwrap().is_none());
+        file.write_all(b"manifest").unwrap();
+        assert!(names_in(dir).is_empty());
+        new.link().unwrap();
+        assert_eq!(fs::read(dir.join("m")).unwrap(), b"manifest");
+        // The link of procfs, for a kernel before 6.10, links the same. A
+        // temporary name it leaves is removed as for every file that has
+        // its name.
+        let (mut file, mut new) = NewFile::create_at(directory.as_fd(), Path::new("again"), false).unwrap();
+        file.write_all(b"again").unwrap();
+        new.temporary = new.link_through_procfs().unwrap();
+        new.sync_named().unwrap();
+        assert_eq!(fs::read(dir.join("again")).unwrap(), b"again");
+        // A link that leads to another file by the time the file gets its
+        // name leaves no name behind, and the other file as it was.
+        fs::write(dir.join("decoy"), b"decoy").unwrap();
+        let (_, new) = NewFile::create_at(directory.as_fd(), Path::new("decoyed"), false).unwrap();
+        let decoy = dir.join("decoy");
+        let inotify = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).unwrap();
+        let named = inotify::WatchFlags::CREATE | inotify::WatchFlags::MOVED_TO;
+        inotify::add_watch(&inotify, dir, named).unwrap();
+        let Err(Unnamed::Failed(e)) = new.link_through(decoy.to_str().unwrap()) else {
+            panic!("the link that leads to another file did not fail as one that gave no name");
+        };
+        assert_eq!(e.to_string(), "the link of /proc/thread-self/fd leads to another file");
+        let mut buffer = [MaybeUninit::uninit(); 4096];
+        let mut events = inotify::Reader::new(&inotify, &mut buffer);
+        let mut appeared = Vec::new();
+        loop {
+            match events.next() {
+                Ok(event) => appeared.push(event.file_name().unwrap().to_owned()),
+                Err(Errno::AGAIN) => break,
+                Err(e) => panic!("{}", e),
+            }
+        }
+        assert_eq!(appeared.len(), 1, "{:?}", appeared);
+        assert!(appeared[0].to_bytes().starts_with(NewFile::NAME_PREFIX.as_bytes()));
+        let mut names = names_in(dir);
+        names.sort();
+        assert_eq!(names, ["again", "decoy", "m"]);
+        assert_eq!(fs::metadata(&decoy).unwrap().nlink(), 1);
+        fs::remove_file(&decoy).unwrap();
+        // One that is synced gets its name the same way.
+        let (mut file, new) = NewFile::create_at(directory.as_fd(), Path::new("synced"), true).unwrap();
+        file.write_all(b"synced").unwrap();
+        new.link().unwrap();
+        assert_eq!(fs::read(dir.join("synced")).unwrap(), b"synced");
+        // Something that has the name by then stays.
+        let (_, new) = NewFile::create_at(directory.as_fd(), Path::new("taken"), false).unwrap();
+        fs::write(dir.join("taken"), b"mine").unwrap();
+        let e = new.link().unwrap_err();
+        let message = format!(
+            "the manifest file 'taken': {}",
+            io::Error::from_raw_os_error(libc::EEXIST)
+        );
+        assert_eq!(e.to_string(), message);
+        assert_eq!(new_file_errno(e), Some(libc::EEXIST));
+        assert_eq!(fs::read(dir.join("taken")).unwrap(), b"mine");
+    }
+
+    /// The name of a new file below a directory has the directories on the
+    /// way and the name of the file in the last one. A name is none of a
+    /// file below a directory where it is empty, absolute, ends in a slash,
+    /// `.` or `..`, or has `.` or `..` on the way. Slashes that follow each
+    /// other are one.
+    #[test]
+    fn names_of_new_files_below_a_directory() {
+        let split = |name: &'static str| NewFile::split(Path::new(name));
+        let parts =
+            |parent: Option<&'static str>, file: &'static str| Some((parent.map(str::as_bytes), file.as_bytes()));
+        assert_eq!(split("m"), parts(None, "m"));
+        assert_eq!(split("a/m"), parts(Some("a"), "m"));
+        assert_eq!(split("a/b/m"), parts(Some("a/b"), "m"));
+        assert_eq!(split("a//b///m"), parts(Some("a//b//"), "m"));
+        assert_eq!(split("..a/b../..."), parts(Some("..a/b.."), "..."));
+        for name in [
+            "",
+            "/",
+            "/m",
+            "//m",
+            "/a/m",
+            "a/",
+            "a//",
+            ".",
+            "..",
+            "a/.",
+            "a/..",
+            "./m",
+            "../m",
+            "a/./m",
+            "a/../m",
+            "a/b/../../m",
+            "a//../m",
+        ] {
+            assert_eq!(split(name), None, "{:?}", name);
+        }
+        let components = |parent: &'static str| NewFile::components(parent.as_bytes()).collect::<Vec<_>>();
+        assert_eq!(components("a//b//"), [b"a", b"b"]);
+        assert!(components("").is_empty());
+    }
+
+    /// A new file that has a name until it gets its own, as on a file
+    /// system without O_TMPFILE, is renamed without replacing anything, and
+    /// loses its name when it is dropped instead. Its inode is the one a
+    /// walk has to pass over. One that is synced gets its name the same
+    /// way. One that is dropped keeps what it holds, and one whose name is
+    /// taken is emptied. What the first half of the link came to decides
+    /// that: a file that got no name is emptied, and one of which nobody
+    /// can tell whether it has its name keeps what it holds. Both lose
+    /// their temporary name.
+    #[test]
+    fn new_files_with_names() {
+        let tmp = TempDir::new("sys-new-named");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let new_synced = |name: &CStr, sync: bool| {
+            let named = TemporaryName::create(
+                directory.as_fd(),
+                NewFile::NAME_PREFIX,
+                NewFile::NAMED_FLAGS,
+                NewFile::MODE,
+            );
+            let (file, temporary) = named.unwrap();
+            let new = NewFile {
+                directory: Arc::new(directory.as_fd().try_clone_to_owned().unwrap()),
+                name: name.to_owned(),
+                path: PathBuf::from(name.to_str().unwrap()),
+                file: Arc::new(File::from(file)),
+                temporary: Some(temporary),
+                sync,
+            };
+            (new.file.try_clone().unwrap(), new)
+        };
+        let new = |name: &CStr| new_synced(name, false);
+        let (mut file, synced) = new_synced(c"synced", true);
+        file.write_all(b"synced").unwrap();
+        synced.link().unwrap();
+        assert_eq!(fs::read(dir.join("synced")).unwrap(), b"synced");
+        fs::remove_file(dir.join("synced")).unwrap();
+        let (mut file, made) = new(c"m");
+        let inode = Status::of(file.as_fd()).unwrap().identity.inode_id();
+        // What a walk passes over is the file by the descriptor the new
+        // file has of it: no other one is taken for it.
+        let (named, shared) = made.named_file().unwrap().unwrap();
+        assert_eq!(named, inode);
+        assert!(Arc::ptr_eq(&shared, &made.file));
+        drop(shared);
+        let listed = names_in(dir);
+        assert!(
+            listed.len() == 1
+                && listed[0]
+                    .as_encoded_bytes()
+                    .starts_with(NewFile::NAME_PREFIX.as_bytes())
+        );
+        file.write_all(b"manifest").unwrap();
+        made.link().unwrap();
+        assert_eq!(names_in(dir), ["m"]);
+        assert_eq!(fs::read(dir.join("m")).unwrap(), b"manifest");
+        let (mut file, dropped) = new(c"dropped");
+        file.write_all(b"dropped").unwrap();
+        drop(dropped);
+        assert_eq!(file.metadata().unwrap().len(), b"dropped".len() as u64);
+        assert_eq!(names_in(dir), ["m"]);
+        let (mut file, taken) = new(c"m");
+        file.write_all(b"taken").unwrap();
+        assert_eq!(new_file_errno(taken.link().unwrap_err()), Some(libc::EEXIST));
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(names_in(dir), ["m"]);
+        assert_eq!(fs::read(dir.join("m")).unwrap(), b"manifest");
+        // A file of which nobody can tell whether it has its name keeps
+        // what it holds, and one that got none is emptied. Both lose their
+        // temporary name with the drop.
+        for (unnamed, held) in [
+            (Unnamed::Unknown(Errno::EXIST.into()), b"untold".len() as u64),
+            (Unnamed::Failed(Errno::EXIST.into()), 0),
+        ] {
+            let (mut file, untold) = new(c"untold");
+            file.write_all(b"untold").unwrap();
+            let e = untold.linked(Err(unnamed)).unwrap_err();
+            assert_eq!(new_file_errno(e), Some(libc::EEXIST));
+            assert_eq!(file.metadata().unwrap().len(), held);
+            assert_eq!(names_in(dir), ["m"]);
+        }
+    }
+
+    /// The variable that names a directory without O_TMPFILE, in which the
+    /// test binary runs [`new_files_without_descriptors`] again.
+    const NO_TMPFILE_DIR: &str = "UAPI16_TEST_NO_TMPFILE_DIR";
+
+    /// A new file that has a name until it gets its own and that can't be
+    /// made for want of a descriptor leaves no name behind. The test binary
+    /// runs this test again with 64 descriptors at most, in a user, mount
+    /// and IPC namespace from unshare(1), on a file system of message
+    /// queues, which has no O_TMPFILE. It is skipped where unshare can't
+    /// make one.
+    #[test]
+    fn new_files_without_descriptors() {
+        if let Some(dir) = std::env::var_os(NO_TMPFILE_DIR) {
+            return check_new_files_without_descriptors(Path::new(&dir));
+        }
+        let tmp = TempDir::new("sys-new-descriptors");
+        let dir = &tmp.0;
+        let works = Command::new("unshare").args(["-Urmi", "true"]).output();
+        if !works.is_ok_and(|output| output.status.success()) {
+            eprintln!("skipping: unshare -Urmi does not work here");
+            return;
+        }
+        // The script exits with 77 where it can't mount the file system.
+        let script = concat!(
+            r#"mount -t mqueue mqueue "$1" || exit 77; ulimit -n 64 || exit 1; "#,
+            r#"exec "$2" --exact sys::tests::new_files_without_descriptors"#
+        );
+        let output = Command::new("unshare")
+            .args(["-Urmi", "sh", "-c", script, "sh"])
+            .arg(dir)
+            .arg(std::env::current_exe().unwrap())
+            .env(NO_TMPFILE_DIR, dir)
+            .output()
+            .unwrap();
+        if output.status.code() == Some(77) {
+            eprintln!("skipping: no file system of message queues here");
+            return;
+        }
+        // A test binary that runs no test succeeds as well.
+        let ran = String::from_utf8_lossy(&output.stdout).contains("1 passed");
+        assert!(output.status.success() && ran, "{:?}", output);
+    }
+
+    /// The checks of [`new_files_without_descriptors`] in `dir`.
+    fn check_new_files_without_descriptors(dir: &Path) {
+        let directory = File::open(dir).unwrap();
+        let unnamed = rustix::fs::openat(&directory, NewFile::ITSELF, NewFile::UNNAMED_FLAGS, NewFile::MODE);
+        assert_eq!(unnamed.unwrap_err(), Errno::OPNOTSUPP);
+        // Two descriptors are left, for the directory and for the file,
+        // which has its name then. None is left for writing it.
+        let mut taken = Vec::new();
+        loop {
+            match rustix::fs::open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, rustix::fs::Mode::empty()) {
+                Ok(fd) => taken.push(fd),
+                Err(Errno::MFILE) => break,
+                Err(e) => panic!("{}", e),
+            }
+        }
+        taken.truncate(taken.len() - 2);
+        let e = NewFile::create_at(directory.as_fd(), Path::new("m"), false).unwrap_err();
+        drop(taken);
+        assert_eq!(new_file_errno(e), Some(libc::EMFILE));
+        assert!(names_in(dir).is_empty(), "{:?}", names_in(dir));
+    }
+
+    /// A call that gives a new file its name and that was interrupted can
+    /// have given the name before it failed. Made again it fails with
+    /// EEXIST for a link, with ENOENT for a rename, or with something else,
+    /// and the file has the name where the name leads to it. Where the
+    /// name leads to another file by then, is not there, or can't be
+    /// looked at, nobody can tell whether the call gave it, and the half
+    /// that made the call is told so. A call that fails because the file
+    /// system has no such call gave no name, and one that was not
+    /// interrupted says what it says.
+    #[test]
+    fn names_given_while_interrupted() {
+        let tmp = TempDir::new("sys-new-interrupted");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let new = |name: &CStr| {
+            let named = TemporaryName::create(
+                directory.as_fd(),
+                NewFile::NAME_PREFIX,
+                NewFile::NAMED_FLAGS,
+                NewFile::MODE,
+            );
+            let (file, temporary) = named.unwrap();
+            NewFile {
+                directory: Arc::new(directory.as_fd().try_clone_to_owned().unwrap()),
+                name: name.to_owned(),
+                path: PathBuf::from(name.to_str().unwrap()),
+                file: Arc::new(File::from(file)),
+                temporary: Some(temporary),
+                sync: false,
+            }
+        };
+        // `give`, which is interrupted the first time once it did what it
+        // does.
+        fn interrupted_once(
+            mut give: impl FnMut() -> rustix::io::Result<()>,
+        ) -> impl FnMut() -> rustix::io::Result<()> {
+            let mut first = true;
+            move || {
+                let given = give();
+                if std::mem::take(&mut first) {
+                    given.and(Err(Errno::INTR))
+                } else {
+                    given
+                }
+            }
+        }
+        let linked = new(c"linked");
+        let from = linked.temporary.as_ref().unwrap().as_c_str();
+        let link = || rustix::fs::linkat(&linked.directory, from, &linked.directory, c"linked", AtFlags::empty());
+        linked.give_name(interrupted_once(link)).unwrap();
+        assert!(linked.has_name().unwrap());
+        // The same where the call fails for something else when it is made
+        // again: it gave the name before it was interrupted.
+        let done = new(c"done");
+        let from = done.temporary.as_ref().unwrap().as_c_str();
+        let link = || rustix::fs::linkat(&done.directory, from, &done.directory, c"done", AtFlags::empty());
+        let mut link = interrupted_once(link);
+        let mut first = true;
+        let told = done.give_name(|| {
+            if std::mem::take(&mut first) {
+                link()
+            } else {
+                Err(Errno::IO)
+            }
+        });
+        assert_eq!(told, Ok(()));
+        // One that did nothing before it was interrupted and fails that
+        // way: nobody can tell. And one that fails because the file system
+        // has no such call gave no name.
+        for (errno, told) in [
+            (Errno::IO, Unnamed::Unknown(Errno::IO)),
+            (Errno::INVAL, Unnamed::Failed(Errno::INVAL)),
+            (Errno::NOSYS, Unnamed::Failed(Errno::NOSYS)),
+            (Errno::OPNOTSUPP, Unnamed::Failed(Errno::OPNOTSUPP)),
+        ] {
+            let mut calls = [Errno::INTR, errno].into_iter();
+            assert_eq!(new(c"untold").give_name(|| Err(calls.next().unwrap())), Err(told));
+        }
+        let renamed = new(c"renamed");
+        let from = renamed.temporary.as_ref().unwrap().as_c_str();
+        let flags = RenameFlags::NOREPLACE;
+        let rename = || rustix::fs::renameat_with(&renamed.directory, from, &renamed.directory, c"renamed", flags);
+        match renamed.give_name(interrupted_once(rename)) {
+            Ok(()) => assert!(renamed.has_name().unwrap()),
+            Err(Unnamed::Failed(Errno::INVAL)) => {
+                eprintln!("skipping the rename: the temporary directory has no RENAME_NOREPLACE")
+            }
+            Err(e) => panic!("{:?}", e),
+        }
+        // Interrupted before anything was done, and another file took the
+        // name in between. The call made again fails as it does after one
+        // that gave the name, and the name leads elsewhere, as it does once
+        // another process renamed its file over it: nobody can tell.
+        let taken = new(c"taken");
+        let from = taken.temporary.as_ref().unwrap().as_c_str();
+        let mut first = true;
+        let told = taken.give_name(|| {
+            if std::mem::take(&mut first) {
+                fs::write(dir.join("taken"), b"mine").unwrap();
+                return Err(Errno::INTR);
+            }
+            rustix::fs::linkat(&taken.directory, from, &taken.directory, c"taken", AtFlags::empty())
+        });
+        assert_eq!(told, Err(Unnamed::Unknown(Errno::EXIST)));
+        // It stays that for the half that made the call.
+        let half: Unnamed = Unnamed::Unknown(Errno::EXIST).into();
+        assert!(matches!(half, Unnamed::Unknown(_)));
+        assert_eq!(fs::read(dir.join("taken")).unwrap(), b"mine");
+        // A name that can't be looked at tells nothing either. The
+        // directory may not be searched here, which is skipped where the
+        // tests may search any.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o600)).unwrap();
+        let searched = fs::symlink_metadata(dir.join("taken")).is_ok();
+        let mut calls = [Errno::INTR, Errno::EXIST].into_iter();
+        let told = taken.give_name(|| Err(calls.next().unwrap()));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if searched {
+            eprintln!("skipping the name that can't be looked at: the tests may search any directory");
+        } else {
+            assert_eq!(told, Err(Unnamed::Unknown(Errno::ACCESS)));
+        }
+        // Not interrupted, a name that is taken is a call that failed.
+        let told = taken
+            .give_name(|| rustix::fs::linkat(&taken.directory, from, &taken.directory, c"taken", AtFlags::empty()));
+        assert_eq!(told, Err(Unnamed::Failed(Errno::EXIST)));
+    }
+
+    /// The errno of the I/O error `e` of a new file, which says what file
+    /// it is of, see Error::io_about().
+    fn new_file_errno(e: io::Error) -> Option<i32> {
+        Error::from(e).io_error().and_then(io::Error::raw_os_error)
+    }
+
+    /// Without RENAME_NOREPLACE a new file gets a link of its own name, and
+    /// its temporary name is removed once it has that. Where that fails,
+    /// the file has both names and what it holds, and this fails. Its own
+    /// name is not removed again, since another file can have taken it in
+    /// between. The temporary name is removed once more when the file is
+    /// dropped. The temporary name here is in a directory that may be
+    /// searched but not written, so the link goes through and the removal
+    /// does not. That is skipped where the tests may remove any name. The
+    /// file is open for reading and writing, as a new file is, so that one
+    /// that is given up is seen to be empty.
+    #[test]
+    fn links_instead_of_renames() {
+        let tmp = TempDir::new("sys-new-link-instead");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let new = |name: &CStr, temporary: &CStr| NewFile {
+            directory: Arc::new(directory.as_fd().try_clone_to_owned().unwrap()),
+            name: name.to_owned(),
+            path: PathBuf::from(name.to_str().unwrap()),
+            file: Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(temporary.to_str().unwrap()))
+                    .unwrap(),
+            ),
+            temporary: Some(TemporaryName(temporary.to_owned())),
+            sync: false,
+        };
+        // The link that gives the name where a rename says that there is
+        // no RENAME_NOREPLACE. What comes once the file has its name
+        // removes the temporary one.
+        let link = |new: &NewFile| new.link_instead(new.temporary.as_ref().unwrap());
+        fs::create_dir(dir.join("open")).unwrap();
+        fs::write(dir.join("open/file"), b"named").unwrap();
+        let mut named = new(c"named", c"open/file");
+        link(&named).unwrap();
+        assert!(dir.join("open/file").exists());
+        named.sync_named().unwrap();
+        assert_eq!(fs::read(dir.join("named")).unwrap(), b"named");
+        assert!(!dir.join("open/file").exists() && named.temporary.is_none());
+        fs::create_dir(dir.join("locked")).unwrap();
+        fs::write(dir.join("locked/file"), b"both").unwrap();
+        fs::write(dir.join("locked/probe"), b"").unwrap();
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o500)).unwrap();
+        /// Makes the directory writable again before it is removed.
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let locked = dir.join("locked");
+        let _unlock = Unlock(&locked);
+        if fs::remove_file(dir.join("locked/probe")).is_ok() {
+            eprintln!("skipping the name that can't be removed: the tests may remove any");
+            return;
+        }
+        let mut both = new(c"both", c"locked/file");
+        link(&both).unwrap();
+        let e = both.sync_named().unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fs::read(dir.join("both")).unwrap(), b"both");
+        assert_eq!(fs::read(dir.join("locked/file")).unwrap(), b"both");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(both);
+        assert_eq!(fs::read(dir.join("both")).unwrap(), b"both");
+        assert!(!dir.join("locked/file").exists());
+    }
+
+    /// A temporary name is made by a link as well, which follows a symbolic
+    /// link at the end of its path, as it has to for the link procfs has
+    /// for a descriptor. What was interrupted can have made the name before
+    /// it failed: that name is removed, and the next one is made.
+    #[test]
+    fn temporary_names_of_links() {
+        let tmp = TempDir::new("sys-temporary-links");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        fs::write(dir.join("file"), b"linked").unwrap();
+        symlink("file", dir.join("link")).unwrap();
+        let path = dir.join("link");
+        let path = path.to_str().unwrap();
+        let name = TemporaryName::link(directory.as_fd(), ".test-", path).unwrap();
+        let linked = dir.join(std::ffi::OsStr::from_bytes(name.as_c_str().to_bytes()));
+        assert_eq!(fs::read(&linked).unwrap(), b"linked");
+        assert!(!fs::symlink_metadata(&linked).unwrap().is_symlink());
+        assert_eq!(fs::metadata(dir.join("file")).unwrap().nlink(), 2);
+        name.remove(directory.as_fd()).unwrap();
+        let mut tried = Vec::new();
+        let made = TemporaryName::make(directory.as_fd(), ".test-", |name| {
+            tried.push(name.to_owned());
+            rustix::fs::linkat(CWD, path, &directory, name, AtFlags::SYMLINK_FOLLOW)?;
+            if tried.len() == 1 {
+                return Err(Errno::INTR);
+            }
+            Ok(())
+        });
+        let ((), name) = made.unwrap();
+        assert_eq!(tried.len(), 2);
+        assert_eq!(name.as_c_str(), tried[1].as_c_str());
+        // A call that was interrupted takes no name that something has, so
+        // any number of them is tried again, each with another name.
+        let interruptions = 3 * TemporaryName::ATTEMPTS;
+        let mut calls = 0;
+        let made = TemporaryName::make(directory.as_fd(), ".interrupted-", |_| {
+            calls += 1;
+            if calls <= interruptions {
+                return Err(Errno::INTR);
+            }
+            Ok(calls)
+        });
+        assert_eq!(made.unwrap().0, interruptions + 1);
+        // Names that something has are tried so many times and no more,
+        // also with interruptions in between.
+        let mut calls = 0;
+        let taken = TemporaryName::make(directory.as_fd(), ".taken-", |_| {
+            calls += 1;
+            Err::<(), _>(if calls % 2 == 0 { Errno::EXIST } else { Errno::INTR })
+        });
+        assert_eq!(taken.map(drop).map_err(|e| e.raw_os_error()), Err(Some(libc::EEXIST)));
+        assert_eq!(calls, 2 * TemporaryName::ATTEMPTS);
+        let mut names = names_in(dir);
+        names.sort();
+        let made = std::ffi::OsStr::from_bytes(name.as_c_str().to_bytes()).to_owned();
+        let mut expected = vec![made, "file".into(), "link".into()];
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(fs::metadata(dir.join("file")).unwrap().nlink(), 2);
+    }
+
     /// The names of the entries of the directory `dir`.
     fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
         fs::read_dir(dir)
@@ -2858,5 +3964,6 @@ mod tests {
         send_sync::<ScratchFile>();
         send_sync::<Entries>();
         send_sync::<Listed>();
+        send_sync::<NewFile>();
     }
 }

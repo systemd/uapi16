@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use crate::object::{ContentsObject, ContentsSource, InodeAttributes};
     use crate::testing::TempDir;
-    use crate::{ErrorKind, Field, Problem, RootObject, Writer};
+    use crate::{ErrorKind, Field, ManifestOptions, Problem, RootObject, Writer};
     use rustix::fs::{FileType, CWD};
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
@@ -159,13 +159,14 @@ mod tests {
     /// A file whose owner has the user or the group ID 65535 gets an
     /// object without that ID, since a manifest can't record it, and with
     /// the other one. A writer takes the object, and refuses it with the ID
-    /// that was left out. The file is one of the test's own, seen from a
-    /// user namespace that maps the user of the test to that ID, its
-    /// group, or both. The one that is not mapped shows as the overflow
-    /// ID, which a manifest can record, so that the user ID is told by
-    /// itself and not by the group ID, and the other way round.
-    /// unshare(1) makes the namespaces, and the test binary runs this test
-    /// again in each. It is skipped where unshare can't do that.
+    /// that was left out. So does the builder, as a file object of a
+    /// caller. The file is one of the test's own, seen from a user
+    /// namespace that maps the user of the test to that ID, its group, or
+    /// both. The one that is not mapped shows as the overflow ID, which a
+    /// manifest can record, so that the user ID is told by itself and not
+    /// by the group ID, and the other way round. unshare(1) makes the
+    /// namespaces, and the test binary runs this test again in each. It is
+    /// skipped where unshare can't do that.
     ///
     /// No stat() gives the other ID a manifest can't record, 4294967295:
     /// the kernel shows an owner it can't map as the overflow ID. So what
@@ -253,5 +254,30 @@ mod tests {
             }
             writer.finish().unwrap();
         }
+        // The builder takes the object as a file object of a caller, and
+        // refuses it with the ID that was left out, as the writer does.
+        let features = Features::DEFAULT | Features::UID | Features::GID;
+        let object = FileObject::from_metadata(NameBuf::new("file").unwrap(), &meta, features).unwrap();
+        let mut options = ManifestOptions::new();
+        options.features(features);
+        let mut writer = options.open(Vec::new()).unwrap();
+        writer.add_object(&object).unwrap();
+        for (field, left_out) in [(Field::Uid, meta.uid()), (Field::Gid, meta.gid())] {
+            if left_out != NO_ID {
+                continue;
+            }
+            let mut refused = object.clone();
+            refused.name = NameBuf::new("refused").unwrap();
+            match field {
+                Field::Uid => refused.inode.uid = Some(left_out),
+                _ => refused.inode.gid = Some(left_out),
+            }
+            let e = writer.add_object(&refused).unwrap_err();
+            assert_eq!(
+                (e.kind(), e.field()),
+                (ErrorKind::Manifest(Problem::FieldOutOfRange), Some(field))
+            );
+        }
+        writer.finish().unwrap();
     }
 }

@@ -1007,6 +1007,18 @@ impl Merge {
             Taken::Memory => Ok(self.memory.record()),
         }
     }
+
+    /// Gives the merge up: the scratch file of the runs goes back to
+    /// `scratch`, which empties it, if the sort wrote one. The sort has the
+    /// file until it is wound up, also where that failed, and the merge
+    /// from then on. A merge that is dropped leaves the file as it is.
+    pub(crate) fn give_back(self, scratch: &mut Scratch) {
+        let of_sort = self.sorter.and_then(|sorter| sorter.file);
+        let file = of_sort.or(self.file.map(|file| file.scratch));
+        if let Some(file) = file {
+            scratch.take_back(file);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1467,7 +1479,9 @@ mod tests {
     /// A merge keeps the sort where the rest of a run that was half
     /// written cannot be written, and the scratch file of the runs with
     /// it: the file stays open as it is, and the merge fails from there
-    /// on.
+    /// on. A merge that is given up gives the file back from there, which
+    /// empties it, and so does one that is wound up, which has the file
+    /// itself.
     #[test]
     fn failed_wind_ups() {
         /// An offset no file has.
@@ -1485,6 +1499,21 @@ mod tests {
         assert!(merge.prepare(u64::MAX).is_err());
         let files = OpenFile::made_in(&tmp.0);
         assert!(files.len() == 1 && files[0].size > 0, "{:?}", files);
+        merge.give_back(&mut scratch);
+        let files = OpenFile::made_in(&tmp.0);
+        assert!(files.len() == 1 && files[0].size == 0, "{:?}", files);
+        // The next sort takes the file that was given back, and its merge
+        // has it once it is wound up.
+        let mut sorter = small(2000, MOST_RUNS);
+        while sorter.runs.is_empty() {
+            sorter.push(&mut scratch, b"key", b"").unwrap();
+        }
+        let mut merge = sorter.finish();
+        assert!(merge.prepare(u64::MAX).unwrap() && merge.file.is_some());
+        assert!(OpenFile::made_in(&tmp.0).iter().all(|file| file.size > 0));
+        merge.give_back(&mut scratch);
+        let files = OpenFile::made_in(&tmp.0);
+        assert!(files.len() == 1 && files[0].size == 0, "{:?}", files);
     }
 
     /// A run is written a part at a time, with as much writing as the

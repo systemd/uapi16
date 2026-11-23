@@ -348,6 +348,18 @@ impl Field {
 // attributes. So these go out only where they say more.
 
 impl RootObject {
+    /// Checks the root file object as a writer does that begins a manifest
+    /// with it, on its own: the size of its record, its strings, its
+    /// fields and their features, in the order a reader finds what is
+    /// wrong with a record, see [`Encoder::start`]. The error names no
+    /// record, since the object is in none yet.
+    pub(crate) fn check_alone(&self) -> Result<(), Error> {
+        Encoder::put_together(&mut Vec::new(), self)
+            .and_then(|()| self.check_strings())
+            .and_then(|()| self.check())
+            .and_then(|()| SequenceCheck::new(self.recorded_features(), self.order).check_root_fields(self))
+    }
+
     /// Checks every string the record of the root file object has, in the
     /// order of the keys, for what the strings of a manifest may not hold.
     fn check_strings(&self) -> Result<(), Error> {

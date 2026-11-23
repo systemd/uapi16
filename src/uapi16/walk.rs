@@ -109,7 +109,9 @@ use rustix::fs::FileType;
 
 use crate::error::{Error, ErrorKind, TreeProblem};
 use crate::listing::{Listing, Writing};
-use crate::object::{ContentsObject, ContentsSource, FileObject, InodeAttributes, InodeType, RootObject};
+use crate::object::{
+    ContentsObject, ContentsSource, FileObject, FileSystemIdentity, InodeAttributes, InodeType, RootObject,
+};
 use crate::optional::FeatureReader;
 use crate::sys::{DataHash, Entries, Listed, Readable, DATA_BUFFER_SIZE};
 use crate::tree::{Entry, Failure, InodeId, MountId, Place, Status, Subject};
@@ -130,22 +132,38 @@ const TURN: u64 = 1;
 /// data of a large one.
 const OPEN: u64 = 4096;
 
-/// How an add walks: whether it crosses mount points, and what it does with
-/// an entry whose name a manifest cannot hold.
+/// How [`ManifestOptions::generate_at`] and [`ManifestOptions::generate`]
+/// walk: whether they cross mount points, and what they do with a file
+/// whose name a manifest can't hold.
+/// The flags combine with `|`.
+///
+/// ```
+/// use uapi16::AddFlags;
+///
+/// let flags = AddFlags::CROSS_MOUNTS | AddFlags::GRACEFUL;
+/// assert!(flags.contains(AddFlags::CROSS_MOUNTS));
+/// assert!(!AddFlags::NONE.contains(AddFlags::CROSS_MOUNTS));
+/// ```
+///
+/// [`ManifestOptions::generate_at`]: crate::ManifestOptions::generate_at
+/// [`ManifestOptions::generate`]: crate::ManifestOptions::generate
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct AddFlags(u8);
+pub struct AddFlags(u8);
 
 impl AddFlags {
-    /// No flags.
-    pub(crate) const NONE: AddFlags = AddFlags(0);
+    /// No flags: mount points are not crossed, and a name a manifest can't
+    /// hold is an error.
+    pub const NONE: AddFlags = AddFlags(0);
     /// Walk into mount points instead of writing them as empty directories.
-    pub(crate) const CROSS_MOUNTS: AddFlags = AddFlags(1 << 0);
-    /// Leave out entries whose names a manifest can't hold, a directory
-    /// with everything below it, and count them, instead of failing.
-    pub(crate) const GRACEFUL: AddFlags = AddFlags(1 << 1);
+    pub const CROSS_MOUNTS: AddFlags = AddFlags(1 << 0);
+    /// Leave out files whose names a manifest can't hold, a directory with
+    /// everything below it, and count them in
+    /// [`ManifestReport::entries_omitted`](crate::ManifestReport::entries_omitted),
+    /// instead of failing.
+    pub const GRACEFUL: AddFlags = AddFlags(1 << 1);
 
     /// Whether every flag of `flags` is among these.
-    pub(crate) const fn contains(self, flags: AddFlags) -> bool {
+    pub const fn contains(self, flags: AddFlags) -> bool {
         self.0 & flags.0 == flags.0
     }
 }
@@ -179,6 +197,12 @@ pub(crate) enum Add<'a> {
     /// The directory a descriptor of a caller refers to, as the root, and
     /// everything below it.
     Tree { top: BorrowedFd<'a>, flags: AddFlags },
+    /// The root as a caller describes it: its inode attributes and the
+    /// identity of its file system.
+    Root {
+        inode: &'a InodeAttributes,
+        file_system: &'a FileSystemIdentity,
+    },
     /// A file object a caller made.
     Object(&'a FileObject),
 }
@@ -337,6 +361,8 @@ enum Next<'a> {
     Read(Box<Reading<'a>>),
     /// Takes the next entry of the directory the walk lists.
     List,
+    /// Hands the root as a caller describes it to the listing.
+    GivenRoot(&'a InodeAttributes, &'a FileSystemIdentity),
     /// Hands a file object of a caller to the listing.
     Given(&'a FileObject),
     /// Nothing, the add is done.
@@ -421,6 +447,11 @@ impl Walker {
                 next: Next::Start(top),
                 walk: None,
             },
+            Add::Root { inode, file_system } => Task {
+                flags: AddFlags::NONE,
+                next: Next::GivenRoot(inode, file_system),
+                walk: None,
+            },
             Add::Object(object) => Task {
                 flags: AddFlags::NONE,
                 next: Next::Given(object),
@@ -489,6 +520,15 @@ impl Walker {
             }
             Next::Read(reading) => self.read(task, reading, left)?,
             Next::List => self.list(task, left)?,
+            Next::GivenRoot(inode, file_system) if !self.listing.make_room(*left)? => {
+                *left = 0;
+                Next::GivenRoot(inode, file_system)
+            }
+            Next::GivenRoot(inode, file_system) => {
+                *left -= TURN;
+                self.listing.add_given_root(inode, file_system)?;
+                Next::Done
+            }
             Next::Given(object) if !self.listing.make_room(*left)? => {
                 *left = 0;
                 Next::Given(object)
@@ -2192,8 +2232,9 @@ mod tests {
 
     /// A file object of a caller goes into the manifest next to the files of
     /// a tree. Its add waits while the listing makes room for it, a step at
-    /// a time, and hands it over once there is room. So does the walk of a
-    /// tree with what it read.
+    /// a time, and hands it over once there is room. So does the add of
+    /// the root as a caller describes it, and so does the walk of a tree
+    /// with what it read.
     #[test]
     fn file_objects_of_a_caller() {
         let (tmp, _socket, mut names) = every_type("walk-given");
@@ -2209,11 +2250,17 @@ mod tests {
         assert_eq!(whole.objects.len(), names.len());
         // Objects the listing has to make room for. The add of the first
         // one that waits is given up for the walk of a tree, which waits
-        // with the root it read as well.
+        // with the root it read and is given up for the add of a root,
+        // which finds the listing without room as well.
         let top = open_path(dir);
         let objects = large_objects();
+        let inode = InodeAttributes {
+            mode: Some(Mode::new(0o750).unwrap()),
+            ..InodeAttributes::default()
+        };
+        let file_system = FileSystemIdentity::default();
         let mut build = Build::new(Features::DEFAULT);
-        let mut waited = 0;
+        let (mut waited, mut root_waited) = (0, 0);
         for object in &objects {
             let mut task = Walker::begin(Add::Object(object));
             if build.walker.step(&mut task, 1).unwrap().is_continue() {
@@ -2227,11 +2274,20 @@ mod tests {
                     assert!(matches!(walk.next, Next::Read(_)));
                 }
                 drop(walk);
+                let mut root = Walker::begin(Add::Root {
+                    inode: &inode,
+                    file_system: &file_system,
+                });
+                while build.walker.step(&mut root, 1).unwrap().is_continue() {
+                    assert!(matches!(root.next, Next::GivenRoot(..)));
+                    root_waited += 1;
+                }
                 build.run(Add::Object(object)).unwrap();
             }
         }
-        assert!(waited > 0);
+        assert!(waited > 0 && root_waited > 0);
         let (whole, _, _) = build.finish().unwrap();
+        assert_eq!(whole.root.inode().mode(), inode.mode);
         let listed: Vec<&str> = objects.iter().map(|object| object.name().as_str()).collect();
         assert_eq!(self::names(&whole)[1..], listed);
     }
@@ -2261,11 +2317,18 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::Manifest(crate::Problem::FieldOutOfRange));
         all(&mut build);
         assert_eq!(build.finish().unwrap().0, whole);
-        // Nothing is left to do of the add of a file object that was
-        // refused either: every later step of it does nothing and breaks,
-        // whatever its budget.
+        // Nothing is left to do of the add of a file object or of a root
+        // that was refused either: every later step of it does nothing and
+        // breaks, whatever its budget.
         let mut build = Build::new(Features::DEFAULT);
-        let refused_adds = [Add::Object(&refused)];
+        let file_system = FileSystemIdentity::default();
+        let refused_adds = [
+            Add::Object(&refused),
+            Add::Root {
+                inode: &refused.inode,
+                file_system: &file_system,
+            },
+        ];
         for add in refused_adds {
             let mut task = Walker::begin(add);
             let e = build.walker.step(&mut task, STEP_BUDGET).unwrap_err();

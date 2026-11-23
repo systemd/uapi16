@@ -99,6 +99,22 @@ fn damaged() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "a scratch file of the sort was changed")
 }
 
+impl RootObject {
+    /// The root file object of the manifest of a listing: that of a root
+    /// with the inode attributes `inode` in the file system `file_system`,
+    /// in a manifest that records `features` in the order `order`.
+    fn listed(inode: InodeAttributes, file_system: FileSystemIdentity, features: Features, order: Order) -> RootObject {
+        RootObject {
+            inode,
+            file_system,
+            gpt_disk_uuid: None,
+            order: Some(order),
+            features: Some(features),
+            validity: ValidityWindow::default(),
+        }
+    }
+}
+
 impl Order {
     /// Writes the key a file object with the name `name` is sorted by into
     /// `key`: the keys are in the order of their bytes where the names are
@@ -392,6 +408,27 @@ impl Listing {
         self.push(Name::ROOT)
     }
 
+    /// Adds the root as a caller describes it: `inode` are its inode
+    /// attributes and `file_system` is the identity of its file system.
+    ///
+    /// The root is checked as a writer checks the root file object it
+    /// begins a manifest with, see [`RootObject::check_alone`], and one
+    /// that is refused is not added. The body of its record is put together
+    /// first, as for a file object of a caller, see
+    /// [`Listing::add_given`].
+    pub(crate) fn add_given_root(
+        &mut self,
+        inode: &InodeAttributes,
+        file_system: &FileSystemIdentity,
+    ) -> Result<(), Error> {
+        self.fill(Name::ROOT, ROOT, |record| {
+            inode.to_record(record);
+            file_system.to_record(record);
+        })?;
+        RootObject::listed(inode.clone(), file_system.clone(), self.features, self.order).check_alone()?;
+        self.push(Name::ROOT)
+    }
+
     /// Adds a file of a tree that is not its root: `object` is its file
     /// object, without an `inodeToken`, `status` what statx() said of it,
     /// and `data` the hash of its data, if it was hashed.
@@ -651,14 +688,7 @@ impl Writing {
         file_system: FileSystemIdentity,
         text: &mut String,
     ) -> Result<&mut Encoder, Error> {
-        let root = RootObject {
-            inode,
-            file_system,
-            gpt_disk_uuid: None,
-            order: Some(self.order),
-            features: Some(self.features),
-            validity: ValidityWindow::default(),
-        };
+        let root = RootObject::listed(inode, file_system, self.features, self.order);
         let encoder = Encoder::begin(&root, text)?;
         self.totals.directories += 1;
         Ok(self.encoder.insert(encoder))
@@ -759,6 +789,17 @@ impl Writing {
             self.totals.bytes = self.totals.bytes.saturating_add(size.unwrap_or_default());
         }
         self.put(*object, text)
+    }
+
+    /// Gives the scratch files of the manifest back to the scratch space,
+    /// which empties them: those of the table of the hard links and that
+    /// of the sort. They are closed with this then. Whoever writes the
+    /// manifest calls this once it is written or failed, and so does
+    /// whoever gives up a manifest that is not written. A Writing that is
+    /// dropped closes the files as they are.
+    pub(crate) fn give_back(mut self) {
+        self.links.give_back(&mut self.scratch);
+        self.merge.give_back(&mut self.scratch);
     }
 }
 

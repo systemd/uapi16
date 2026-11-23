@@ -1388,6 +1388,26 @@ impl HardlinkTable {
         self.tokens = next.get();
         Ok(next)
     }
+
+    /// Gives the table up, with every scratch file it has: those of its
+    /// pages and of its names, and those of a move to disk or of a doubling
+    /// that is not finished. They go back to `scratch`, which empties them.
+    /// Whoever has the table calls this where the manifest is written or
+    /// given up. A table that is dropped leaves its files as they are.
+    pub(crate) fn give_back(self, scratch: &mut Scratch) {
+        match self.growth {
+            Growth::None => {}
+            Growth::Moving { pages, names, .. } => {
+                scratch.take_back(names);
+                scratch.take_back(pages);
+            }
+            Growth::Doubling { old, .. } => old.give_back(scratch),
+        }
+        self.store.give_back(scratch);
+        if let Names::Disk { file, .. } = self.names {
+            scratch.take_back(file);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2793,6 +2813,44 @@ mod tests {
         for index in 0..GROUPS {
             let again = table.note(&mut scratch, &walked(index), &name("again"), &likeness);
             assert_eq!(again.unwrap(), Noted::Again, "{}", index);
+        }
+    }
+
+    /// A table that is given up gives every scratch file it has back, also
+    /// those of a move to disk and of a doubling there that are under way:
+    /// each is empty then, and the scratch space hands it out again before
+    /// it makes a new one.
+    #[test]
+    fn gives_its_files_back() {
+        let likeness = likeness(1, b"1");
+        // A move has the file of the pages and that of the names, and a
+        // doubling on disk those of the old pages, of the new ones and of
+        // the names.
+        for (doubling, files) in [(false, 2), (true, 3)] {
+            let (tmp, mut scratch) = scratch("hardlink-given-back");
+            let mut table = small();
+            let under_way = |table: &HardlinkTable| match &table.growth {
+                Growth::None => false,
+                Growth::Moving { .. } => !doubling,
+                Growth::Doubling { old, .. } => doubling && matches!(old, Store::Disk(_)),
+            };
+            // Names until the step that makes room for the next one
+            // begins the one or the other and does not finish it.
+            let mut count = 0;
+            while !under_way(&table) {
+                if table.make_room(&mut scratch, 1).unwrap() {
+                    table.note(&mut scratch, &walked(count), &name("n"), &likeness).unwrap();
+                    count += 1;
+                }
+            }
+            let open = OpenFile::made_in(&tmp.0);
+            assert_eq!(open.len(), files, "{:?}", open);
+            assert!(open.iter().any(|file| file.size > 0), "{:?}", open);
+            table.give_back(&mut scratch);
+            let _handed_out: Vec<ScratchFile> = (0..files).map(|_| scratch.file().unwrap()).collect();
+            let open = OpenFile::made_in(&tmp.0);
+            assert_eq!(open.len(), files, "{:?}", open);
+            assert!(open.iter().all(|file| file.size == 0), "{:?}", open);
         }
     }
 

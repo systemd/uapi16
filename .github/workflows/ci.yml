@@ -266,6 +266,12 @@ jobs:
           mkdir "$UAPI16_TEST_FAT_DIR/tmp"
           TMPDIR=$UAPI16_TEST_FAT_DIR/tmp cargo test --locked --lib -- --exact sort::tests::gives_room_back
 
+      - name: Build a manifest on FAT
+        # The manifest and its scratch files on FAT: the scratch files get
+        # names they lose right away, and the manifest gets its name with
+        # RENAME_NOREPLACE.
+        run: TMPDIR=$UAPI16_TEST_FAT_DIR/tmp cargo test --locked --lib -- --exact manifest::tests::on_fat
+
   clippy:
     name: clippy (rustc ${{ matrix.rust }})
     runs-on: ubuntu-26.04

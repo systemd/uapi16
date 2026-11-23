@@ -317,6 +317,16 @@ pub(crate) enum Failure {
 }
 
 impl Failure {
+    /// The error of a failure that is about no file of the manifest, such
+    /// as a failure of statx() of a descriptor a caller gave. Only a system
+    /// call or a kernel that is too old fail so.
+    pub(crate) fn into_unnamed_error(self) -> Error {
+        match self {
+            Failure::Io(e) => Error::from(e),
+            failure => failure.into_error(Name::ROOT),
+        }
+    }
+
     /// The error of the file `name`, which failed so. The error that the
     /// kernel is too old is about no file.
     pub(crate) fn into_error(self, name: &Name) -> Error {
