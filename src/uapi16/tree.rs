@@ -342,7 +342,7 @@ impl From<io::Error> for Failure {
 
 /// A file of a tree as a message names it: by its name in the manifest,
 /// and the root of the tree, which has none, as what it is.
-struct Subject<'a>(&'a Name);
+pub(crate) struct Subject<'a>(pub(crate) &'a Name);
 
 impl fmt::Display for Subject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

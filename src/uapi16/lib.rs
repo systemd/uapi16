@@ -96,6 +96,8 @@ mod digest;
 mod directory;
 mod error;
 mod features;
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod hardlink;
 mod hex;
 // The ioctls rustix has no call for and the lookups in the user database
 // are the only unsafe code of the crate but for the one cast of the module
@@ -122,7 +124,6 @@ mod sequence;
 mod strict;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod sys;
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod tree;
 mod writer;
 

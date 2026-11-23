@@ -8,7 +8,7 @@ use std::io;
 use crate::decode::Subject;
 use crate::object::FileObject;
 use crate::strict::{ParseError, ParseErrorKind};
-use crate::{Features, NameProblem, MAX_CONTENTS, MAX_RECORD_SIZE};
+use crate::{Features, NameBuf, NameProblem, MAX_CONTENTS, MAX_RECORD_SIZE};
 
 /// What is wrong with a manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -579,6 +579,13 @@ impl Error {
     #[must_use]
     pub(crate) fn named(mut self, name: impl Into<String>) -> Error {
         self.0.name = Some(name.into());
+        self
+    }
+
+    /// Names the other name of the inode the error is about.
+    #[must_use]
+    pub(crate) fn linked(mut self, name: NameBuf) -> Error {
+        self.0.hardlink_name = Some(name.into());
         self
     }
 
