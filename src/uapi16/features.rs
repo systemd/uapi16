@@ -24,9 +24,9 @@ use std::str::FromStr;
 /// without the field has that flag cleared. Where the list doesn't name the
 /// feature, nothing is known about these properties.
 ///
-/// A manifest that does not list its features records
-/// [`Features::DEFAULT`], what `systemd-manifest make` records unless it
-/// is told otherwise.
+/// A manifest that does not list `features` records [`Features::DEFAULT`],
+/// the features the specification gives such a manifest: `device`, `gid`,
+/// `hardlink`, `mode`, `sha256`, `size`, `symlink` and `uid`.
 ///
 /// ```
 /// use uapi16::Features;
