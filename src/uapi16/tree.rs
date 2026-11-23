@@ -50,6 +50,17 @@ pub(crate) struct Identity {
     pub(crate) subvolume: Option<u64>,
 }
 
+impl Identity {
+    /// The inode, whatever mount it was reached through.
+    pub(crate) fn inode_id(&self) -> InodeId {
+        InodeId {
+            device: self.device,
+            inode: self.inode,
+            subvolume: self.subvolume,
+        }
+    }
+}
+
 /// Which inode a file is, whatever mount it was reached through: the
 /// device, the inode number and the subvolume of an [`Identity`], without
 /// its mount.
@@ -109,6 +120,21 @@ impl Status {
     pub(crate) fn changed_since(&self, before: &Status) -> bool {
         (self.identity, self.size, self.mtime, self.ctime, self.nlink)
             != (before.identity, before.size, before.mtime, before.ctime, before.nlink)
+    }
+
+    /// Whether this status, of a file that has the inode of the file `own`
+    /// is the status of, is of that file as well. A file system can give
+    /// two files one inode, see [`OwnFiles`](crate::sys::OwnFiles). They
+    /// are one file if the type, the mode, the owner, the group, the number
+    /// of names, the size, the modification time and the change time are
+    /// the same, and the birth time where both statuses have one.
+    pub(crate) fn matches(&self, own: &Status) -> bool {
+        let born = match (self.btime, own.btime) {
+            (Some(found), Some(own)) => found == own,
+            _ => true,
+        };
+        let held = |s: &Status| (s.file_type, s.mode, s.uid, s.gid, s.nlink, s.size, s.mtime, s.ctime);
+        born && held(self) == held(own)
     }
 
     /// What `read`, the read of the data of the file of this status, comes
@@ -386,6 +412,53 @@ mod tests {
             change(&mut later);
             assert_eq!(later.changed_since(&before), shows, "{}", what);
         }
+    }
+
+    /// Two statuses with one inode are of one file where the type, the
+    /// mode, the owner, the group, the number of names, the size, the
+    /// modification time and the change time are the same, to the
+    /// nanosecond, and the birth time where both have one. The mount a file
+    /// was reached through and the device a device node stands for say
+    /// nothing of that.
+    #[test]
+    fn what_tells_files_with_one_inode_apart() {
+        let own = status();
+        assert!(own.matches(&own));
+        type Change = fn(&mut Status);
+        let changes: [(&str, Change, bool); 14] = [
+            ("type", |s| s.file_type = FileType::Fifo, false),
+            ("mode", |s| s.mode = Mode::from_st_mode(0o645), false),
+            ("uid", |s| s.uid ^= 1, false),
+            ("gid", |s| s.gid ^= 1, false),
+            ("nlink", |s| s.nlink ^= 1, false),
+            ("size", |s| s.size ^= 1, false),
+            ("mtime", |s| s.mtime.nanoseconds ^= 1, false),
+            ("mtime, its seconds", |s| s.mtime.seconds ^= 1, false),
+            ("ctime", |s| s.ctime.nanoseconds ^= 1, false),
+            ("ctime, its seconds", |s| s.ctime.seconds ^= 1, false),
+            (
+                "btime",
+                |s| {
+                    s.btime = Some(Timestamp {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    })
+                },
+                false,
+            ),
+            ("no btime", |s| s.btime = None, true),
+            ("mount", |s| s.identity.mount = MountId::Reusable(1), true),
+            ("rdev", |s| s.rdev.major ^= 1, true),
+        ];
+        for (what, change, one_file) in changes {
+            let mut found = own;
+            change(&mut found);
+            assert_eq!(found.matches(&own), one_file, "{}", what);
+            assert_eq!(own.matches(&found), one_file, "{}", what);
+        }
+        let mut neither = own;
+        neither.btime = None;
+        assert!(neither.matches(&neither));
     }
 
     /// A read and the status after it come to the hash when both went

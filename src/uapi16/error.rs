@@ -625,6 +625,17 @@ impl Error {
         self
     }
 
+    /// The I/O error `error`, which `about` says what it was about, as an
+    /// I/O error of its kind for code that hands I/O errors on. Where it
+    /// becomes an error of this crate, it is one of the kind Io that says
+    /// both, "about: error", and whose cause is `error`, so that the errno
+    /// of the system call stays.
+    pub(crate) fn io_about(about: String, error: io::Error) -> io::Error {
+        let kind = error.kind();
+        let message = format!("{}: {}", about, error);
+        io::Error::new(kind, IoAbout(Error::new(ErrorKind::Io, message).caused_by(error)))
+    }
+
     /// A record that is not JSON, that has a key twice in an object, or
     /// that has a string the specification does not permit.
     pub(crate) fn not_json(record_number: u64, error: ParseError) -> Error {
@@ -844,7 +855,7 @@ impl fmt::Display for Error {
         match (&self.0.kind, &self.0.cause) {
             // An I/O error shows as its cause, but for one that says what
             // it was about, such as one of a Writer after a write that
-            // failed or one of a file of a tree.
+            // failed, one of a file of a tree or one of Error::io_about().
             (ErrorKind::Io, Some(Cause::Io(e))) if self.0.message.is_empty() => e.fmt(f),
             _ => f.write_str(&self.0.message),
         }
@@ -863,7 +874,30 @@ impl std::error::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
-        Error::new(ErrorKind::Io, String::new()).caused_by(e)
+        // An error of this crate that says what an I/O error was about,
+        // which the I/O error carried on its way up, see Error::io_about(),
+        // is that error again.
+        match e.downcast::<IoAbout>() {
+            Ok(about) => about.0,
+            Err(e) => Error::new(ErrorKind::Io, String::new()).caused_by(e),
+        }
+    }
+}
+
+/// An error of the kind Io that says what it was about, which an I/O error
+/// carries on its way up, see [`Error::io_about`].
+#[derive(Debug)]
+struct IoAbout(Error);
+
+impl fmt::Display for IoAbout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for IoAbout {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.0)
     }
 }
 
@@ -906,6 +940,23 @@ mod tests {
         let inner = io.get_ref().and_then(|e| e.downcast_ref::<Error>()).unwrap();
         assert_eq!(inner.kind(), ErrorKind::Manifest(Problem::NoTrailer));
         assert_eq!(io.to_string(), "incomplete");
+    }
+
+    /// An I/O error that says what it was about is an I/O error of its kind
+    /// on the way up, and an error of the kind Io here that says both, with
+    /// the I/O error as its cause. As an I/O error again it is that of the
+    /// system call.
+    #[test]
+    fn io_errors_that_say_what_they_were_about() {
+        let enoent = || io::Error::from_raw_os_error(libc::ENOENT);
+        let io = Error::io_about("the directory".to_string(), enoent());
+        assert_eq!(io.kind(), io::ErrorKind::NotFound);
+        let e = Error::from(io);
+        assert_eq!(e.kind(), ErrorKind::Io);
+        assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOENT));
+        assert_eq!(e.to_string(), format!("the directory: {}", enoent()));
+        assert!(std::error::Error::source(&e).is_some());
+        assert_eq!(io::Error::from(e).raw_os_error(), Some(libc::ENOENT));
     }
 
     /// An error can be sent to another thread, shared between threads and

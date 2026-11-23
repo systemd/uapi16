@@ -116,6 +116,8 @@ mod object;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod optional;
 mod reader;
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod scratch;
 mod sequence;
 mod strict;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
@@ -181,11 +183,16 @@ pub(crate) mod testing {
         Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
+    use crate::tree::{InodeId, Status};
+    use rustix::fs::OFlags;
     use serde_core::de::DeserializeSeed;
     use std::collections::BTreeMap;
     use std::fs;
     use std::num::NonZeroU64;
-    use std::path::PathBuf;
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Mutex, PoisonError};
 
     /// Whether the kernel has O_EMPTYPATH, asked of the kernel itself. What
     /// the process found out about it is no answer while tests run: those
@@ -205,7 +212,14 @@ pub(crate) mod testing {
     /// everything in it when the test ends.
     pub(crate) struct TempDir(pub(crate) PathBuf);
 
+    /// The unit `st_blocks` counts the room of a file in, in bytes.
+    pub(crate) const ST_BLOCKS_UNIT: u64 = 512;
+
     impl TempDir {
+        /// What the script of [`TempDir::rerun_on`] exits with where it
+        /// cannot mount the file system.
+        const NOT_MOUNTED: i32 = 77;
+
         pub(crate) fn new(name: &str) -> TempDir {
             let path = std::env::temp_dir().join(format!("uapi16-{}-{}", name, std::process::id()));
             // What a test of the same name in a process of the same number
@@ -214,11 +228,98 @@ pub(crate) mod testing {
             fs::create_dir(&path).unwrap();
             TempDir(path)
         }
+
+        /// Runs the test `test` of the test binary again in a process for
+        /// which a file system of the type `file_system` is mounted over
+        /// this directory, with the mount options `options` if there are
+        /// any, and with the directory as the value of the variable
+        /// `variable`.
+        ///
+        /// The mount takes a user and a mount namespace, which unshare(1)
+        /// makes. Where it cannot, or where the file system can't be
+        /// mounted in them, the test is skipped.
+        pub(crate) fn rerun_on(&self, file_system: &str, options: Option<&str>, test: &str, variable: &str) {
+            let works = Command::new("unshare").args(["-Urm", "true"]).output();
+            if !works.is_ok_and(|output| output.status.success()) {
+                eprintln!("skipping: unshare -Urm does not work here");
+                return;
+            }
+            // What is mounted has the name of its type, as for every file
+            // system without a device, and -o is there only with options.
+            let script = format!(
+                r#"mount -t "$1" ${{2:+-o "$2"}} "$1" "$3" || exit {}; exec "$4" --exact "$5" --nocapture"#,
+                TempDir::NOT_MOUNTED
+            );
+            let output = Command::new("unshare")
+                .args(["-Urm", "sh", "-c", &script, "sh", file_system])
+                .arg(options.unwrap_or_default())
+                .arg(&self.0)
+                .arg(std::env::current_exe().unwrap())
+                .arg(test)
+                .env(variable, &self.0)
+                .output()
+                .unwrap();
+            if output.status.code() == Some(TempDir::NOT_MOUNTED) {
+                eprintln!("skipping: no {} can be mounted here", file_system);
+                return;
+            }
+            // A test binary that runs no test succeeds as well.
+            let ran = String::from_utf8_lossy(&output.stdout).contains("1 passed");
+            assert!(output.status.success() && ran, "{:?}", output);
+        }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file this process has open: its status, as a walk finds it, with
+    /// the inode and the size the status has.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct OpenFile {
+        pub(crate) inode: InodeId,
+        pub(crate) size: u64,
+        pub(crate) status: Status,
+    }
+
+    impl OpenFile {
+        /// The files this process has open that were made in the directory
+        /// `dir`, which are the scratch files made there where a test opens
+        /// nothing else in it. procfs says of every descriptor where its
+        /// file was made.
+        ///
+        /// Looking takes a handle of every file the process has open, for
+        /// a moment. So one test looks at a time: another one would take
+        /// such a handle for one more descriptor of a file of its own.
+        pub(crate) fn made_in(dir: &Path) -> Vec<OpenFile> {
+            static LOOKING: Mutex<()> = Mutex::new(());
+            let _looking = LOOKING.lock().unwrap_or_else(PoisonError::into_inner);
+            let dir = fs::canonicalize(dir).unwrap();
+            let flags = OFlags::PATH | OFlags::CLOEXEC;
+            let mut files = Vec::new();
+            for entry in fs::read_dir("/proc/self/fd").unwrap() {
+                // Other tests close their descriptors meanwhile. A handle
+                // of the file stays the file it is while it is looked at.
+                let Ok(handle) = rustix::fs::open(entry.unwrap().path(), flags, rustix::fs::Mode::empty()) else {
+                    continue;
+                };
+                // Another test can have a file open that is so deep in a
+                // tree that procfs cannot say where: that is none of these.
+                let Ok(made_at) = fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())) else {
+                    continue;
+                };
+                if made_at.parent() == Some(dir.as_path()) {
+                    let status = Status::of(handle.as_fd()).unwrap();
+                    files.push(OpenFile {
+                        inode: status.identity.inode_id(),
+                        size: status.size,
+                        status,
+                    });
+                }
+            }
+            files
         }
     }
 

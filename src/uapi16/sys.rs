@@ -33,19 +33,25 @@
 //! They are called from here and handed on from here, so that this module
 //! stays the one place that talks to the host.
 
-use std::collections::BTreeMap;
-use std::ffi::CStr;
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{CStr, CString};
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::io;
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::str;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use pathrs::error::{Error as PathrsError, ErrorKind as PathrsErrorKind};
 use pathrs::flags::OpenFlags;
 use pathrs::HandleRef;
-use rustix::fs::{AtFlags, FileType, FsWord, IFlags, OFlags, Statx, StatxAttributes, StatxFlags, StatxTimestamp, CWD};
+use rustix::fs::{
+    AtFlags, FallocateFlags, FileType, FsWord, IFlags, OFlags, Statx, StatxAttributes, StatxFlags, StatxTimestamp, CWD,
+};
 use rustix::io::{retry_on_intr, Errno};
 use rustix::mount::OpenTreeFlags;
 
@@ -713,6 +719,323 @@ impl XattrSource<'_> {
     }
 }
 
+/// A name nobody can guess, which a file has in a directory for a while: a
+/// scratch file on a file system without O_TMPFILE until it loses it right
+/// away, and a new file until it gets its own. Nobody else has it, so only
+/// the one who made the file removes it.
+#[derive(Debug)]
+pub(crate) struct TemporaryName(CString);
+
+impl TemporaryName {
+    /// How many names that something else has are tried before giving up.
+    const ATTEMPTS: u32 = 16;
+
+    /// Makes a file in the directory `dir` with a name that starts with
+    /// `prefix` and that nothing has, opened with `flags`, which have
+    /// O_CREAT and O_EXCL, and with the access mode `mode`.
+    fn create(
+        dir: BorrowedFd<'_>,
+        prefix: &str,
+        flags: OFlags,
+        mode: rustix::fs::Mode,
+    ) -> io::Result<(OwnedFd, TemporaryName)> {
+        // The keys of a hasher of std are random, and so is what it makes
+        // of a number.
+        let random = RandomState::new();
+        let mut taken = 0;
+        for number in 0_u64.. {
+            let name = format!("{}{:016x}", prefix, random.hash_one(number));
+            let name = TemporaryName(CString::new(name).expect("a formatted name has no NUL"));
+            match rustix::fs::openat(dir, name.as_c_str(), flags, mode) {
+                Ok(file) => return Ok((file, name)),
+                Err(Errno::EXIST) => {
+                    taken += 1;
+                    if taken == TemporaryName::ATTEMPTS {
+                        break;
+                    }
+                }
+                // An open that was interrupted can have made the file
+                // before it failed, and the same open again fails with
+                // EEXIST then. So it is not made again: the name is
+                // removed, and the next one is tried. That is no name
+                // something else has, and does not count as one.
+                Err(Errno::INTR) => name.remove(dir)?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Errno::EXIST.into())
+    }
+
+    /// The name, which need not be UTF-8 for anybody else.
+    fn as_c_str(&self) -> &CStr {
+        &self.0
+    }
+
+    /// Removes the name from the directory `dir`. A removal that was
+    /// interrupted can have removed it before it failed, so one that finds
+    /// the name gone is done.
+    fn remove(&self, dir: BorrowedFd<'_>) -> rustix::io::Result<()> {
+        match retry_on_intr(|| rustix::fs::unlinkat(dir, self.as_c_str(), AtFlags::empty())) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The files a manifest that is being built made itself and has open, such
+/// as its scratch files. A walk of a tree that they are in passes over
+/// them. They are known by their inodes and not by their names: a file
+/// system can keep a file that was unlinked while it is open in its
+/// directory, under a name of its own. NFS does, and so does libfuse for a
+/// FUSE file system on its high-level interface that does not set
+/// hard_remove.
+///
+/// The inode alone does not make a file one of them. A file system can
+/// give two files the same device and the same inode number: a FUSE file
+/// system that shows the files of two file systems with the inode numbers
+/// they have there does. So each of these files is kept open with its
+/// inode, and a file a walk comes to with that inode is one of them only
+/// if its status is the status of the open file as well, see
+/// [`OwnFiles::contains`]. A file of the tree that only has the number of
+/// one of them is listed like any other. Two of these files can have one
+/// inode as well. Both are kept open with it then, and a file with that
+/// inode is one of them if its status is the status of either.
+///
+/// A scratch file is one of them from when it is made, and it stays one and
+/// stays open once whoever made it is done with it. It is closed when these
+/// files are dropped, which is not before whoever walks trees for the
+/// manifest is, see
+/// [`Scratch::own_files`](crate::scratch::Scratch::own_files). A file that
+/// was closed could not be one of them: nothing is left that a file with
+/// its inode could be held against. And a file system that keeps an
+/// unlinked file under a name removes that name some time after the file
+/// was closed, without anybody waiting for it, as FUSE and NFS do. A walk
+/// that comes to the name in between would list a file of the manifest's
+/// own, or fail because the file is gone when it is opened. So a scratch
+/// file that is given back is only emptied, which gives its room back. It
+/// takes a descriptor and nothing else until it is handed out again, which
+/// it is before a new file is made, see
+/// [`Scratch::file`](crate::scratch::Scratch::file).
+#[derive(Debug, Default)]
+pub(crate) struct OwnFiles {
+    /// The files by their inodes, each of them open. An inode has every
+    /// file that was kept with it, in the order they were kept: one file,
+    /// and more where the file system gave its inode to another one of the
+    /// files as well. No file is ever taken out of them, so each of them is
+    /// open for as long as this is there.
+    open: HashMap<InodeId, Vec<Arc<File>>>,
+    /// The scratch files among them that were given back and emptied, and
+    /// that were not handed out since.
+    given_back: Vec<Arc<File>>,
+}
+
+impl OwnFiles {
+    /// Takes the scratch file `file`, which has the inode `inode`, as one
+    /// of the files, and keeps it open for as long as they are there. A
+    /// file that was kept with that inode before stays one of them, and
+    /// open, next to it.
+    fn keep(&mut self, inode: InodeId, file: Arc<File>) {
+        self.open.entry(inode).or_default().push(file);
+    }
+
+    /// Whether the file with the status `found`, which a walk came to, is
+    /// one of the files: it has the inode of one of them, and its status
+    /// is the one that file has now, see [`Status::matches`]. Where several
+    /// of the files have that inode, it is held against one after the
+    /// other, until its status is that of one of them. That takes one
+    /// statx() of each open file it is held against: at most as many as
+    /// have that inode, and none where no file has it. Where the status of
+    /// one of them can't be read, this fails.
+    pub(crate) fn contains(&self, found: &Status) -> Result<bool, Failure> {
+        let own = self.open.get(&found.identity.inode_id());
+        for file in own.into_iter().flatten() {
+            if found.matches(&Status::of(file.as_fd())?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Takes back the scratch file `file`, one of the files, which whoever
+    /// had it is done with. It is emptied, which gives its room back, and
+    /// it is handed out again where another one is needed. A file that
+    /// cannot be emptied is kept as it is, and its room with it, until it
+    /// is closed. It is never handed out again.
+    pub(crate) fn take_back(&mut self, file: ScratchFile) {
+        if file.set_len(0).is_ok() {
+            self.given_back.push(file.file);
+        }
+    }
+
+    /// A scratch file that was given back and emptied, if there is one that
+    /// was not handed out since. It is one of the files as it was, with the
+    /// inode it had.
+    pub(crate) fn hand_out(&mut self) -> Option<ScratchFile> {
+        let file = self.given_back.pop()?;
+        Some(ScratchFile { file })
+    }
+}
+
+/// A file without a name, which the builder keeps in what it cannot keep
+/// in memory. It is read and written at the offsets the caller gives, and
+/// it is gone once it is closed, also when the process dies. It is one of
+/// the files of its builder, which keep it open: one that is given back to
+/// them is emptied and handed out again where another one is needed, see
+/// [`OwnFiles::take_back`], and one that is dropped stays as it is. Both
+/// are closed with them.
+#[derive(Debug)]
+pub(crate) struct ScratchFile {
+    /// The file, which the files of its builder have as well.
+    file: Arc<File>,
+}
+
+impl ScratchFile {
+    /// How a directory is opened that scratch files are made in: as a
+    /// handle, for a directory and nothing else.
+    const DIRECTORY_FLAGS: OFlags = OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
+    /// How a file without a name is made: with O_TMPFILE, for reading and
+    /// writing, and with O_EXCL, which for such a file says that it never
+    /// gets a name.
+    const UNNAMED_FLAGS: OFlags = OFlags::TMPFILE
+        .union(OFlags::RDWR)
+        .union(OFlags::EXCL)
+        .union(OFlags::CLOEXEC);
+    /// How a file is made that loses its name right away: only if nothing
+    /// has that name, a symbolic link included.
+    const NAMED_FLAGS: OFlags = OFlags::CREATE
+        .union(OFlags::EXCL)
+        .union(OFlags::RDWR)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    /// Only the owner reads and writes a scratch file.
+    const MODE: rustix::fs::Mode = rustix::fs::Mode::RUSR.union(rustix::fs::Mode::WUSR);
+    /// The name a directory has in itself, which a file without a name is
+    /// made in.
+    const ITSELF: &'static CStr = c".";
+    /// What the name of a file that loses its name right away starts with.
+    const NAME_PREFIX: &'static str = ".uapi16-";
+    /// How the room of a part of a file is given back: as a hole, which
+    /// leaves the file as long as it is. fallocate() takes
+    /// FALLOC_FL_PUNCH_HOLE only together with FALLOC_FL_KEEP_SIZE.
+    const PUNCH_FLAGS: FallocateFlags = FallocateFlags::PUNCH_HOLE.union(FallocateFlags::KEEP_SIZE);
+
+    /// Opens the directory `path` as one that scratch files are made in.
+    pub(crate) fn open_directory(path: &Path) -> io::Result<OwnedFd> {
+        Ok(retry_on_intr(|| {
+            rustix::fs::open(path, ScratchFile::DIRECTORY_FLAGS, rustix::fs::Mode::empty())
+        })?)
+    }
+
+    /// Makes a file without a name in the file system of the directory
+    /// `dir`, which is one of the files `own`. Where the file system cannot
+    /// make one, the file is made with a name that nothing has and loses it
+    /// at once, as for systemd's open_tmpfile_unlinkable(): the file system
+    /// says EOPNOTSUPP then, and a kernel that does not know O_TMPFILE tries
+    /// to open the directory for writing and says EISDIR.
+    pub(crate) fn create_in(dir: BorrowedFd<'_>, own: &mut OwnFiles) -> io::Result<ScratchFile> {
+        match ScratchFile::create_unnamed(dir, own) {
+            Ok(file) => Ok(file),
+            Err(Errno::OPNOTSUPP | Errno::ISDIR) => ScratchFile::create_and_unlink(dir, own),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Makes a file without a name with O_TMPFILE.
+    fn create_unnamed(dir: BorrowedFd<'_>, own: &mut OwnFiles) -> rustix::io::Result<ScratchFile> {
+        let file = retry_on_intr(|| {
+            rustix::fs::openat(dir, ScratchFile::ITSELF, ScratchFile::UNNAMED_FLAGS, ScratchFile::MODE)
+        })?;
+        ScratchFile::new(file, own)
+    }
+
+    /// Makes a file with a name nobody can guess and removes the name.
+    fn create_and_unlink(dir: BorrowedFd<'_>, own: &mut OwnFiles) -> io::Result<ScratchFile> {
+        let (file, name) = TemporaryName::create(
+            dir,
+            ScratchFile::NAME_PREFIX,
+            ScratchFile::NAMED_FLAGS,
+            ScratchFile::MODE,
+        )?;
+        name.remove(dir)?;
+        Ok(ScratchFile::new(file, own)?)
+    }
+
+    /// The scratch file `file`, which was just made, as one of the files
+    /// `own`.
+    fn new(file: OwnedFd, own: &mut OwnFiles) -> rustix::io::Result<ScratchFile> {
+        let inode = InodeId::of(file.as_fd())?;
+        let file = Arc::new(File::from(file));
+        own.keep(inode, Arc::clone(&file));
+        Ok(ScratchFile { file })
+    }
+
+    /// Makes the file `len` bytes long. What it gains reads as zeroes and
+    /// takes no room until it is written.
+    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+        Ok(retry_on_intr(|| rustix::fs::ftruncate(&self.file, len))?)
+    }
+
+    /// The size of a block of the file in bytes, as statx() reports it: the
+    /// block size of the file system, or several blocks where the file
+    /// system does its I/O in more than one.
+    pub(crate) fn block_size(&self) -> io::Result<u64> {
+        let statx = retry_on_intr(|| rustix::fs::statx(&self.file, c"", Status::OF_DESCRIPTOR, StatxFlags::empty()))?;
+        Ok(u64::from(statx.stx_blksize))
+    }
+
+    /// Gives the room of the `len` bytes of the file at `offset` back to
+    /// the file system, as a hole: the bytes read as zeroes from then on,
+    /// and the file stays as long as it is. `len` is not 0.
+    ///
+    /// A file system gives back whole blocks. What the range has of a
+    /// block that is not all in it is only written over with zeroes, so a
+    /// caller that wants room back asks for whole blocks, see
+    /// [`ScratchFile::block_size`].
+    ///
+    /// Not every file system can punch holes. One that cannot fails with
+    /// EOPNOTSUPP and leaves the file as it was.
+    pub(crate) fn punch_hole(&self, offset: u64, len: u64) -> io::Result<()> {
+        Ok(retry_on_intr(|| {
+            rustix::fs::fallocate(&self.file, ScratchFile::PUNCH_FLAGS, offset, len)
+        })?)
+    }
+
+    /// Fills `buffer` with what the file has at `offset`. A file that ends
+    /// before the buffer is full fails: nothing that was written is ever
+    /// that short.
+    pub(crate) fn read_exact_at(&self, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buffer.is_empty() {
+            match rustix::io::pread(&self.file, &mut *buffer, offset) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(read) => {
+                    let rest = buffer;
+                    buffer = &mut rest[read..];
+                    offset += read as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes all of `data` into the file at `offset`.
+    pub(crate) fn write_all_at(&self, mut data: &[u8], mut offset: u64) -> io::Result<()> {
+        while !data.is_empty() {
+            match rustix::io::pwrite(&self.file, data, offset) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => {
+                    data = &data[written..];
+                    offset += written as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The hash of the data of a regular file, read a part at a time, so that
 /// a large file takes several steps: the file, opened again through the
 /// handle of its entry, its status when the entry was opened, the hash of
@@ -834,8 +1157,8 @@ impl From<Errno> for Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TempDir;
-    use rustix::fs::{inotify, CWD};
+    use crate::testing::{OpenFile, TempDir, ST_BLOCKS_UNIT};
+    use rustix::fs::{inotify, MemfdFlags, SealFlags, CWD};
     use rustix::io::FdFlags;
     use std::fmt;
     use std::fs::{self, OpenOptions};
@@ -1732,6 +2055,440 @@ mod tests {
         assert_eq!(errno(DataHash::of(&directory, opened)), libc::EINVAL);
     }
 
+    /// The names of the entries of the directory `dir`.
+    fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    }
+
+    /// A temporary name is one nothing has, and it is removed, also once it
+    /// is gone already, as after a removal that was interrupted after it
+    /// was done.
+    #[test]
+    fn temporary_names() {
+        let tmp = TempDir::new("sys-temporary-names");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let names = || -> Vec<Vec<u8>> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_encoded_bytes())
+                .collect()
+        };
+        let made = TemporaryName::create(directory.as_fd(), ".test-", ScratchFile::NAMED_FLAGS, ScratchFile::MODE);
+        let (_file, name) = made.unwrap();
+        assert_eq!(names(), [name.as_c_str().to_bytes()]);
+        assert!(name.as_c_str().to_bytes().starts_with(b".test-"));
+        for _ in 0..2 {
+            name.remove(directory.as_fd()).unwrap();
+            assert!(names().is_empty());
+        }
+    }
+
+    /// A scratch file has no name and can get none, only its owner reads
+    /// and writes it, and it is not inherited across exec. That holds for
+    /// one made with O_TMPFILE and for one that lost its name right away.
+    #[test]
+    fn scratch_files_have_no_name() {
+        let tmp = TempDir::new("sys-scratch");
+        let dir = &tmp.0;
+        let directory = ScratchFile::open_directory(dir).unwrap();
+        let mut own = OwnFiles::default();
+        let mut made = vec![
+            ScratchFile::create_in(directory.as_fd(), &mut own).unwrap(),
+            ScratchFile::create_and_unlink(directory.as_fd(), &mut own).unwrap(),
+        ];
+        match ScratchFile::create_unnamed(directory.as_fd(), &mut own) {
+            Ok(file) => made.push(file),
+            Err(e) => {
+                assert!(matches!(e, Errno::OPNOTSUPP | Errno::ISDIR), "{}", e);
+                eprintln!("skipping O_TMPFILE, which the temporary directory does not have");
+            }
+        }
+        for file in &made {
+            assert!(names_in(dir).is_empty());
+            let meta = file.file.metadata().unwrap();
+            assert_eq!((meta.nlink(), meta.len()), (0, 0));
+            assert_eq!(meta.permissions().mode() & 0o7777 & !0o600, 0);
+            assert!(meta.is_file());
+            assert!(rustix::io::fcntl_getfd(&file.file).unwrap().contains(FdFlags::CLOEXEC));
+            // Not through procfs either.
+            let link = format!("/proc/self/fd/{}", file.file.as_raw_fd());
+            let linked = rustix::fs::linkat(CWD, link.as_str(), &directory, "linked", AtFlags::SYMLINK_FOLLOW);
+            assert_eq!(linked, Err(Errno::NOENT));
+        }
+        // A path that is not a directory is not one scratch files go to.
+        fs::write(dir.join("file"), b"").unwrap();
+        let not_directory = ScratchFile::open_directory(&dir.join("file")).unwrap_err();
+        assert_eq!(not_directory.raw_os_error(), Some(libc::ENOTDIR));
+        let missing = ScratchFile::open_directory(&dir.join("missing")).unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// A scratch file is one of the files of its builder from when it is
+    /// made: one made with O_TMPFILE where there is one, and one that lost
+    /// its name right away. It is there by the inode and the status a walk
+    /// finds for it, and no other file is. One that is given back is
+    /// emptied, and one that is dropped keeps what it has. Both stay open
+    /// and among the files until those are dropped, which closes them.
+    #[test]
+    fn scratch_files_are_own_files() {
+        let tmp = TempDir::new("sys-scratch-own");
+        let dir = &tmp.0;
+        let directory = ScratchFile::open_directory(dir).unwrap();
+        let mut own = OwnFiles::default();
+        // What a walk finds of the file: its status, with its inode.
+        let found = |file: &File| Status::of(file.as_fd()).unwrap();
+        let first = ScratchFile::create_in(directory.as_fd(), &mut own).unwrap();
+        let second = ScratchFile::create_and_unlink(directory.as_fd(), &mut own).unwrap();
+        let one = found(&first.file).identity.inode_id();
+        let other = found(&second.file).identity.inode_id();
+        assert_ne!(one, other);
+        assert!(own.contains(&found(&first.file)).unwrap() && own.contains(&found(&second.file)).unwrap());
+        fs::write(dir.join("file"), b"").unwrap();
+        assert!(!own.contains(&found(&File::open(dir.join("file")).unwrap())).unwrap());
+        // The files of another builder are not these.
+        let mut others = OwnFiles::default();
+        let third = ScratchFile::create_in(directory.as_fd(), &mut others).unwrap();
+        assert!(others.contains(&found(&third.file)).unwrap() && !own.contains(&found(&third.file)).unwrap());
+        assert!(!others.contains(&found(&first.file)).unwrap());
+        // The files with the inodes `inodes` that this process has open
+        // among those made in the directory, the smallest first.
+        let open = |inodes: &[InodeId]| -> Vec<OpenFile> {
+            let mut files = OpenFile::made_in(dir);
+            files.retain(|file| inodes.contains(&file.inode));
+            files.sort_unstable_by_key(|file| file.size);
+            files
+        };
+        let sizes = |files: &[OpenFile]| -> Vec<u64> { files.iter().map(|file| file.size).collect() };
+        const DATA: &[u8] = b"data";
+        const MORE: &[u8] = b"more data";
+        first.write_all_at(DATA, 0).unwrap();
+        second.write_all_at(MORE, 0).unwrap();
+        assert_eq!(sizes(&open(&[one, other])), [DATA.len() as u64, MORE.len() as u64]);
+        own.take_back(first);
+        let files = open(&[one, other]);
+        assert_eq!(sizes(&files), [0, MORE.len() as u64]);
+        assert!(files.iter().all(|file| own.contains(&file.status).unwrap()));
+        own.take_back(second);
+        let files = open(&[one, other]);
+        assert_eq!(sizes(&files), [0, 0]);
+        assert!(files.iter().all(|file| own.contains(&file.status).unwrap()));
+        // A file that is dropped and not given back keeps what it has.
+        let kept = ScratchFile::create_in(directory.as_fd(), &mut own).unwrap();
+        kept.write_all_at(MORE, 0).unwrap();
+        let unused = found(&kept.file).identity.inode_id();
+        drop(kept);
+        let files = open(&[one, other, unused]);
+        assert_eq!(sizes(&files), [0, 0, MORE.len() as u64]);
+        assert!(files.iter().all(|file| own.contains(&file.status).unwrap()));
+        // A file that is still used outlives the files of its builder.
+        let last = ScratchFile::create_in(directory.as_fd(), &mut own).unwrap();
+        last.write_all_at(DATA, 0).unwrap();
+        let inode = found(&last.file).identity.inode_id();
+        drop(own);
+        assert_eq!(sizes(&open(&[one, other, unused, inode])), [DATA.len() as u64]);
+        let mut read = [0; DATA.len()];
+        last.read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(read, DATA);
+        drop(last);
+        assert!(open(&[one, other, unused, inode]).is_empty());
+    }
+
+    /// A file is one of the files of a builder by its inode and by its
+    /// status. A file system can give two files one inode, so a file that
+    /// has the inode of one of the files and another status is none of
+    /// them. Here the inode of one file is taken as that of another one,
+    /// which is kept open for it, as such a file system would have it.
+    #[test]
+    fn own_files_are_known_by_their_status() {
+        let tmp = TempDir::new("sys-own-status");
+        let dir = &tmp.0;
+        fs::write(dir.join("ours"), b"ours").unwrap();
+        fs::write(dir.join("theirs"), b"of the tree").unwrap();
+        let open = |name: &str| File::open(dir.join(name)).unwrap();
+        let found = |name: &str| Status::of(open(name).as_fd()).unwrap();
+        let mut own = OwnFiles::default();
+        assert!(!own.contains(&found("ours")).unwrap());
+        own.keep(found("theirs").identity.inode_id(), Arc::new(open("ours")));
+        assert!(!own.contains(&found("theirs")).unwrap());
+        assert!(!own.contains(&found("ours")).unwrap());
+        // Under its own inode the file is one of them, and the other one,
+        // which is kept under its own inode as well now, is too.
+        own.keep(found("ours").identity.inode_id(), Arc::new(open("ours")));
+        assert!(own.contains(&found("ours")).unwrap());
+        own.keep(found("theirs").identity.inode_id(), Arc::new(open("theirs")));
+        assert!(own.contains(&found("theirs")).unwrap());
+        // The status is the one the file has now, and not one it had.
+        let before = found("ours");
+        fs::write(dir.join("ours"), b"changed").unwrap();
+        assert!(!own.contains(&before).unwrap());
+        assert!(own.contains(&found("ours")).unwrap());
+    }
+
+    /// A file system that gives two files one inode can give it to two of
+    /// the files of a builder. Both are kept with that inode then, and both
+    /// are files of the builder's own: the one that was kept first is not
+    /// given up for the one that is kept after it. Both stay open until the
+    /// files are dropped. A file of the tree that has their inode and the
+    /// status of neither is none of them. Here two files are kept under
+    /// the inode of the first one, as such a file system would have them.
+    #[test]
+    fn own_files_with_one_inode() {
+        let tmp = TempDir::new("sys-own-one-inode");
+        let dir = &tmp.0;
+        fs::write(dir.join("older"), b"the older one").unwrap();
+        fs::write(dir.join("newer"), b"newer").unwrap();
+        fs::write(dir.join("theirs"), b"of the tree").unwrap();
+        let open = |name: &str| File::open(dir.join(name)).unwrap();
+        let found = |name: &str| Status::of(open(name).as_fd()).unwrap();
+        // What a walk finds of the file `name` where the file system gives
+        // it the inode of the older file.
+        let numbered = |name: &str| Status {
+            identity: found("older").identity,
+            ..found(name)
+        };
+        let inode = found("older").identity.inode_id();
+        let mut own = OwnFiles::default();
+        own.keep(inode, Arc::new(open("older")));
+        assert!(own.contains(&found("older")).unwrap());
+        assert!(!own.contains(&numbered("newer")).unwrap());
+        own.keep(inode, Arc::new(open("newer")));
+        assert!(own.contains(&found("older")).unwrap());
+        assert!(own.contains(&numbered("newer")).unwrap());
+        assert!(!own.contains(&numbered("theirs")).unwrap());
+        // The files of the builder alone have the two open, until they are
+        // dropped.
+        let mut kept: Vec<u64> = OpenFile::made_in(dir).iter().map(|file| file.size).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [found("newer").size, found("older").size]);
+        drop(own);
+        assert!(OpenFile::made_in(dir).is_empty());
+    }
+
+    /// A scratch file that was given back is handed out again, once: it is
+    /// empty, and it is the file it was, one of the files of its builder
+    /// with the inode it had. The files of another builder hand out none of
+    /// them. A file that could not be emptied when it was given back keeps
+    /// what it has, stays one of the files, and is not handed out again.
+    #[test]
+    fn scratch_files_given_back_are_handed_out_again() {
+        let tmp = TempDir::new("sys-scratch-again");
+        let directory = ScratchFile::open_directory(&tmp.0).unwrap();
+        let mut own = OwnFiles::default();
+        let inode_of = |file: &ScratchFile| InodeId::of(file.file.as_fd()).unwrap();
+        let len_of = |file: &ScratchFile| file.file.metadata().unwrap().len();
+        /// More files than the test makes. A file that is handed out is
+        /// not handed out again, and one that was would be without end.
+        const MOST: usize = 8;
+        // Every file there is to hand out, which stays handed out.
+        let handed_out =
+            |own: &mut OwnFiles| -> Vec<ScratchFile> { std::iter::from_fn(|| own.hand_out()).take(MOST).collect() };
+        assert!(handed_out(&mut own).is_empty());
+        let first = ScratchFile::create_in(directory.as_fd(), &mut own).unwrap();
+        let second = ScratchFile::create_in(directory.as_fd(), &mut own).unwrap();
+        let (one, other) = (inode_of(&first), inode_of(&second));
+        const DATA: &[u8] = b"data";
+        first.write_all_at(DATA, 0).unwrap();
+        second.write_all_at(DATA, 0).unwrap();
+        assert!(handed_out(&mut own).is_empty());
+        own.take_back(first);
+        let mut others = OwnFiles::default();
+        assert!(handed_out(&mut others).is_empty());
+        let again = handed_out(&mut own);
+        assert_eq!(again.len(), 1);
+        assert_eq!((inode_of(&again[0]), len_of(&again[0])), (one, 0));
+        assert!(own.contains(&Status::of(again[0].file.as_fd()).unwrap()).unwrap());
+        // It is used like a new one, and handed out again once it is
+        // given back again.
+        again[0].write_all_at(DATA, 0).unwrap();
+        let mut read = [0; DATA.len()];
+        again[0].read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(read, DATA);
+        again.into_iter().chain([second]).for_each(|file| own.take_back(file));
+        let both = handed_out(&mut own);
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().all(|file| len_of(file) == 0));
+        let handed: Vec<InodeId> = both.iter().map(inode_of).collect();
+        assert!(handed.contains(&one) && handed.contains(&other));
+        // A file in memory that is sealed can't be made shorter.
+        let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
+        let Ok(sealed) = rustix::fs::memfd_create("uapi16-sealed", flags) else {
+            eprintln!("skipping the file that can't be emptied: there is no memfd_create()");
+            return;
+        };
+        let kept = ScratchFile::new(sealed, &mut own).unwrap();
+        kept.write_all_at(DATA, 0).unwrap();
+        rustix::fs::fcntl_add_seals(&kept.file, SealFlags::SHRINK).unwrap();
+        assert_eq!(kept.set_len(0).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        let file = Arc::clone(&kept.file);
+        own.take_back(kept);
+        assert!(handed_out(&mut own).is_empty());
+        assert_eq!(file.metadata().unwrap().len(), DATA.len() as u64);
+        assert!(own.contains(&Status::of(file.as_fd()).unwrap()).unwrap());
+    }
+
+    /// A file system that has no O_TMPFILE gets a file that loses its name
+    /// right away. The message queue file system is one, and lets anybody
+    /// make a file in it.
+    #[test]
+    fn scratch_files_without_o_tmpfile() {
+        let queues = Path::new("/dev/mqueue");
+        let Ok(directory) = ScratchFile::open_directory(queues) else {
+            eprintln!("skipping: there is no /dev/mqueue");
+            return;
+        };
+        let mut own = OwnFiles::default();
+        match ScratchFile::create_unnamed(directory.as_fd(), &mut own) {
+            Err(Errno::OPNOTSUPP) => {}
+            other => {
+                eprintln!("skipping: O_TMPFILE in /dev/mqueue gives {:?}", other.map(|_| ()));
+                return;
+            }
+        }
+        let before = names_in(queues).len();
+        let file = match ScratchFile::create_in(directory.as_fd(), &mut own) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("skipping: no file can be made in /dev/mqueue: {}", e);
+                return;
+            }
+        };
+        assert_eq!(file.file.metadata().unwrap().nlink(), 0);
+        // Other processes make and remove queues, but ours is gone.
+        let prefix = ScratchFile::NAME_PREFIX.as_bytes();
+        let left = names_in(queues)
+            .iter()
+            .filter(|name| name.as_encoded_bytes().starts_with(prefix))
+            .count();
+        assert_eq!(left, 0, "{} entries before", before);
+    }
+
+    /// A scratch file is read and written at any offset. What was never
+    /// written reads as zeroes up to the end of the file, and a read past
+    /// the end fails instead of coming back short.
+    #[test]
+    fn scratch_files_are_read_and_written_anywhere() {
+        let tmp = TempDir::new("sys-scratch-io");
+        let directory = ScratchFile::open_directory(&tmp.0).unwrap();
+        let file = ScratchFile::create_in(directory.as_fd(), &mut OwnFiles::default()).unwrap();
+        let data: Vec<u8> = (0..3 * DATA_BUFFER_SIZE + 7).map(|i| (i % 253) as u8).collect();
+        let far = 5 * 1024 * 1024 * 1024;
+        file.write_all_at(&data, far).unwrap();
+        file.write_all_at(b"start", 0).unwrap();
+        file.write_all_at(b"", 1).unwrap();
+        let mut read = vec![0xff; data.len()];
+        file.read_exact_at(&mut read, far).unwrap();
+        assert_eq!(read, data);
+        let mut start = [0xff; 8];
+        file.read_exact_at(&mut start, 0).unwrap();
+        assert_eq!(&start, b"start\0\0\0");
+        file.read_exact_at(&mut [], far + data.len() as u64 + 1).unwrap();
+        // The last byte, and one more.
+        let end = far + data.len() as u64;
+        file.read_exact_at(&mut start[..1], end - 1).unwrap();
+        let past = file.read_exact_at(&mut start[..2], end - 1).unwrap_err();
+        assert_eq!(past.kind(), io::ErrorKind::UnexpectedEof);
+        // A longer file has zeroes where nothing was written, and a
+        // shorter one ends there.
+        file.set_len(end + 4096).unwrap();
+        let mut tail = [0xff; 4096];
+        file.read_exact_at(&mut tail, end).unwrap();
+        assert_eq!(tail, [0; 4096]);
+        file.set_len(4).unwrap();
+        let short = file.read_exact_at(&mut start[..5], 0).unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::UnexpectedEof);
+        // Only what is written takes room.
+        assert!(room_of(&file) < far);
+    }
+
+    /// How many bytes of room the scratch file `file` takes.
+    fn room_of(file: &ScratchFile) -> u64 {
+        file.file.metadata().unwrap().blocks() * ST_BLOCKS_UNIT
+    }
+
+    /// `blocks` blocks of `block` bytes of data without a zero.
+    fn blocks_of_data(blocks: u64, block: u64) -> Vec<u8> {
+        (0..blocks * block).map(|at| (at % 251) as u8 + 1).collect()
+    }
+
+    /// A hole punched into a scratch file reads as zeroes. The file stays
+    /// as long as it is and keeps what is around the hole, and the room of
+    /// the blocks that are all in the hole is given back. Where the
+    /// temporary directory cannot punch holes this is skipped.
+    #[test]
+    fn holes_in_scratch_files() {
+        let tmp = TempDir::new("sys-scratch-holes");
+        let directory = ScratchFile::open_directory(&tmp.0).unwrap();
+        let file = ScratchFile::create_in(directory.as_fd(), &mut OwnFiles::default()).unwrap();
+        let block = file.block_size().unwrap();
+        assert!(block > 0);
+        let data = blocks_of_data(8, block);
+        file.write_all_at(&data, 0).unwrap();
+        // What was written has its room now, and not only the promise of
+        // it.
+        file.file.sync_all().unwrap();
+        let before = room_of(&file);
+        // Two blocks, and a part of the block on either side of them.
+        let (start, end) = (2 * block - 100, 4 * block + 100);
+        if let Err(e) = file.punch_hole(start, end - start) {
+            assert_eq!(e.raw_os_error(), Some(libc::EOPNOTSUPP), "{}", e);
+            eprintln!("skipping: the temporary directory cannot punch holes");
+            return;
+        }
+        assert_eq!(file.file.metadata().unwrap().len(), data.len() as u64);
+        let mut read = vec![0xff; data.len()];
+        file.read_exact_at(&mut read, 0).unwrap();
+        let (start, end) = (start as usize, end as usize);
+        assert!(read[..start] == data[..start] && read[end..] == data[end..]);
+        assert!(read[start..end].iter().all(|&byte| byte == 0));
+        assert!(room_of(&file) + 2 * block <= before, "{} -> {}", before, room_of(&file));
+        // A hole in a hole, and one that is no block long.
+        file.punch_hole(2 * block, block).unwrap();
+        file.punch_hole(7 * block + 1, 1).unwrap();
+        file.read_exact_at(&mut read, 0).unwrap();
+        assert_eq!(
+            read[7 * block as usize..][..3],
+            [data[7 * block as usize], 0, data[7 * block as usize + 2]]
+        );
+        // No hole is nothing to ask for.
+        let empty = file.punch_hole(block, 0).unwrap_err();
+        assert_eq!(empty.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    /// The variable that names a directory of a file system that cannot
+    /// punch holes, in which the test binary runs
+    /// [`scratch_files_without_holes`] again.
+    const NO_HOLES_DIR: &str = "UAPI16_TEST_NO_HOLES_DIR";
+
+    /// A file system that cannot punch holes fails with EOPNOTSUPP, and the
+    /// file keeps its data and its room. The test binary runs this test
+    /// again with its directory on a ramfs, which is one, and it is skipped
+    /// where that cannot be mounted.
+    #[test]
+    fn scratch_files_without_holes() {
+        let Some(dir) = std::env::var_os(NO_HOLES_DIR) else {
+            let tmp = TempDir::new("sys-scratch-no-holes");
+            tmp.rerun_on("ramfs", None, "sys::tests::scratch_files_without_holes", NO_HOLES_DIR);
+            return;
+        };
+        let directory = ScratchFile::open_directory(Path::new(&dir)).unwrap();
+        let file = ScratchFile::create_in(directory.as_fd(), &mut OwnFiles::default()).unwrap();
+        let block = file.block_size().unwrap();
+        assert!(block > 0);
+        let data = blocks_of_data(4, block);
+        file.write_all_at(&data, 0).unwrap();
+        let before = room_of(&file);
+        let refused = file.punch_hole(block, 2 * block).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EOPNOTSUPP));
+        let mut read = vec![0; data.len()];
+        file.read_exact_at(&mut read, 0).unwrap();
+        assert!(read == data);
+        assert_eq!(room_of(&file), before);
+    }
+
     /// The data of a file of procfs goes on after its size, which is 0,
     /// and the status of the file shows no change.
     #[test]
@@ -1862,5 +2619,9 @@ mod tests {
         send_sync::<Status>();
         send_sync::<Entry<'_>>();
         send_sync::<DataHash>();
+        send_sync::<Readable>();
+        send_sync::<UserXattrs>();
+        send_sync::<UserDatabase>();
+        send_sync::<ScratchFile>();
     }
 }
