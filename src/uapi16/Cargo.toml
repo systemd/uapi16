@@ -18,6 +18,9 @@ include = ["/*.rs", "/refused.jsonl", "/tests/", "/README.md", "/LICENSE"]
 path = "lib.rs"
 
 [dependencies]
+# getpwuid_r() and getgrgid_r(), which give the names of the owners of the
+# files a manifest is built from. The tests take errno values from it.
+libc.workspace = true
 serde_core.workspace = true
 # Without float_roundtrip serde_json refuses some spellings of the largest
 # doubles as out of range, such as 1.7976931348623158e308.
@@ -35,8 +38,6 @@ pathrs.workspace = true
 rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
-# The errno values of the errors the tests make.
-libc.workspace = true
 # The tests look at the order of the keys the writer writes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 

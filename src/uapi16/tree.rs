@@ -3,6 +3,7 @@
 //! one, whether that shows a change, and why one could not be read. The
 //! system calls that read them are in the module sys.
 
+use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -10,7 +11,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::FileType;
 
 use crate::error::{Error, ErrorKind, TreeProblem};
-use crate::{Mode, Name, Sha256};
+use crate::{Features, Mode, Name, Sha256};
 
 /// The mount a file was reached through, as statx() tells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -46,6 +47,16 @@ pub(crate) struct Identity {
     pub(crate) inode: u64,
     /// The subvolume the file is in, STATX_SUBVOL from Linux 6.10 on,
     /// where the file system has subvolumes, such as btrfs.
+    pub(crate) subvolume: Option<u64>,
+}
+
+/// Which inode a file is, whatever mount it was reached through: the
+/// device, the inode number and the subvolume of an [`Identity`], without
+/// its mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct InodeId {
+    pub(crate) device: DeviceNumber,
+    pub(crate) inode: u64,
     pub(crate) subvolume: Option<u64>,
 }
 
@@ -185,6 +196,16 @@ impl<'fd> Entry<'fd> {
     }
 }
 
+/// Where an entry of a tree is: the directory it is in and its name there,
+/// which a directory is opened by, see [`Entry::reopen`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Place<'a> {
+    /// The directory, a handle or the directory open for its listing.
+    pub(crate) dir: BorrowedFd<'a>,
+    /// The name of the entry in it, one component.
+    pub(crate) name: &'a CStr,
+}
+
 /// Why the data of a regular file was not read as far as its size.
 #[derive(Debug)]
 pub(crate) enum DataFailure {
@@ -194,6 +215,45 @@ pub(crate) enum DataFailure {
     EndedEarly,
     /// The data went on after the size.
     WentOn,
+}
+
+/// Why a feature that was asked for cannot be read from a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// The file system of the file has no inode flags.
+    NoInodeFlags,
+    /// The file system of the file has no DOS attributes.
+    NoDosAttributes,
+    /// The file system of the file has no extended attributes.
+    NoXattrs,
+    /// Extended attributes are read through procfs, which is not mounted.
+    NoProcfs,
+    /// An extended attribute of the file has a name a manifest cannot
+    /// hold: one that is not UTF-8, or that has a control character or a
+    /// noncharacter.
+    XattrName,
+    /// The file system cannot say what its label is.
+    NoLabel,
+    /// The label of the file system is not one a manifest can hold.
+    LabelUnwritable,
+    /// The file is an automount point, which is not opened, see
+    /// [`Entry::is_automount`], and the feature is read from the open file.
+    Automount,
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unreadable::NoInodeFlags => f.write_str("the file system has no inode flags"),
+            Unreadable::NoDosAttributes => f.write_str("the file system has no DOS attributes"),
+            Unreadable::NoXattrs => f.write_str("the file system has no extended attributes"),
+            Unreadable::NoProcfs => f.write_str("extended attributes are read through /proc, which is not mounted"),
+            Unreadable::XattrName => f.write_str("an extended attribute has a name a manifest cannot hold"),
+            Unreadable::NoLabel => f.write_str("the file system cannot say what its label is"),
+            Unreadable::LabelUnwritable => f.write_str("the label of the file system is not one a manifest can hold"),
+            Unreadable::Automount => f.write_str("the file is an automount point, which is not opened"),
+        }
+    }
 }
 
 /// Why a file of a tree could not be read as it is.
@@ -209,6 +269,11 @@ pub(crate) enum Failure {
     /// else showed a change: the size of a file of procfs or sysfs says
     /// nothing of its data.
     WrongSize,
+    /// A single feature that was asked for cannot be read from the file.
+    Unavailable(Features, Unreadable),
+    /// What was read of the file is more than a record of a manifest has
+    /// room for.
+    TooLarge,
 }
 
 impl Failure {
@@ -226,6 +291,18 @@ impl Failure {
             }
             Failure::Changed => format!("{}: changed while it was read", Subject(name)),
             Failure::WrongSize => format!("{}: its data does not end at its size", Subject(name)),
+            Failure::Unavailable(feature, why) => {
+                let message = format!(
+                    "{}: '{}' cannot be read: {}",
+                    Subject(name),
+                    feature.names().next().unwrap_or_default(),
+                    why
+                );
+                return Error::new(ErrorKind::Tree(TreeProblem::FeatureUnavailable), message)
+                    .named(name.as_str())
+                    .about(feature);
+            }
+            Failure::TooLarge => return Error::record_too_large().named(name.as_str()),
         };
         Error::new(ErrorKind::Tree(TreeProblem::Changed), message).named(name.as_str())
     }

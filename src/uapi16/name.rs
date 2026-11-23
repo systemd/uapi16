@@ -2,8 +2,9 @@
 //! The names of file objects: [`Name`] borrows one, and [`NameBuf`] owns
 //! one.
 //!
-//! The crate denies unsafe code, with one exception that is here: the cast
-//! that makes a `&Name` of a `&str`, in `Name::from_str_unchecked()`.
+//! The crate denies unsafe code. One of the exceptions is here: the cast
+//! that makes a `&Name` of a `&str`, in `Name::from_str_unchecked()`. The
+//! others are the modules ioctl and nss.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;

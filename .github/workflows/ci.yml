@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64,
-# the same with musl, the build and the tests on i686, the lints for
-# twelve targets, the formatting, the documentation, the package cargo
-# publish uploads, the dependency check and the sign-offs.
+# the same with musl, the build and the tests on i686, the tests on FAT,
+# the lints for twelve targets, the formatting, the documentation, the
+# package cargo publish uploads, the dependency check and the sign-offs.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS,
 # clippy's -D warnings and RUSTDOCFLAGS.
@@ -217,6 +217,46 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target "$TARGET"
+
+  fat:
+    name: Tests on FAT
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dosfstools
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Make a FAT file system
+        # One the user owns, with a regular file, a read-only one and a
+        # directory on it, which the tests of the DOS attributes look at.
+        run: |
+          fat=$RUNNER_TEMP/fat
+          truncate -s 1G "$fat.img"
+          /usr/sbin/mkfs.vfat -F 32 "$fat.img"
+          mkdir "$fat"
+          sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$fat.img" "$fat"
+          echo file > "$fat/file"
+          echo read-only > "$fat/read-only"
+          chmod a-w "$fat/read-only"
+          mkdir "$fat/dir"
+          echo "UAPI16_TEST_FAT_DIR=$fat" >> "$GITHUB_ENV"
+
+      - name: Test the DOS attributes and the volume serial number
+        run: cargo test --locked --lib -- --exact ioctl::tests::fat optional::tests::fat
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})

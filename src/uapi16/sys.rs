@@ -15,31 +15,49 @@
 //! through that handle. The data of a regular file is read through the
 //! handle opened again, never through the name: by then the name can lead
 //! to another file, such as a device node, which would do what its driver
-//! does on open.
+//! does on open. A directory is opened by its name in its directory
+//! instead, with O_DIRECTORY and O_NOFOLLOW, which open nothing but a
+//! directory, and it has to be the file of its handle. Nothing else is ever
+//! opened.
 //!
 //! Nothing here mounts anything. The kernel mounts a file system on an
 //! automount point when the directory is opened by its name or a name is
 //! looked up in it, but not when its handle is taken. So an entry says
 //! whether it is an automount point, see [`Entry::is_automount`], and one
-//! that is one is not opened and has nothing opened in it.
+//! that is one is not opened and has nothing opened in it. That leaves a
+//! directory that becomes an automount point after its entry was looked at
+//! and before it is opened by its name, see [`Entry::reopen`].
+//!
+//! The ioctls rustix has no call for and the lookups in the user database
+//! are in the modules ioctl and nss, which have the unsafe code for them.
+//! They are called from here and handed on from here, so that this module
+//! stays the one place that talks to the host.
 
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::str;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use pathrs::error::{Error as PathrsError, ErrorKind as PathrsErrorKind};
 use pathrs::flags::OpenFlags;
 use pathrs::HandleRef;
-use rustix::fs::{AtFlags, FileType, FsWord, OFlags, Statx, StatxAttributes, StatxFlags, StatxTimestamp};
+use rustix::fs::{AtFlags, FileType, FsWord, IFlags, OFlags, Statx, StatxAttributes, StatxFlags, StatxTimestamp, CWD};
 use rustix::io::{retry_on_intr, Errno};
 use rustix::mount::OpenTreeFlags;
 
 use crate::digest::Sha256Context;
-use crate::tree::{DataFailure, DeviceNumber, Entry, Failure, Handle, Identity, MountId, Status, Timestamp};
-use crate::{Mode, Sha256};
+use crate::ioctl;
+pub(crate) use crate::ioctl::{DosAttributes, FsLabel, FsUuid};
+pub(crate) use crate::nss::UserDatabase;
+use crate::object::{FatSerial, FileObject, InodeFlags};
+use crate::tree::{
+    DataFailure, DeviceNumber, Entry, Failure, Handle, Identity, InodeId, MountId, Place, Status, Timestamp, Unreadable,
+};
+use crate::{Features, Mode, Sha256, MAX_RECORD_SIZE, STRING_RULES, USER_NAMESPACE};
 
 /// How much of a file is read at a time for its hash: the size of the
 /// buffer the data is read through.
@@ -54,7 +72,7 @@ impl EmptyPath {
     /// O_EMPTYPATH, include/uapi/asm-generic/fcntl.h. No architecture
     /// overrides it, and fs/fcntl.c checks at build time that it is a bit
     /// of its own on every architecture.
-    const FLAG: u32 = 1 << 26;
+    pub(crate) const FLAG: u32 = 1 << 26;
     /// Not tried yet.
     pub(crate) const UNKNOWN: u8 = 0;
     /// It worked once, so ENOENT is the file's own error from now on.
@@ -83,9 +101,9 @@ impl OpenTree {
 /// The state of [`OpenTree`] for this process.
 static OPEN_TREE: AtomicU8 = AtomicU8::new(OpenTree::CALLED);
 
-/// A regular file pinned by a handle, a descriptor opened with O_PATH,
-/// through which it is opened for reading: without its name, so that no
-/// other file can take its place.
+/// A regular file or a directory pinned by a handle, a descriptor opened
+/// with O_PATH, through which it is opened for reading: without its name,
+/// so that no other file can take its place.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PinnedFile<'fd>(BorrowedFd<'fd>);
 
@@ -102,9 +120,9 @@ impl<'fd> PinnedFile<'fd> {
     const PATHRS_READ_FLAGS: OpenFlags = OpenFlags::O_RDONLY
         .union(OpenFlags::O_NONBLOCK)
         .union(OpenFlags::O_NOCTTY);
-    /// The regular file `handle` refers to. It has to be one: the file is
-    /// opened whatever it is, a device node with what its driver does on
-    /// open.
+    /// The regular file or the directory `handle` refers to. It has to be
+    /// one of the two: the file is opened whatever it is, a device node
+    /// with what its driver does on open.
     pub(crate) fn new(handle: BorrowedFd<'fd>) -> PinnedFile<'fd> {
         PinnedFile(handle)
     }
@@ -152,12 +170,88 @@ impl<'fd> PinnedFile<'fd> {
     }
 }
 
+/// The link procfs has for a descriptor of the calling thread,
+/// /proc/thread-self/fd/N, which leads to the file of the descriptor. It is
+/// the link of the thread and not that of /proc/self, the thread group
+/// leader: a thread that took a descriptor table of its own has other
+/// descriptors than the leader.
+///
+/// What goes through the link is checked to be the inode of the descriptor,
+/// by its device, its inode number and its subvolume: a /proc that is not
+/// what it should be could lead elsewhere. What takes the path of the link
+/// checks it before and after, see [`FdLink::check`]. That narrows what
+/// such a /proc can do, but it doesn't close it: it can lead to the file
+/// for the two checks and elsewhere in between. So only the extended
+/// attributes of a file that is not open for reading are read through the
+/// path, see [`UserXattrs`].
+#[derive(Debug)]
+pub(crate) struct FdLink<'fd> {
+    fd: BorrowedFd<'fd>,
+    path: String,
+}
+
+impl<'fd> FdLink<'fd> {
+    /// Where procfs has a link for every descriptor of the calling thread.
+    const THREAD_SELF_FD: &'static str = "/proc/thread-self/fd";
+
+    /// The link of the descriptor `fd`.
+    pub(crate) fn new(fd: BorrowedFd<'fd>) -> FdLink<'fd> {
+        FdLink {
+            fd,
+            path: format!("{}/{}", FdLink::THREAD_SELF_FD, fd.as_raw_fd()),
+        }
+    }
+
+    /// The path of the link, for what goes through it once it was checked.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Checks that the link leads to the file of the descriptor, before the
+    /// path of the link is used and once more after, see [`FdLink`].
+    pub(crate) fn check(&self) -> io::Result<()> {
+        let statx =
+            retry_on_intr(|| rustix::fs::statx(CWD, self.path.as_str(), AtFlags::NO_AUTOMOUNT, InodeId::REQUEST))?;
+        if InodeId::from_statx(&statx) != InodeId::of(self.fd)? {
+            return Err(io::Error::other(
+                "the link of /proc/thread-self/fd leads to another file",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The error `error` of pathrs as an I/O error: that of the system call
 /// that failed, or the error of pathrs itself where none did.
 pub(crate) fn pathrs_io_error(error: PathrsError) -> io::Error {
     match error.kind() {
         PathrsErrorKind::OsError(Some(errno)) => io::Error::from_raw_os_error(errno),
         _ => io::Error::other(error),
+    }
+}
+
+impl InodeId {
+    /// What statx() is asked for to tell the inode of a file, which takes
+    /// no mount ID.
+    const REQUEST: StatxFlags = StatxFlags::INO.union(Status::SUBVOL);
+
+    /// The inode of the file `fd` refers to.
+    fn of(fd: BorrowedFd<'_>) -> rustix::io::Result<InodeId> {
+        let statx = retry_on_intr(|| rustix::fs::statx(fd, c"", Status::OF_DESCRIPTOR, InodeId::REQUEST))?;
+        Ok(InodeId::from_statx(&statx))
+    }
+
+    /// The inode `statx` is of, with its subvolume where the mask has it.
+    fn from_statx(statx: &Statx) -> InodeId {
+        let mask = StatxFlags::from_bits_retain(statx.stx_mask);
+        InodeId {
+            device: DeviceNumber {
+                major: statx.stx_dev_major,
+                minor: statx.stx_dev_minor,
+            },
+            inode: statx.stx_ino,
+            subvolume: mask.contains(Status::SUBVOL).then_some(statx.stx_subvol),
+        }
     }
 }
 
@@ -257,6 +351,13 @@ impl<'fd> Entry<'fd> {
     /// gives for autofs, the file system of the automount points an
     /// automount unit of systemd or automount(8) makes.
     const AUTOFS_SUPER_MAGIC: FsWord = 0x0187;
+    /// How a directory is opened by its name for reading: as a directory
+    /// and nothing else, not through a symbolic link, and not inherited
+    /// across exec.
+    const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
 
     /// Opens the entry `name` of the directory `dir`, one component and
     /// neither `.` nor `..`, such as a name of the listing of `dir`. `dir`
@@ -328,6 +429,288 @@ impl<'fd> Entry<'fd> {
         }
         Ok(Entry::new(handle, status, automount))
     }
+
+    /// Opens the regular file or the directory of the entry for reading, so
+    /// that no other file takes its place. A regular file is opened through
+    /// its handle and never through its name, as [`PinnedFile`] opens one.
+    /// A directory is opened by its name in its directory, `place`, with
+    /// O_DIRECTORY and O_NOFOLLOW, which refuse anything else with ENOTDIR
+    /// before it is opened, and what is opened has to be the file of the
+    /// entry. That takes no procfs, and nothing but the permission to read
+    /// the directory, which its listing takes anyway. A directory without a
+    /// place, that of a descriptor a caller gave, such as the top directory
+    /// of a walk, has no name to be opened by, and is opened through its
+    /// handle as a regular file is. Anything else fails with EINVAL and is
+    /// not opened: a FIFO or a device node would do what its driver does on
+    /// open, and an automount point opened by its name would have a file
+    /// system mounted on it, see [`Entry::is_automount`].
+    ///
+    /// Whether the entry is an automount point was told when its handle was
+    /// taken. A directory that becomes one after that and before it is
+    /// opened by its name has its file system mounted by that open, which
+    /// then is the root of that file system and not the file of the entry:
+    /// the tree changed. This is a known limit, and nothing here closes it.
+    /// It takes someone who can mount in the mount namespace of the
+    /// process, or an automount unit that is started at that moment.
+    pub(crate) fn reopen(&self, place: Option<Place<'_>>) -> Result<Readable, Failure> {
+        match (self.status().file_type, place) {
+            (FileType::Directory, _) if self.is_automount() => Err(Errno::INVAL.into()),
+            (FileType::Directory, Some(place)) => self.reopen_directory(place),
+            (FileType::RegularFile | FileType::Directory, _) => Ok(Readable(PinnedFile::new(self.handle()).reopen()?)),
+            _ => Err(Errno::INVAL.into()),
+        }
+    }
+
+    /// Opens the directory of the entry by its name in its directory,
+    /// `place`. Where the name leads to nothing by then, to something that
+    /// is not a directory or to another directory, the tree changed.
+    fn reopen_directory(&self, place: Place<'_>) -> Result<Readable, Failure> {
+        let opened = retry_on_intr(|| {
+            rustix::fs::openat(place.dir, place.name, Entry::DIRECTORY_FLAGS, rustix::fs::Mode::empty())
+        });
+        let directory = match opened {
+            Ok(directory) => directory,
+            Err(Errno::NOENT | Errno::NOTDIR) => return Err(Failure::Changed),
+            Err(e) => return Err(e.into()),
+        };
+        if Status::of(directory.as_fd())?.identity != self.status().identity {
+            return Err(Failure::Changed);
+        }
+        Ok(Readable(File::from(directory)))
+    }
+}
+
+/// A regular file or a directory of a tree, opened for reading, see
+/// [`Entry::reopen`]. The data of a regular file is read through it, the
+/// entries of a directory are listed through it, and the inode flags, the
+/// DOS attributes, the extended attributes and the identity of the file
+/// system are read through it, which a handle cannot be asked for.
+#[derive(Debug)]
+pub(crate) struct Readable(File);
+
+impl Readable {
+    /// What a file system fails an ioctl with that it does not have: ENOTTY
+    /// as a rule, and what systemd takes for the same besides.
+    const NOT_SUPPORTED: [Errno; 4] = [Errno::NOTTY, Errno::OPNOTSUPP, Errno::NOSYS, Errno::INVAL];
+    /// The inode flags the specification has a field for, as the kernel
+    /// has them, each with its flag in a manifest.
+    const INODE_FLAGS: [(IFlags, InodeFlags); 5] = [
+        (IFlags::APPEND, InodeFlags::APPEND_ONLY),
+        (IFlags::IMMUTABLE, InodeFlags::IMMUTABLE),
+        (IFlags::NOATIME, InodeFlags::NO_ATIME),
+        (IFlags::NOCOW, InodeFlags::NO_COW),
+        (IFlags::NODUMP, InodeFlags::NO_DUMP),
+    ];
+
+    /// The descriptor, which the entries of a directory are listed
+    /// through.
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+
+    /// What the file system answers the ioctl `ask` makes with, or nothing
+    /// if it does not have the ioctl.
+    fn answer<T>(ask: impl FnMut() -> rustix::io::Result<T>) -> io::Result<Option<T>> {
+        match retry_on_intr(ask) {
+            Ok(answer) => Ok(Some(answer)),
+            Err(e) if Readable::NOT_SUPPORTED.contains(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Those of the inode flags the specification has a field for that are
+    /// set on the file, or nothing if its file system has no inode flags.
+    pub(crate) fn inode_flags(&self) -> io::Result<Option<InodeFlags>> {
+        let Some(set) = Readable::answer(|| rustix::fs::ioctl_getflags(&self.0))? else {
+            return Ok(None);
+        };
+        let flags = Readable::INODE_FLAGS
+            .into_iter()
+            .filter(|(flag, _)| set.contains(*flag))
+            .fold(InodeFlags::default(), |flags, (_, flag)| flags | flag);
+        Ok(Some(flags))
+    }
+
+    /// The DOS attributes of the file, or nothing if its file system has
+    /// none. Whatever answers the ioctl has them: FAT and exFAT, and a
+    /// FUSE server that implements it.
+    pub(crate) fn dos_attributes(&self) -> io::Result<Option<DosAttributes>> {
+        Readable::answer(|| ioctl::dos_attributes(self.as_fd()))
+    }
+
+    /// The volume serial number of the FAT file system the file is in, or
+    /// nothing if it is in another file system.
+    pub(crate) fn fat_serial(&self) -> io::Result<Option<FatSerial>> {
+        Readable::answer(|| ioctl::fat_serial(self.as_fd()))
+    }
+
+    /// The label of the file system the file is in, or nothing if the file
+    /// system cannot say.
+    pub(crate) fn fs_label(&self) -> io::Result<Option<FsLabel>> {
+        Readable::answer(|| ioctl::fs_label(self.as_fd()))
+    }
+
+    /// What the file system the file is in identifies itself with, or
+    /// nothing if it has no identifier or the kernel is older than Linux
+    /// 6.9.
+    pub(crate) fn fs_uuid(&self) -> io::Result<Option<FsUuid>> {
+        Readable::answer(|| ioctl::fs_uuid(self.as_fd()))
+    }
+}
+
+/// Reads the extended attributes of the user namespace of the files of a
+/// tree. Those of a file that is open for reading anyway are read through
+/// that descriptor, see [`Entry::reopen`]: a directory that is listed, a
+/// regular file that is opened for the hash of its data, and either of
+/// them where it is opened for its inode flags, its DOS attributes or the
+/// identity of its file system. Nothing is opened for its attributes
+/// alone, so a file that may not be opened still has them read, and
+/// reading them is never an open that others see. The system calls that
+/// take a descriptor refuse a handle, also those of Linux 6.13 that take a
+/// descriptor and an empty path. So the attributes of any other file are
+/// read through the link procfs has for its handle, see [`FdLink`], which
+/// leads to the file itself, the way systemd reads them.
+///
+/// It keeps what it reads into from one file to the next.
+#[derive(Debug, Default)]
+pub(crate) struct UserXattrs {
+    /// The names of the attributes of the file, each with a NUL behind it,
+    /// as listxattr() gives them.
+    names: Vec<u8>,
+    /// The value of one attribute.
+    value: Vec<u8>,
+}
+
+impl UserXattrs {
+    /// `XATTR_LIST_MAX`, include/uapi/linux/limits.h: the most bytes the
+    /// names of the attributes of a file take.
+    const LIST_MAX: usize = 65536;
+    /// `XATTR_SIZE_MAX`, include/uapi/linux/limits.h: the most bytes the
+    /// value of an attribute has.
+    const SIZE_MAX: usize = 65536;
+    /// What ends a name in the list of names.
+    const NAME_END: u8 = b'\0';
+    /// What separates the namespace of an attribute from its name.
+    const NAMESPACE_SEPARATOR: u8 = b'.';
+
+    /// A reader that has read nothing yet.
+    pub(crate) fn new() -> UserXattrs {
+        UserXattrs::default()
+    }
+
+    /// The name `full`, as listxattr() lists it, without the namespace in
+    /// front, if it is in the user namespace.
+    fn in_user_namespace(full: &[u8]) -> Option<&[u8]> {
+        full.strip_prefix(USER_NAMESPACE.as_bytes())?
+            .strip_prefix(&[UserXattrs::NAMESPACE_SEPARATOR])
+    }
+
+    /// The attributes of the user namespace of the regular file or the
+    /// directory `file`, which is open for reading, by their names without
+    /// the namespace.
+    ///
+    /// A name a manifest cannot hold fails, since a manifest lists all
+    /// attributes of a file or none. So do attributes that take more than
+    /// a record of a manifest has room for, before they are all read. An
+    /// attribute that is gone by the time its value is read is left out.
+    pub(crate) fn read(&mut self, file: &Readable) -> Result<BTreeMap<String, Vec<u8>>, Failure> {
+        self.read_from(XattrSource::File(file.as_fd()))
+    }
+
+    /// The same for the file of `entry`, which is not open for reading,
+    /// through the link procfs has for its handle, see [`FdLink`]. A
+    /// symbolic link cannot have any, and is not asked. Without a procfs
+    /// they can't be read. A file that is gone by now can look like that,
+    /// and fails as one that changed.
+    pub(crate) fn read_unopened(&mut self, entry: &Entry<'_>) -> Result<BTreeMap<String, Vec<u8>>, Failure> {
+        debug_assert_ne!(entry.status().file_type, FileType::Symlink);
+        let link = FdLink::new(entry.handle());
+        match link.check() {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // The link is not there without a procfs. A file system
+                // can also say so of a file that was removed, as a FUSE
+                // file system does that finds its files by their names.
+                // The handle itself tells the two apart.
+                return Err(match InodeId::of(entry.handle()) {
+                    Err(Errno::NOENT | Errno::STALE) => Failure::Changed,
+                    _ => Failure::Unavailable(Features::USER_XATTR, Unreadable::NoProcfs),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let attributes = self.read_from(XattrSource::Link(link.path()))?;
+        // Where the link led elsewhere for a while, what was read can be of
+        // another file.
+        link.check()?;
+        Ok(attributes)
+    }
+
+    /// Reads the attributes of the file `source` leads to.
+    fn read_from(&mut self, source: XattrSource<'_>) -> Result<BTreeMap<String, Vec<u8>>, Failure> {
+        let unavailable = |why| Failure::Unavailable(Features::USER_XATTR, why);
+        let mut attributes = BTreeMap::new();
+        self.names.resize(UserXattrs::LIST_MAX, 0);
+        let listed = match retry_on_intr(|| source.list(&mut self.names[..])) {
+            Ok(listed) => listed,
+            Err(Errno::OPNOTSUPP | Errno::NOSYS) => return Err(unavailable(Unreadable::NoXattrs)),
+            Err(e) => return Err(e.into()),
+        };
+        let mut size = 0;
+        for full in self.names[..listed].split(|&byte| byte == UserXattrs::NAME_END) {
+            let Some(name) = UserXattrs::in_user_namespace(full) else {
+                continue;
+            };
+            let name = str::from_utf8(name)
+                .ok()
+                .filter(|name| FileObject::is_xattr_name(name) && STRING_RULES.admits(name))
+                .ok_or(unavailable(Unreadable::XattrName))?;
+            self.value.resize(UserXattrs::SIZE_MAX, 0);
+            let len = match retry_on_intr(|| source.get(full, &mut self.value[..])) {
+                Ok(len) => len,
+                // Removed since it was listed, or listed on a file that
+                // cannot have one.
+                Err(Errno::NODATA) => continue,
+                Err(Errno::OPNOTSUPP | Errno::NOSYS) => return Err(unavailable(Unreadable::NoXattrs)),
+                Err(e) => return Err(e.into()),
+            };
+            size += name.len() + len;
+            if size > MAX_RECORD_SIZE {
+                return Err(Failure::TooLarge);
+            }
+            attributes.insert(name.to_owned(), self.value[..len].to_vec());
+        }
+        Ok(attributes)
+    }
+}
+
+/// What the extended attributes of a file are read through.
+#[derive(Clone, Copy, Debug)]
+enum XattrSource<'a> {
+    /// The file open for reading, with flistxattr() and fgetxattr().
+    File(BorrowedFd<'a>),
+    /// The path of the link procfs has for the handle of a file that is not
+    /// open for reading, with listxattr() and getxattr(), which follow the
+    /// link. llistxattr() and lgetxattr() would read the link itself.
+    Link(&'a str),
+}
+
+impl XattrSource<'_> {
+    /// Lists the names of the attributes into `names`.
+    fn list(self, names: &mut [u8]) -> rustix::io::Result<usize> {
+        match self {
+            XattrSource::File(fd) => rustix::fs::flistxattr(fd, names),
+            XattrSource::Link(path) => rustix::fs::listxattr(path, names),
+        }
+    }
+
+    /// Reads the value of the attribute `name` into `value`.
+    fn get(self, name: &[u8], value: &mut [u8]) -> rustix::io::Result<usize> {
+        match self {
+            XattrSource::File(fd) => rustix::fs::fgetxattr(fd, name, value),
+            XattrSource::Link(path) => rustix::fs::getxattr(path, name, value),
+        }
+    }
 }
 
 /// The hash of the data of a regular file, read a part at a time, so that
@@ -369,8 +752,18 @@ impl DataHash {
     /// opened, see [`DataHash::admits`].
     pub(crate) fn start(entry: &Entry<'_>) -> Result<DataHash, Failure> {
         DataHash::admits(entry.status())?;
+        DataHash::of(entry, entry.reopen(None)?)
+    }
+
+    /// The hash of the data of the regular file of `entry`, read through
+    /// `opened`, which is that file opened again, see [`Entry::reopen`]. So
+    /// a file that is open already, for its inode flags for example, is
+    /// not opened once more for its data. A file whose data is not hashed
+    /// fails, see [`DataHash::admits`].
+    pub(crate) fn of(entry: &Entry<'_>, opened: Readable) -> Result<DataHash, Failure> {
+        DataHash::admits(entry.status())?;
         Ok(DataHash {
-            file: PinnedFile::new(entry.handle()).reopen()?,
+            file: opened.0,
             before: *entry.status(),
             context: Sha256Context::new(),
             offset: 0,
@@ -448,7 +841,6 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::mem::MaybeUninit;
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
@@ -682,6 +1074,21 @@ mod tests {
         OPEN_TREE.store(OpenTree::REFUSED, Ordering::Relaxed);
         check();
         OPEN_TREE.store(OpenTree::CALLED, Ordering::Relaxed);
+    }
+
+    /// A file system that does not have an ioctl has no answer to it. It
+    /// says so with ENOTTY as a rule, and EOPNOTSUPP, ENOSYS and EINVAL are
+    /// taken for the same. Any other error of an ioctl is an error.
+    #[test]
+    fn ioctls_a_file_system_does_not_have() {
+        for errno in [Errno::NOTTY, Errno::OPNOTSUPP, Errno::NOSYS, Errno::INVAL] {
+            assert_eq!(Readable::answer(|| Err::<u8, _>(errno)).unwrap(), None, "{}", errno);
+        }
+        for errno in [Errno::IO, Errno::ACCESS, Errno::PERM, Errno::NOENT, Errno::BADF] {
+            let e = Readable::answer(|| Err::<u8, _>(errno)).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(errno.raw_os_error()));
+        }
+        assert_eq!(Readable::answer(|| Ok(7)).unwrap(), Some(7));
     }
 
     /// An entry is a handle, which is not inherited across exec and opens
@@ -1166,6 +1573,165 @@ mod tests {
         }
     }
 
+    /// The link of a descriptor in procfs leads to its file, also after the
+    /// file lost its name, which is checked before its path is used: a link
+    /// that leads to another file fails.
+    #[test]
+    fn links_of_descriptors() {
+        let tmp = TempDir::new("sys-fd-link");
+        let dir = &tmp.0;
+        fs::write(dir.join("a"), b"a").unwrap();
+        fs::write(dir.join("b"), b"b").unwrap();
+        let a = File::open(dir.join("a")).unwrap();
+        let b = File::open(dir.join("b")).unwrap();
+        fs::remove_file(dir.join("a")).unwrap();
+        let link = FdLink::new(a.as_fd());
+        link.check().unwrap();
+        assert_eq!(fs::read(link.path()).unwrap(), b"a");
+        let elsewhere = FdLink {
+            fd: a.as_fd(),
+            path: FdLink::new(b.as_fd()).path,
+        };
+        let e = elsewhere.check().unwrap_err();
+        assert_eq!(e.to_string(), "the link of /proc/thread-self/fd leads to another file");
+    }
+
+    /// A regular file and a directory are opened for reading as the files
+    /// of their entries: a regular file through its handle, also once
+    /// another file has its name, and a directory by its name, which is a
+    /// change once the name leads to another file or to none. A directory
+    /// that may be read but not searched is opened by its name as well, and
+    /// one without a name, of a descriptor a caller gave, through its
+    /// handle. What is opened is not a handle, and it is not inherited
+    /// across exec. Nothing else is opened: a symbolic link, a FIFO, a
+    /// socket and a device node fail with EINVAL, and nobody opened the
+    /// FIFO.
+    #[test]
+    fn reopens_files_and_directories() {
+        let tmp = TempDir::new("sys-reopen-entries");
+        let dir = &tmp.0;
+        fs::write(dir.join("file"), b"pinned").unwrap();
+        fs::create_dir(dir.join("dir")).unwrap();
+        fs::write(dir.join("dir/inside"), b"").unwrap();
+        fs::create_dir(dir.join("unsearchable")).unwrap();
+        fs::set_permissions(dir.join("unsearchable"), fs::Permissions::from_mode(0o400)).unwrap();
+        symlink("file", dir.join("link")).unwrap();
+        make_fifo(&dir.join("fifo"));
+        let _socket = UnixListener::bind(dir.join("socket")).unwrap();
+        let tree = open_dir(dir);
+        let at = |name| {
+            Some(Place {
+                dir: tree.as_fd(),
+                name,
+            })
+        };
+        let file = Entry::open_at(tree.as_fd(), c"file").unwrap();
+        let directory = Entry::open_at(tree.as_fd(), c"dir").unwrap();
+        let unsearchable = Entry::open_at(tree.as_fd(), c"unsearchable").unwrap();
+        fs::rename(dir.join("file"), dir.join("moved")).unwrap();
+        fs::write(dir.join("file"), b"impostor").unwrap();
+        fs::rename(dir.join("dir"), dir.join("moved-dir")).unwrap();
+        fs::create_dir(dir.join("dir")).unwrap();
+        let check_flags = |opened: &Readable| {
+            assert!(!rustix::fs::fcntl_getfl(opened.as_fd()).unwrap().contains(OFlags::PATH));
+            assert!(rustix::io::fcntl_getfd(opened.as_fd())
+                .unwrap()
+                .contains(FdFlags::CLOEXEC));
+        };
+        // The entries of a directory that is open, listed through it.
+        let listed = |opened: &Readable| {
+            rustix::fs::Dir::read_from(opened.as_fd())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_owned())
+                .filter(|name| !matches!(name.to_bytes(), b"." | b".."))
+                .collect::<Vec<_>>()
+        };
+        for state in [EmptyPath::UNKNOWN, EmptyPath::MISSING] {
+            EMPTYPATH.store(state, Ordering::Relaxed);
+            for place in [None, at(c"file")] {
+                let opened = file.reopen(place).unwrap();
+                check_flags(&opened);
+                let mut data = [0; 16];
+                let read = rustix::io::pread(opened.as_fd(), &mut data, 0).unwrap();
+                assert_eq!(&data[..read], b"pinned");
+            }
+            let opened = directory.reopen(None).unwrap();
+            check_flags(&opened);
+            assert_eq!(listed(&opened), [c"inside".to_owned()]);
+            check_flags(&unsearchable.reopen(None).unwrap());
+        }
+        EMPTYPATH.store(EmptyPath::UNKNOWN, Ordering::Relaxed);
+        let opened = directory.reopen(at(c"moved-dir")).unwrap();
+        check_flags(&opened);
+        assert_eq!(listed(&opened), [c"inside".to_owned()]);
+        check_flags(&unsearchable.reopen(at(c"unsearchable")).unwrap());
+        // Another directory, a regular file, a symbolic link to the
+        // directory, and nothing.
+        symlink("moved-dir", dir.join("dir-link")).unwrap();
+        for name in [c"dir", c"file", c"dir-link", c"gone"] {
+            let reopened = directory.reopen(at(name));
+            assert!(matches!(reopened, Err(Failure::Changed)), "{:?}: {:?}", name, reopened);
+        }
+        let opens = Opens::of(&dir.join("fifo"));
+        for name in [c"link", c"fifo", c"socket"] {
+            let entry = Entry::open_at(tree.as_fd(), name).unwrap();
+            for place in [None, at(name)] {
+                assert_eq!(errno(entry.reopen(place)), libc::EINVAL, "{:?}", name);
+            }
+        }
+        assert!(!opens.seen());
+        let dev = open_dir(Path::new("/dev"));
+        let null = Entry::open_at(dev.as_fd(), c"null").unwrap();
+        let place = Place {
+            dir: dev.as_fd(),
+            name: c"null",
+        };
+        assert_eq!(errno(null.reopen(Some(place))), libc::EINVAL);
+    }
+
+    /// The data of a file that is open already is hashed through that
+    /// descriptor, with the same checks as otherwise. A directory that is
+    /// open has no data to hash.
+    #[test]
+    fn hashes_through_an_open_file() {
+        let tmp = TempDir::new("sys-hash-open");
+        let dir = &tmp.0;
+        let data: Vec<u8> = (0..DATA_BUFFER_SIZE + 5).map(|i| (i % 249) as u8).collect();
+        fs::write(dir.join("file"), &data).unwrap();
+        fs::create_dir(dir.join("dir")).unwrap();
+        let tree = open_dir(dir);
+        let entry = Entry::open_at(tree.as_fd(), c"file").unwrap();
+        let mut buffer = vec![0; DATA_BUFFER_SIZE];
+        let mut hash = DataHash::of(&entry, entry.reopen(None).unwrap()).unwrap();
+        let found = loop {
+            match hash.read(&mut buffer, 4096).unwrap() {
+                ControlFlow::Break(found) => break found,
+                ControlFlow::Continue(more) => hash = more,
+            }
+        };
+        assert_eq!(found, Sha256::digest(&data));
+        // A file that changes after it was opened again changed while it
+        // was read.
+        let hash = DataHash::of(&entry, entry.reopen(None).unwrap()).unwrap();
+        wait_for_clock(dir, entry.status().ctime);
+        OpenOptions::new()
+            .append(true)
+            .open(dir.join("file"))
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let read = hash.read(&mut buffer, u64::MAX);
+        assert!(matches!(read, Err(Failure::Changed)), "{:?}", read);
+        let directory = Entry::open_at(tree.as_fd(), c"dir").unwrap();
+        let opened = directory
+            .reopen(Some(Place {
+                dir: tree.as_fd(),
+                name: c"dir",
+            }))
+            .unwrap();
+        assert_eq!(errno(DataHash::of(&directory, opened)), libc::EINVAL);
+    }
+
     /// The data of a file of procfs goes on after its size, which is 0,
     /// and the status of the file shows no change.
     #[test]
@@ -1221,6 +1787,8 @@ mod tests {
         assert_eq!(entry.status().size, DataHash::MAX_SIZE + 1);
         assert_eq!(errno(DataHash::admits(entry.status())), libc::EFBIG);
         assert_eq!(errno(DataHash::start(&entry)), libc::EFBIG);
+        let opened = entry.reopen(None).unwrap();
+        assert_eq!(errno(DataHash::of(&entry, opened)), libc::EFBIG);
         // A file that may not be opened fails for its size all the same:
         // nothing opens it.
         fs::set_permissions(dir.join("file"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -1241,6 +1809,7 @@ mod tests {
     /// An entry says whether it is an automount point that nothing is
     /// mounted on, and taking its handle mounts nothing, with open_tree()
     /// and with openat(), and neither does what is read through the handle.
+    /// It is not opened: by its name that would mount what it stands for.
     /// Only root can make one, so the test takes one that is there:
     /// `UAPI16_TEST_AUTOMOUNT` names a directory that is one, such as the
     /// mount point of an automount unit of systemd, or `tracing` in a
@@ -1265,6 +1834,17 @@ mod tests {
                 assert!(entry.is_automount(), "{}", point.display());
                 assert_eq!(entry.status().file_type, FileType::Directory);
                 Status::of(entry.handle()).unwrap();
+                FdLink::new(entry.handle()).check().unwrap();
+                // Whether it has extended attributes is its file system's
+                // to say. Asking mounts nothing.
+                let _ = UserXattrs::new().read_unopened(&entry);
+                let place = Place {
+                    dir: parent.as_fd(),
+                    name,
+                };
+                for place in [Some(place), None] {
+                    assert_eq!(errno(entry.reopen(place)), libc::EINVAL);
+                }
             }
         });
         // A directory that is none says so.

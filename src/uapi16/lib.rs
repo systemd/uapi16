@@ -97,16 +97,27 @@ mod directory;
 mod error;
 mod features;
 mod hex;
+// The ioctls rustix has no call for and the lookups in the user database
+// are the only unsafe code of the crate but for the one cast of the module
+// name. Each is in a module of its own, which says what it makes sure of.
+// Only the module sys calls them.
+#[allow(unsafe_code)]
+mod ioctl;
 mod metadata;
 mod name;
+#[allow(unsafe_code)]
+mod nss;
 mod object;
-mod reader;
-mod sequence;
-mod strict;
 // Only the tests use the files of a tree and the system calls of the
 // builder until ManifestWriter does. PinnedDirectory shares the reopen of
 // a pinned file. A module with something that no other module uses
-// expects dead code.
+// expects dead code. The modules ioctl and nss need none: what expects to
+// be unused uses them.
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod optional;
+mod reader;
+mod sequence;
+mod strict;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod sys;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
@@ -175,6 +186,20 @@ pub(crate) mod testing {
     use std::fs;
     use std::num::NonZeroU64;
     use std::path::PathBuf;
+
+    /// Whether the kernel has O_EMPTYPATH, asked of the kernel itself. What
+    /// the process found out about it is no answer while tests run: those
+    /// that open a file both ways set it for a while.
+    pub(crate) fn has_empty_path() -> bool {
+        use rustix::fs::{Mode, OFlags};
+        let handle = rustix::fs::open(".", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::from_bits_retain(crate::sys::EmptyPath::FLAG);
+        match rustix::fs::openat(&handle, "", flags, Mode::empty()) {
+            Ok(_) => true,
+            Err(rustix::io::Errno::NOENT) => false,
+            Err(e) => panic!("{}", e),
+        }
+    }
 
     /// A directory of its own below the temporary directory, removed with
     /// everything in it when the test ends.

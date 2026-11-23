@@ -589,6 +589,13 @@ impl Error {
         self
     }
 
+    /// Names the feature the error is about, a single one.
+    #[must_use]
+    pub(crate) fn about(mut self, feature: Features) -> Error {
+        self.0.feature = Some(feature);
+        self
+    }
+
     /// Names the field the error is about.
     #[must_use]
     pub(crate) fn at(mut self, field: Field) -> Error {

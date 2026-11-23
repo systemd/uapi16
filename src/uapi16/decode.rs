@@ -719,19 +719,24 @@ impl FileObject {
         }
     }
 
-    /// Checks `name`, the value of `field`, as the name of a user or of a
-    /// group. systemd's relaxed rules take anything that is not obviously
-    /// broken or a number in disguise.
-    pub(crate) fn check_owner_name(field: Field, name: &str, subject: Subject<'_>) -> Result<(), Error> {
+    /// Whether `name` can be the name of a user or of a group. systemd's
+    /// relaxed rules take anything that is not obviously broken or a number
+    /// in disguise.
+    pub(crate) fn is_owner_name(name: &str) -> bool {
         let digits = name.strip_prefix('-').unwrap_or(name);
-        if name.is_empty()
+        !(name.is_empty()
             || name.starts_with(' ')
             || name.ends_with(' ')
             || name == "."
             || name == ".."
             || name.chars().any(|c| c.is_ascii_control() || c == ':' || c == '/')
-            || digits.bytes().all(|b| b.is_ascii_digit())
-        {
+            || digits.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// Checks `name`, the value of `field`, as the name of a user or of a
+    /// group, see [`FileObject::is_owner_name`].
+    pub(crate) fn check_owner_name(field: Field, name: &str, subject: Subject<'_>) -> Result<(), Error> {
+        if !FileObject::is_owner_name(name) {
             return Err(Error::manifest(
                 Problem::WrongFieldType,
                 format!("{}: {} '{}' is not a valid name", subject, field, name.escape_debug()),
@@ -741,10 +746,16 @@ impl FileObject {
         Ok(())
     }
 
-    /// Checks `name` as the name of an extended attribute: it is not empty
-    /// and has no control character.
+    /// Whether `name` can be the name of an extended attribute: it is not
+    /// empty and has no control character.
+    pub(crate) fn is_xattr_name(name: &str) -> bool {
+        !name.is_empty() && !name.chars().any(|c| c.is_ascii_control())
+    }
+
+    /// Checks `name` as the name of an extended attribute, see
+    /// [`FileObject::is_xattr_name`].
     pub(crate) fn check_xattr_name(name: &str, subject: Subject<'_>) -> Result<(), Error> {
-        if name.is_empty() || name.chars().any(|c| c.is_ascii_control()) {
+        if !FileObject::is_xattr_name(name) {
             return Err(Error::manifest(
                 Problem::InvalidExtendedAttributes,
                 format!("{}: invalid extended attribute name '{}'", subject, name.escape_debug()),

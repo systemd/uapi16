@@ -32,7 +32,7 @@ updates:
           - "typenum"
     ignore:
       # Stay on 0.2 like pathrs, errno, getrandom and sha2's cpufeatures,
-      # so that the tests never build two versions of libc.
+      # so that no build has two versions of libc.
       - dependency-name: "libc"
         update-types:
           - "version-update:semver-major"
