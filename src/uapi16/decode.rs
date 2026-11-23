@@ -466,10 +466,12 @@ impl FileObject {
 
     /// Fills in what follows from the contents objects, as a reader does:
     /// what each of them says of its own data, and the size and the hash of
-    /// the data of the object. Where fields contradict each other nothing
-    /// follows from them, and a writer refuses the object. So where the
-    /// fields of one contents object contradict each other, nothing is
-    /// filled in for the object, as a reader refuses its record.
+    /// the data of the object. Only a contents object a reader takes gives
+    /// anything: one whose values a reader takes, see
+    /// [`ContentsObject::check_values`], and whose fields agree with each
+    /// other. Where one of them does not, nothing is filled in for the
+    /// object either, as a reader refuses its record and a writer refuses
+    /// the object.
     pub(crate) fn fill_in_from_contents(&mut self) {
         // The object is in no record, and what is wrong with it is not
         // shown, so the number of the record does not matter.
@@ -477,17 +479,22 @@ impl FileObject {
         let data: Vec<_> = self
             .contents
             .iter()
-            .map(|contents| contents.check_consistency(subject).ok())
+            .map(|contents| {
+                contents
+                    .check_values(subject)
+                    .and_then(|()| contents.check_consistency(subject))
+                    .ok()
+            })
             .collect();
-        let consistent = data.iter().all(Option::is_some);
+        let taken = data.iter().all(Option::is_some);
         for (contents, data) in self.contents.iter_mut().zip(data) {
             if let Some(data) = data {
                 contents.fill_in(data);
             }
         }
-        // A contents object that contradicts itself gives nothing for the
-        // object either. A reader refuses its record.
-        if !consistent {
+        // A contents object a reader refuses gives nothing for the object
+        // either. A reader refuses its record.
+        if !taken {
             return;
         }
         let subject = Subject::new(self, ROOT_RECORD);
@@ -2933,9 +2940,10 @@ mod tests {
     }
 
     /// set_contents() fills in what a reader fills in for the same record,
-    /// marks and all. Where the fields of a contents object contradict each
-    /// other, a reader refuses the record, and set_contents() fills in
-    /// nothing for the object: neither its size nor its hash.
+    /// marks and all. Where a contents object has fields that contradict
+    /// each other or a value a reader refuses, a reader refuses the record,
+    /// and set_contents() fills in nothing for the object: neither its size
+    /// nor its hash.
     #[test]
     fn set_contents_fills_in_what_a_reader_does() {
         let hello: Option<Sha256> = HELLO.parse().ok();
@@ -3037,6 +3045,19 @@ mod tests {
                     }],
                 ),
             ),
+            (
+                r#"{"name":"x","contents":[{"url":"https://example.com/x","httpHeaders":{"A":"b"},"originalSize":5}]}"#
+                    .to_string(),
+                set(
+                    None,
+                    None,
+                    vec![ContentsObject {
+                        http_headers: vec![("A".into(), "b".into())],
+                        original_size: Some(5),
+                        ..ContentsObject::new(ContentsSource::Url("https://example.com/x".into()))
+                    }],
+                ),
+            ),
         ] {
             assert_eq!(object, self::object(&record), "{}", record);
         }
@@ -3078,6 +3099,51 @@ mod tests {
             if let [agrees, _] = object.contents() {
                 assert!(agrees.filled_in().contains(Field::EncodedSize), "{}", record);
             }
+        }
+        // A contents object with a value a reader refuses: a URL that is
+        // neither http nor https, the encoding that stands for none and a
+        // name that is not one of an HTTP header field.
+        let ftp = || ContentsObject::new(ContentsSource::Url("ftp://example.com/x".into()));
+        let https = || ContentsObject::new(ContentsSource::Url("https://example.com/x".into()));
+        for (record, contents, field) in [
+            (
+                r#"{"name":"x","contents":[{"url":"ftp://example.com/x","originalSize":5}]}"#,
+                ContentsObject {
+                    original_size: Some(5),
+                    ..ftp()
+                },
+                Field::Url,
+            ),
+            (
+                r#"{"name":"x","contents":[{"literal":"aGVsbG8=","encoding":"identity","originalSize":5}]}"#,
+                ContentsObject {
+                    encoding: Some("identity".into()),
+                    original_size: Some(5),
+                    ..literal()
+                },
+                Field::Encoding,
+            ),
+            (
+                r#"{"name":"x","contents":[{"url":"https://example.com/x","httpHeaders":{"bad name":"b"},"originalSize":5}]}"#,
+                ContentsObject {
+                    http_headers: vec![("bad name".into(), "b".into())],
+                    original_size: Some(5),
+                    ..https()
+                },
+                Field::HttpHeaders,
+            ),
+        ] {
+            let e = refused(record);
+            assert_eq!(
+                (e.kind(), e.field()),
+                (ErrorKind::Manifest(Problem::InvalidContents), Some(field)),
+                "{}",
+                record
+            );
+            let object = set(None, None, vec![contents.clone()]);
+            assert_eq!((object.size(), object.sha256()), (None, None), "{}", record);
+            assert!(object.filled_in().is_empty(), "{}", record);
+            assert_eq!(object.contents(), [contents], "{}", record);
         }
     }
 

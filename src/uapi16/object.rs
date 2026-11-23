@@ -1818,12 +1818,15 @@ impl FileObject {
 
     /// Sets `contents`, and fills in what follows from them as a reader
     /// does, see [`FilledIn`]: what each contents object says of its own
-    /// data, and the size and the hash of the data of the file. Where the
-    /// fields of one contents object contradict each other, the size and
-    /// the hash of the file are not filled in. What a reader filled in that
-    /// no longer follows is dropped, and what the object states stays. A
-    /// writer refuses an object whose fields contradict each other, and
-    /// more than [`MAX_CONTENTS`] contents objects.
+    /// data, and the size and the hash of the data of the file. Only a
+    /// contents object a reader takes gives anything. Where one has a value
+    /// a reader refuses, such as a URL that is neither http nor https, or
+    /// fields that contradict each other, nothing is filled in for it, and
+    /// the size and the hash of the file are not filled in either. What a
+    /// reader filled in that no longer follows is dropped, and what the
+    /// object states stays. A writer refuses an object whose fields
+    /// contradict each other or that has such a value, and more than
+    /// [`MAX_CONTENTS`] contents objects.
     ///
     /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
     pub fn set_contents(&mut self, contents: Vec<ContentsObject>) {

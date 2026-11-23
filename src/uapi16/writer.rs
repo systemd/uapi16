@@ -739,6 +739,16 @@ impl ContentsObject {
         }
     }
 
+    /// Checks every value of the contents object, one of those of the file
+    /// object `subject` names, as a reader does: its strings, see
+    /// [`ContentsObject::check_strings`], and the value of every field, see
+    /// [`ContentsObject::check`]. [`ContentsObject::check_consistency`]
+    /// checks the fields against each other.
+    pub(crate) fn check_values(&self, subject: Subject<'_>) -> Result<(), Error> {
+        self.check_strings(subject)?;
+        self.check(subject)
+    }
+
     /// The header fields in the order of their names, which is the order
     /// they are written in.
     fn sorted_headers(&self) -> Vec<&(String, String)> {
