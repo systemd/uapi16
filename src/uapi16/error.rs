@@ -624,6 +624,19 @@ impl Error {
         .at(Field::Contents)
     }
 
+    /// A contents object of the file object `subject` names whose offset
+    /// `offset` is beyond the size `total` of its data.
+    pub(crate) fn offset_beyond_data(subject: Subject<'_>, offset: u64, total: u64) -> Error {
+        Error::manifest(
+            Problem::InvalidContents,
+            format!(
+                "{}: contents offset {} is beyond the data size {}",
+                subject, offset, total
+            ),
+        )
+        .at(Field::Offset)
+    }
+
     /// `object`, which `subject` names, states the flag of the field
     /// `field`, which it cannot have, see [`FileObject::unpermitted_flag`].
     pub(crate) fn unpermitted_flag(object: &FileObject, field: Field, subject: Subject<'_>) -> Error {

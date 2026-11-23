@@ -520,8 +520,11 @@ impl FileObject {
             let Some(total) = original.size else {
                 continue;
             };
-            // ContentsObject::check_consistency found the offset inside the data.
-            let rest = total - contents.offset;
+            // The offset of a contents object that passed its own check is
+            // inside the data.
+            let Some(rest) = total.checked_sub(contents.offset) else {
+                return Err(Error::offset_beyond_data(subject, contents.offset, total));
+            };
             match (self.size, data.size) {
                 (Some(stated), _) => {
                     if contents.offset.checked_add(stated).is_none_or(|end| end > total) {
@@ -780,14 +783,7 @@ impl ContentsObject {
         }
         if let Some(total) = data.original.size {
             if self.offset > total {
-                return Err(Error::manifest(
-                    Problem::InvalidContents,
-                    format!(
-                        "{}: contents offset {} is beyond the data size {}",
-                        subject, self.offset, total
-                    ),
-                )
-                .at(Field::Offset));
+                return Err(Error::offset_beyond_data(subject, self.offset, total));
             }
         }
         Ok(data)
@@ -2476,6 +2472,51 @@ mod tests {
             let read = refused(&record);
             assert_eq!((e.kind(), e.field()), (read.kind(), read.field()), "{}", record);
         }
+    }
+
+    /// set_contents() holds the object against its contents objects, also
+    /// against one whose offset is beyond its data, which its own check
+    /// refuses. There is no rest of the data from that offset on, and the
+    /// size the object has stays.
+    #[test]
+    fn set_contents_with_an_offset_beyond_the_data() {
+        let file = |offset: u64, original_size: u64| {
+            let mut contents = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+            contents.set_offset(offset);
+            contents.set_original_size(Some(original_size));
+            contents
+        };
+        let mut headers = ContentsObject::new(ContentsSource::Implied);
+        headers.set_http_headers(vec![("A".to_string(), "b".to_string())]);
+        headers.set_original_size(Some(0));
+        headers.set_offset(1);
+        let mut encoded = ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()));
+        encoded.set_encoding(Some("gzip".to_string()));
+        encoded.set_original_size(Some(3));
+        encoded.set_offset(4);
+        let whole = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+        for (size, contents) in [
+            (None, vec![file(6, 5)]),
+            (Some(1), vec![file(6, 5)]),
+            (None, vec![headers]),
+            (None, vec![encoded]),
+            (None, vec![whole, file(5, 4)]),
+            (None, vec![file(u64::MAX, 0)]),
+        ] {
+            let mut object = FileObject::new(Name::new("x").unwrap());
+            object.set_size(size);
+            object.set_contents(contents);
+            assert_eq!(object.size(), size, "{:?}", object);
+            assert!(!object.filled_in().contains(Field::Size), "{:?}", object);
+        }
+        // An object a reader read, with the offset set beyond the data.
+        let mut object = object(r#"{"name":"x","contents":[{"file":"a","originalSize":5}]}"#);
+        assert_eq!(object.size(), Some(5));
+        let mut contents = object.take_contents();
+        contents[0].set_offset(6);
+        object.set_contents(contents);
+        assert_eq!(object.size(), None);
+        assert!(!object.filled_in().contains(Field::Size));
     }
 
     /// `gptFlags` holds the flags that `gptFlagNoAuto`,
