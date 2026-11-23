@@ -4,39 +4,16 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
 
-use pathrs::error::{Error as PathrsError, ErrorKind as PathrsErrorKind};
-use pathrs::flags::{OpenFlags, ResolverFlags};
+use pathrs::flags::ResolverFlags;
 use pathrs::{Handle, Root};
 use rustix::fs::{FileType, Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::content::{Directory, ExternalFile, OpenError};
+use crate::sys::{pathrs_io_error, PinnedFile};
 use crate::{Error, FileObject, Name};
-
-/// What this process found out about O_EMPTYPATH: whether the kernel
-/// reopens a descriptor with `openat(fd, "", O_EMPTYPATH | ..)`, which
-/// needs no procfs. Linux 7.2 has it.
-struct EmptyPath;
-
-impl EmptyPath {
-    /// O_EMPTYPATH, include/uapi/asm-generic/fcntl.h. No architecture
-    /// overrides it, and fs/fcntl.c checks at build time that it is a bit
-    /// of its own on every architecture.
-    const FLAG: u32 = 1 << 26;
-    /// Not tried yet.
-    const UNKNOWN: u8 = 0;
-    /// It worked once, so ENOENT is the file's own error from now on.
-    const WORKS: u8 = 1;
-    /// The kernel ignored the flag and refused the empty path.
-    const MISSING: u8 = 2;
-}
-
-/// The state of [`EmptyPath`] for this process.
-static EMPTYPATH: AtomicU8 = AtomicU8::new(EmptyPath::UNKNOWN);
 
 /// The directory on the host the files of a manifest are taken from: the
 /// one the manifest lives in, or the one the caller chose instead. It is
@@ -65,18 +42,6 @@ pub struct PinnedDirectory {
 }
 
 impl PinnedDirectory {
-    /// How a file is opened once it is pinned and known to be a regular
-    /// file: for reading, without waiting for anything, and without
-    /// becoming the controlling terminal.
-    const OPEN_FLAGS: OpenFlags = OpenFlags::O_RDONLY
-        .union(OpenFlags::O_NONBLOCK)
-        .union(OpenFlags::O_NOCTTY);
-    /// The same for the reopen through rustix, with O_CLOEXEC, which
-    /// pathrs adds on its own.
-    const REOPEN_FLAGS: OFlags = OFlags::RDONLY
-        .union(OFlags::NONBLOCK)
-        .union(OFlags::NOCTTY)
-        .union(OFlags::CLOEXEC);
     /// How [`PinnedDirectory::open`] opens the directory: as a handle that
     /// nothing is read through, for a directory and nothing else.
     const DIRECTORY_FLAGS: OFlags = OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
@@ -176,7 +141,7 @@ impl PinnedDirectory {
         } else {
             file.as_str()
         };
-        let pinned = self.root.resolve(path).map_err(PinnedDirectory::io_error)?;
+        let pinned = self.root.resolve(path).map_err(pathrs_io_error)?;
         let stat = rustix::fs::fstat(&pinned).map_err(io::Error::from)?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(OpenError::NotRegular);
@@ -186,39 +151,10 @@ impl PinnedDirectory {
         Ok((pinned, len))
     }
 
-    /// Opens the regular file `pinned` refers to for reading: through
-    /// O_EMPTYPATH where the kernel has it, probed the way systemd's
-    /// fd_reopen() does, and with the checked reopen of pathrs through
-    /// procfs where it does not.
+    /// Opens the regular file `pinned` refers to for reading, through the
+    /// handle, as [`PinnedFile::reopen`] does.
     fn reopen(pinned: &Handle) -> io::Result<File> {
-        let state = EMPTYPATH.load(Ordering::Relaxed);
-        if state != EmptyPath::MISSING {
-            let flags = PinnedDirectory::REOPEN_FLAGS | OFlags::from_bits_retain(EmptyPath::FLAG);
-            match rustix::fs::openat(pinned, "", flags, Mode::empty()) {
-                Ok(fd) => {
-                    EMPTYPATH.store(EmptyPath::WORKS, Ordering::Relaxed);
-                    return Ok(File::from(fd));
-                }
-                // An older kernel ignores the flag and refuses the empty
-                // path. Once it worked, ENOENT comes from the file itself.
-                Err(Errno::NOENT) if state != EmptyPath::WORKS => {
-                    EMPTYPATH.store(EmptyPath::MISSING, Ordering::Relaxed);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        pinned
-            .reopen(PinnedDirectory::OPEN_FLAGS)
-            .map_err(PinnedDirectory::io_error)
-    }
-
-    /// The error `error` of pathrs as an I/O error: that of the system call
-    /// that failed, or the error of pathrs itself where none did.
-    fn io_error(error: PathrsError) -> io::Error {
-        match error.kind() {
-            PathrsErrorKind::OsError(Some(errno)) => io::Error::from_raw_os_error(errno),
-            _ => io::Error::other(error),
-        }
+        PinnedFile::new(pinned.as_fd()).reopen()
     }
 }
 
@@ -236,15 +172,18 @@ impl Directory for PinnedDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::{EmptyPath, EMPTYPATH};
     use crate::testing::TempDir;
     use crate::{
         ContentsObject, ContentsSource, DataCheck, DataLocation, DataProblem, DirectoryProvider, ErrorKind, NameBuf,
         Sha256, Sha256Context, SourceProblem,
     };
     use rustix::fs::{SeekFrom, CWD};
+    use rustix::io::Errno;
     use std::fs;
     use std::io::Read;
     use std::os::unix::fs::{symlink, FileExt};
+    use std::sync::atomic::Ordering;
 
     /// What `dir` has under `name`: the text of a regular file, or why it
     /// has none.

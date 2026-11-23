@@ -103,6 +103,14 @@ mod object;
 mod reader;
 mod sequence;
 mod strict;
+// Only the tests use the files of a tree and the system calls of the
+// builder until ManifestWriter does. PinnedDirectory shares the reopen of
+// a pinned file. A module with something that no other module uses
+// expects dead code.
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod sys;
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod tree;
 mod writer;
 
 pub use blocking::{Reader, Writer};

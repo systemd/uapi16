@@ -264,7 +264,8 @@ pub enum TreeProblem {
     /// A file that is not a directory is where a directory is needed.
     NotDirectory,
     /// A feature that was asked for cannot be read here.
-    /// [`Error::feature`] gives the feature.
+    /// [`Error::feature`] gives the feature. Without a feature, the kernel
+    /// is too old to tell mount points apart: statx() reports no mount ID.
     FeatureUnavailable,
     /// A feature of a partition, such as [`Features::GPT_LABEL`], was asked
     /// for. It does not apply to a tree of files. [`Error::feature`] gives
@@ -836,7 +837,7 @@ impl fmt::Display for Error {
         match (&self.0.kind, &self.0.cause) {
             // An I/O error shows as its cause, but for one that says what
             // it was about, such as one of a Writer after a write that
-            // failed.
+            // failed or one of a file of a tree.
             (ErrorKind::Io, Some(Cause::Io(e))) if self.0.message.is_empty() => e.fmt(f),
             _ => f.write_str(&self.0.message),
         }

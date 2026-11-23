@@ -30,7 +30,9 @@ sha2.workspace = true
 # PinnedDirectory.
 pathrs.workspace = true
 # PinnedDirectory, and the device numbers of FileObject::from_metadata().
-rustix = { workspace = true, features = ["fs"] }
+# open_tree(), which takes the handle of a file of a tree, is in the mount
+# module.
+rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
 # The errno values of the errors the tests make.
