@@ -335,6 +335,14 @@ impl<W: Write> Writer<W> {
         &self.out
     }
 
+    /// What the manifest is written to, to change it, such as to flush it
+    /// in between. Writing to it directly breaks the manifest the writer
+    /// writes. The writer holds nothing back: every method writes its whole
+    /// record to it before it returns.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
     /// Writes out the record that `encode` has the encoder put together.
     fn send_record(&mut self, encode: impl FnOnce(&mut Encoder) -> Result<(), Error>) -> Result<(), Error> {
         let record_number = self.encoder.next_record;
@@ -688,6 +696,17 @@ mod tests {
         assert_eq!(objects.len(), 2);
         assert_eq!(reader.signed_len(), u64::try_from(signed).ok());
         assert_eq!(Sha256::digest(&bytes[..signed]), hash);
+    }
+
+    /// What the writer writes to is lent out as it is, with every record
+    /// written so far in it.
+    #[test]
+    fn lends_out_what_it_writes_to() {
+        let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
+        let root = sequence(&[ROOT]);
+        assert_eq!(writer.get_mut(), &root);
+        writer.get_mut().flush().unwrap();
+        assert_eq!(writer.finish().unwrap(), sequence(&[ROOT, TRAILER]));
     }
 
     /// Notes every write and every flush, and fails the write `fail_at`.
