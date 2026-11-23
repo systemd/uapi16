@@ -7,7 +7,7 @@ use std::io;
 use crate::decode::Subject;
 use crate::object::FileObject;
 use crate::strict::{ParseError, ParseErrorKind};
-use crate::{MAX_CONTENTS, MAX_RECORD_SIZE};
+use crate::{NameProblem, MAX_CONTENTS, MAX_RECORD_SIZE};
 
 /// What is wrong with a manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -635,6 +635,21 @@ impl Error {
             ),
         )
         .at(Field::Offset)
+    }
+
+    /// A contents object of the file object `subject` names whose `file`
+    /// is `file`, which is no name of a file for the reason `reason`.
+    pub(crate) fn invalid_file_reference(subject: Subject<'_>, reason: NameProblem, file: &str) -> Error {
+        Error::manifest(
+            Problem::InvalidContents,
+            format!(
+                "{}: contents file reference: {}: '{}'",
+                subject,
+                reason,
+                file.escape_debug()
+            ),
+        )
+        .at(Field::File)
     }
 
     /// `object`, which `subject` names, states the flag of the field

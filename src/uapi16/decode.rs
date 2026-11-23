@@ -1862,19 +1862,11 @@ impl<'a> Part<'a> for ContentsElement {
             match field {
                 Field::File => {
                     if let Some(file) = decoder.string(field, value) {
-                        match Name::new(file.as_ref()) {
-                            Ok(file) => {
-                                contents.source = ContentsSource::File(file);
-                                places += 1;
-                            }
-                            Err(reason) => decoder.note_error(Problem::InvalidContents, field, || {
-                                format!(
-                                    "{}: contents file reference: {}: '{}'",
-                                    subject,
-                                    reason,
-                                    file.escape_debug()
-                                )
-                            }),
+                        let name = Name::new(file.as_ref())
+                            .map_err(|reason| Error::invalid_file_reference(subject, reason, &file));
+                        if let Some(name) = decoder.note_err(name) {
+                            contents.source = ContentsSource::File(name);
+                            places += 1;
                         }
                     }
                 }
@@ -3101,8 +3093,9 @@ mod tests {
             }
         }
         // A contents object with a value a reader refuses: a URL that is
-        // neither http nor https, the encoding that stands for none and a
-        // name that is not one of an HTTP header field.
+        // neither http nor https, the encoding that stands for none, a name
+        // that is not one of an HTTP header field, and the name of the root
+        // as the file.
         let ftp = || ContentsObject::new(ContentsSource::Url("ftp://example.com/x".into()));
         let https = || ContentsObject::new(ContentsSource::Url("https://example.com/x".into()));
         for (record, contents, field) in [
@@ -3131,6 +3124,14 @@ mod tests {
                     ..https()
                 },
                 Field::HttpHeaders,
+            ),
+            (
+                r#"{"name":"x","contents":[{"file":"","originalSize":5}]}"#,
+                ContentsObject {
+                    original_size: Some(5),
+                    ..ContentsObject::new(ContentsSource::File(Name::ROOT))
+                },
+                Field::File,
             ),
         ] {
             let e = refused(record);
