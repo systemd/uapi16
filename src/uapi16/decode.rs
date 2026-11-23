@@ -93,11 +93,12 @@ enum SizeHashConflict {
 }
 
 /// The object a message is about: `manifest object 5`, and with its name
-/// `manifest object 5 (EFI/BOOT)`.
+/// `manifest object 5 (EFI/BOOT)`. A file object that is in no manifest
+/// yet is `file object (EFI/BOOT)`.
 #[derive(Clone, Copy)]
 pub(crate) struct Subject<'a> {
-    /// The number of the record the object is in.
-    record_number: u64,
+    /// The number of the record the object is in, if it is in one.
+    record_number: Option<u64>,
     name: Option<&'a str>,
 }
 
@@ -123,15 +124,32 @@ impl<'a> Subject<'a> {
     /// `record_number`.
     pub(crate) fn new(object: &'a FileObject, record_number: u64) -> Subject<'a> {
         Subject {
-            record_number,
+            record_number: Some(record_number),
             name: (!object.name.is_root()).then_some(object.name.as_str()),
+        }
+    }
+
+    /// The file object `object`, which is in no manifest yet.
+    pub(crate) fn unwritten(object: &'a FileObject) -> Subject<'a> {
+        Subject {
+            record_number: None,
+            name: (!object.name.is_root()).then_some(object.name.as_str()),
+        }
+    }
+
+    /// A file object of the record with the number `record_number` that
+    /// has no name, or whose name is not known yet.
+    pub(crate) fn unnamed(record_number: u64) -> Subject<'static> {
+        Subject {
+            record_number: Some(record_number),
+            name: None,
         }
     }
 
     /// The root file object, which the first record holds.
     pub(crate) fn root() -> Subject<'static> {
         Subject {
-            record_number: ROOT_RECORD,
+            record_number: Some(ROOT_RECORD),
             name: Some(ROOT_NAME),
         }
     }
@@ -139,7 +157,10 @@ impl<'a> Subject<'a> {
 
 impl fmt::Display for Subject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "manifest object {}", self.record_number)?;
+        match self.record_number {
+            Some(record_number) => write!(f, "manifest object {}", record_number)?,
+            None => f.write_str("file object")?,
+        }
         match self.name {
             Some(name) => write!(f, " ({})", name.escape_debug()),
             None => Ok(()),
@@ -373,7 +394,7 @@ impl Draft {
     /// follows from them.
     fn finish(&mut self, record_number: u64) -> Result<(), Error> {
         let Some(name) = self.name.take() else {
-            return Err(Error::no_name(record_number));
+            return Err(Error::no_name(Subject::unnamed(record_number)).in_record(record_number));
         };
         let object = &mut *self.object;
         object.name = name;
@@ -1350,10 +1371,7 @@ impl<'a> RecordDecoder<'a> {
         if self.record_number == ROOT_RECORD {
             return Subject::root();
         }
-        Subject {
-            record_number: self.record_number,
-            name: None,
-        }
+        Subject::unnamed(self.record_number)
     }
 
     /// What the part made of `value`, which is none for null. A value of

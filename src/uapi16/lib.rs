@@ -96,7 +96,6 @@ mod digest;
 mod directory;
 mod error;
 mod features;
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod hardlink;
 mod hex;
 // The ioctls rustix has no call for and the lookups in the user database
@@ -105,23 +104,26 @@ mod hex;
 // Only the module sys calls them.
 #[allow(unsafe_code)]
 mod ioctl;
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod listing;
 mod metadata;
 mod name;
 #[allow(unsafe_code)]
 mod nss;
 mod object;
-// Only the tests use the files of a tree and the system calls of the
-// builder until ManifestWriter does. PinnedDirectory shares the reopen of
-// a pinned file. A module with something that no other module uses
-// expects dead code. The modules ioctl and nss need none: what expects to
-// be unused uses them.
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod optional;
 mod reader;
+mod record;
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod scratch;
 mod sequence;
+mod sort;
 mod strict;
+// Only the tests use the modules of the manifest builder until
+// ManifestWriter does, and PinnedDirectory shares the reopen of a pinned
+// file. A module with something that no other module uses expects dead
+// code.
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod sys;
 mod tree;

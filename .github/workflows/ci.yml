@@ -258,6 +258,14 @@ jobs:
       - name: Test the DOS attributes and the volume serial number
         run: cargo test --locked --lib -- --exact ioctl::tests::fat optional::tests::fat
 
+      - name: Sort on FAT
+        # The scratch file of a sort on a file system that has no O_TMPFILE
+        # and can't punch holes, in a directory of its own, which the tests
+        # of the DOS attributes don't look at.
+        run: |
+          mkdir "$UAPI16_TEST_FAT_DIR/tmp"
+          TMPDIR=$UAPI16_TEST_FAT_DIR/tmp cargo test --locked --lib -- --exact sort::tests::gives_room_back
+
   clippy:
     name: clippy (rustc ${{ matrix.rust }})
     runs-on: ubuntu-26.04

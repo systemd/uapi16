@@ -73,10 +73,6 @@ pub(crate) struct Encoder {
     pub(crate) record: Vec<u8>,
 }
 
-// Nothing but the tests appends records to a string until the listing of
-// the manifest builder does, so what does that is expected to be unused
-// until then.
-#[cfg_attr(not(test), expect(dead_code, reason = "the listing is the first user"))]
 impl Encoder {
     /// Starts a manifest with the root file object `root`: appends its
     /// record to `text`.
@@ -146,16 +142,18 @@ impl Encoder {
         // symbolic link without its target, gptFlags against the fields of
         // its flags, and where it comes. So the record is put together
         // first. Admitting the object makes it the one the next one is
-        // checked against, which comes last.
+        // checked against, which comes last. FileObject::check_alone() is
+        // the same but for the stage and the admission.
+        let subject = Subject::new(file, record_number);
         let encoded = self
             .write_record(file)
-            .and_then(|()| file.check_strings(record_number))
+            .and_then(|()| file.check_strings(subject))
             .and_then(|()| match self.stage {
                 Stage::Signatures => Err(Error::file_after_signature(record_number)),
                 _ => Ok(()),
             })
-            .and_then(|()| file.check(record_number))
-            .and_then(|()| self.sequence_check.check_fields(file, record_number))
+            .and_then(|()| file.check(subject))
+            .and_then(|()| self.sequence_check.check_fields(file, subject))
             .and_then(|()| self.sequence_check.admit(file, record_number));
         if let Err(e) = encoded {
             self.clear_record();
@@ -208,12 +206,22 @@ impl Encoder {
     /// A record larger than [`MAX_RECORD_SIZE`], its record separator
     /// included, is refused.
     fn write_record(&mut self, object: &impl Fields) -> Result<(), Error> {
-        self.record.clear();
-        self.record.push(RECORD_SEPARATOR);
-        serde_json::to_writer(&mut self.record, &Json(object)).expect("a record serializes into a Vec");
-        self.record.push(RECORD_END);
-        if self.record.len() > MAX_RECORD_SIZE {
+        let written = Encoder::put_together(&mut self.record, object);
+        if written.is_err() {
             self.clear_record();
+        }
+        written
+    }
+
+    /// Puts together the record of `object` in `record`, in place of what
+    /// it held. A record larger than [`MAX_RECORD_SIZE`], its record
+    /// separator included, is refused.
+    fn put_together(record: &mut Vec<u8>, object: &impl Fields) -> Result<(), Error> {
+        record.clear();
+        record.push(RECORD_SEPARATOR);
+        serde_json::to_writer(&mut *record, &Json(object)).expect("a record serializes into a Vec");
+        record.push(RECORD_END);
+        if record.len() > MAX_RECORD_SIZE {
             return Err(Error::record_too_large());
         }
         Ok(())
@@ -419,11 +427,28 @@ impl Serialize for FeatureNames {
 }
 
 impl FileObject {
-    /// Checks every string the record of the object, the one with the
-    /// number `record_number`, has, in the order of the keys, for what the
-    /// strings of a manifest may not hold.
-    fn check_strings(&self, record_number: u64) -> Result<(), Error> {
-        let subject = Subject::new(self, record_number);
+    /// Checks the object as a writer of a manifest that records `features`
+    /// in the order `order` does, on its own: all but where it comes, which
+    /// depends on the objects before it. That is the size of its record,
+    /// its strings, its fields and their features, in the order a reader
+    /// finds what is wrong with a record, see [`Encoder::encode_file`]. The
+    /// error names the object, which is in no record yet.
+    pub(crate) fn check_alone(&self, features: Features, order: Order) -> Result<(), Error> {
+        let subject = Subject::unwritten(self);
+        Encoder::put_together(&mut Vec::new(), self)
+            .and_then(|()| self.check_strings(subject))
+            .and_then(|()| self.check(subject))
+            .and_then(|()| SequenceCheck::new(features, Some(order)).check_fields(self, subject))
+            .map_err(|e| match self.name.is_root() {
+                true => e,
+                false => e.named(self.name.as_str()),
+            })
+    }
+
+    /// Checks every string the record of the object, which `subject`
+    /// names, has, in the order of the keys, for what the strings of a
+    /// manifest may not hold.
+    fn check_strings(&self, subject: Subject<'_>) -> Result<(), Error> {
         for contents in &self.contents {
             contents.check_strings(subject)?;
         }
@@ -434,14 +459,12 @@ impl FileObject {
         self.inode.check_owner_strings(subject)
     }
 
-    /// Checks the object, the one of the record with the number
-    /// `record_number`, as a reader does: the value of every field in the
-    /// order of the keys, each contents object's fields against each other
-    /// right after its values, the name, the fields its inode type permits
-    /// and the fields against each other. Unlike a reader it fills nothing
-    /// in.
-    fn check(&self, record_number: u64) -> Result<(), Error> {
-        let subject = Subject::new(self, record_number);
+    /// Checks the object, which `subject` names, as a reader does: the
+    /// value of every field in the order of the keys, each contents
+    /// object's fields against each other right after its values, the
+    /// name, the fields its inode type permits and the fields against each
+    /// other. Unlike a reader it fills nothing in.
+    fn check(&self, subject: Subject<'_>) -> Result<(), Error> {
         if self.contents.len() > MAX_CONTENTS {
             return Err(Error::too_many_contents(subject));
         }
@@ -471,7 +494,7 @@ impl FileObject {
             FileObject::check_owner_name(Field::UserName, name, subject)?;
         }
         if self.name.is_root() {
-            return Err(Error::no_name(record_number));
+            return Err(Error::no_name(subject));
         }
         self.check_permitted_fields(subject)?;
         // The contents objects were checked above. This is for what

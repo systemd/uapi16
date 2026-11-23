@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io::{self, BufRead};
 
-use crate::decode::{DecodedObject, RecordDecoder, ROOT_RECORD};
+use crate::decode::{DecodedObject, RecordDecoder, Subject, ROOT_RECORD};
 use crate::error::{Error, Problem};
 use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::sequence::SequenceCheck;
@@ -434,7 +434,7 @@ impl Decoder {
                     };
                     let mut object = object?;
                     let checked = sequence_check
-                        .check_fields(&object, number)
+                        .check_fields(&object, Subject::new(&object, number))
                         .and_then(|()| sequence_check.admit(&object, number));
                     checked.map_err(|e| e.in_record(number).named(object.name.as_str()))?;
                     object.fill_in(sequence_check.features());

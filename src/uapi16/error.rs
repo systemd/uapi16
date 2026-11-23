@@ -682,15 +682,10 @@ impl Error {
         .at(Field::Type)
     }
 
-    /// A file object after the root file object, in the record with the
-    /// number `record_number`, that has no name.
-    pub(crate) fn no_name(record_number: u64) -> Error {
-        Error::manifest(
-            Problem::NoName,
-            format!("manifest object {} has no name", record_number),
-        )
-        .at(Field::Name)
-        .in_record(record_number)
+    /// A file object after the root file object, which `subject` names,
+    /// that has no name.
+    pub(crate) fn no_name(subject: Subject<'_>) -> Error {
+        Error::manifest(Problem::NoName, format!("{} has no name", subject)).at(Field::Name)
     }
 
     /// A file object in the record with the number `record_number`, behind
@@ -724,7 +719,7 @@ impl Error {
 
     /// A file object, which `subject` names, with more than
     /// [`MAX_CONTENTS`] contents objects.
-    pub(crate) fn too_many_contents(subject: Subject<'_>) -> Error {
+    pub(crate) fn too_many_contents(subject: impl fmt::Display) -> Error {
         Error::manifest(
             Problem::InvalidContents,
             format!("{}: more than {} contents entries", subject, MAX_CONTENTS),

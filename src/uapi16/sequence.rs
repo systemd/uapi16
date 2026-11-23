@@ -56,15 +56,14 @@ impl SequenceCheck {
         self.check_features_listed(root.feature_fields(), Subject::root())
     }
 
-    /// Checks the fields of `object`, the one of the record with the number
-    /// `record_number`, against what the manifest records: they have to be
-    /// of features the manifest records, the fields a reader filled in
-    /// aside, a symbolic link has its target in a manifest that records
-    /// them, and the flags of a partition agree, see
-    /// [`FileObject::check_partition_flags`]. The error names the first
-    /// field of a feature the manifest does not record.
-    pub(crate) fn check_fields(&self, object: &FileObject, record_number: u64) -> Result<(), Error> {
-        let subject = Subject::new(object, record_number);
+    /// Checks the fields of `object`, which `subject` names, against what
+    /// the manifest records: they have to be of features the manifest
+    /// records, the fields a reader filled in aside, a symbolic link has
+    /// its target in a manifest that records them, and the flags of a
+    /// partition agree, see [`FileObject::check_partition_flags`]. The
+    /// error names the first field of a feature the manifest does not
+    /// record.
+    pub(crate) fn check_fields(&self, object: &FileObject, subject: Subject<'_>) -> Result<(), Error> {
         self.check_features_listed(object.feature_fields(), subject)?;
         let target = object.contents.iter().any(|contents| contents.literal().is_some());
         if self.features.contains(Features::SYMLINK) && object.inode_type == InodeType::Symlink && !target {
@@ -307,10 +306,10 @@ mod tests {
         let check = SequenceCheck::new(Features::SIZE | Features::SYMLINK, None);
         let mut file = object("f", InodeType::Regular);
         file.size = Some(1);
-        assert!(check.check_fields(&file, 1).is_ok());
+        assert!(check.check_fields(&file, Subject::new(&file, 1)).is_ok());
         // A field of a feature the manifest does not record is named.
         file.inode.mtime_nsec = Some(1);
-        let e = check.check_fields(&file, 1).unwrap_err();
+        let e = check.check_fields(&file, Subject::new(&file, 1)).unwrap_err();
         assert_eq!(
             (e.kind(), e.field()),
             (ErrorKind::Manifest(Problem::UnlistedFeature), Some(Field::MTimeNSec))
@@ -359,15 +358,15 @@ mod tests {
         for (inode_type, set, field) in cases {
             let mut o = object("o", inode_type);
             set(&mut o);
-            let e = none.check_fields(&o, 1).unwrap_err();
+            let e = none.check_fields(&o, Subject::new(&o, 1)).unwrap_err();
             assert_eq!(e.field(), Some(field), "{:?}", o);
         }
         let link = object("l", InodeType::Symlink);
-        let e = check.check_fields(&link, 2).unwrap_err();
+        let e = check.check_fields(&link, Subject::new(&link, 2)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::NoTarget));
         assert!(e.to_string().starts_with("manifest object 2 (l): "), "{}", e);
         let quiet = SequenceCheck::new(Features::SIZE, None);
-        assert!(quiet.check_fields(&link, 2).is_ok());
+        assert!(quiet.check_fields(&link, Subject::new(&link, 2)).is_ok());
         // The root file object has the fields of features too.
         let mut root = RootObject::default();
         assert!(none.check_root_fields(&root).is_ok());
@@ -428,7 +427,8 @@ mod tests {
         ];
         for (give, field) in fields {
             give(&mut object);
-            assert_eq!(none.check_fields(&object, 1).unwrap_err().field(), Some(field));
+            let subject = Subject::new(&object, 1);
+            assert_eq!(none.check_fields(&object, subject).unwrap_err().field(), Some(field));
         }
         let mut root = RootObject::default();
         let fields: [(Give<RootObject>, Field); 6] = [

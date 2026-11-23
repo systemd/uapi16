@@ -599,6 +599,22 @@ macro_rules! flag_set {
             pub(crate) const fn without(self, flags: $flags) -> $flags {
                 $flags(self.0 & !flags.0)
             }
+
+            /// The flags as bits, as the manifest builder keeps them while
+            /// it sorts.
+            pub(crate) const fn bits(self) -> u8 {
+                self.0
+            }
+
+            /// The flags the bits `bits` are, if each is the bit of a
+            /// flag.
+            pub(crate) const fn from_bits(bits: u8) -> Option<$flags> {
+                if bits & !$flags::ALL.0 == 0 {
+                    Some($flags(bits))
+                } else {
+                    None
+                }
+            }
         }
 
         impl BitOr for $flags {
@@ -919,6 +935,17 @@ impl FilledIn {
     /// object and those of its inode attributes.
     pub(crate) const fn union(self, other: FilledIn) -> FilledIn {
         FilledIn(self.0 | other.0)
+    }
+
+    /// The marks as bits, one for each field that can be filled in, as the
+    /// manifest builder keeps them while it sorts.
+    pub(crate) const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// The marks the bits `bits` are.
+    pub(crate) const fn from_bits(bits: u16) -> FilledIn {
+        FilledIn(bits)
     }
 }
 
