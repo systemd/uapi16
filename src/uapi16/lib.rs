@@ -104,6 +104,9 @@ mod hex;
 // Only the module sys calls them.
 #[allow(unsafe_code)]
 mod ioctl;
+// Only the tests use the modules of the manifest builder until
+// ManifestWriter does. A module with something that no other module uses
+// expects dead code.
 #[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod listing;
 mod metadata;
@@ -111,7 +114,6 @@ mod name;
 #[allow(unsafe_code)]
 mod nss;
 mod object;
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod optional;
 mod reader;
 mod record;
@@ -120,13 +122,10 @@ mod scratch;
 mod sequence;
 mod sort;
 mod strict;
-// Only the tests use the modules of the manifest builder until
-// ManifestWriter does, and PinnedDirectory shares the reopen of a pinned
-// file. A module with something that no other module uses expects dead
-// code.
-#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
 mod sys;
 mod tree;
+#[cfg_attr(not(test), expect(dead_code, reason = "ManifestWriter is the first user"))]
+mod walk;
 mod writer;
 
 pub use blocking::{Reader, Writer};

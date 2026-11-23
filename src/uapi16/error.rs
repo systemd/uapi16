@@ -589,6 +589,14 @@ impl Error {
         self
     }
 
+    /// Notes the name of the file the error is about as its directory has
+    /// it.
+    #[must_use]
+    pub(crate) fn raw(mut self, name: impl Into<OsString>) -> Error {
+        self.0.raw_name = Some(name.into());
+        self
+    }
+
     /// Notes the rule of a name that the name of the error breaks.
     #[must_use]
     pub(crate) fn because(mut self, problem: NameProblem) -> Error {

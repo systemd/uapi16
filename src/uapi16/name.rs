@@ -32,6 +32,8 @@ const PARENT: &str = "..";
 /// What follows [`FILENAME`] in the name of a file that belongs to the
 /// manifest, such as its signature or a compressed copy.
 const SUFFIX_SEPARATOR: char = '.';
+/// The same as the one byte it is in UTF-8.
+const SUFFIX_SEPARATOR_BYTE: u8 = SUFFIX_SEPARATOR as u8;
 /// The control characters a name may not have are the bytes below the
 /// space, ASCII 0 to 31, and delete, ASCII 127.
 const SPACE: u8 = b' ';
@@ -340,6 +342,15 @@ impl Name {
     pub fn is_reserved(name: &str) -> bool {
         name.strip_prefix(FILENAME)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR) || rest.starts_with(SEPARATOR))
+    }
+
+    /// Whether `component`, the name of a file at the top of a tree as its
+    /// directory has it, is one [`Name::is_reserved`] reserves. It need not
+    /// be UTF-8.
+    pub(crate) fn is_reserved_component(component: &[u8]) -> bool {
+        component
+            .strip_prefix(FILENAME.as_bytes())
+            .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&SUFFIX_SEPARATOR_BYTE))
     }
 
     /// Whether this is the name of the root file object.
@@ -1094,6 +1105,38 @@ mod tests {
             "x.Uapi16Manifest",
         ] {
             assert!(!Name::is_reserved(name), "{:?}", name);
+        }
+    }
+
+    /// A component at the top of a tree is reserved as a name of it is, also
+    /// where it is not UTF-8.
+    #[test]
+    fn reserved_components() {
+        for component in [
+            &b"Uapi16Manifest"[..],
+            b"Uapi16Manifest.",
+            b"Uapi16Manifest.sig",
+            b"Uapi16Manifest.\xff",
+        ] {
+            assert!(Name::is_reserved_component(component), "{:?}", component);
+        }
+        for component in [
+            &b""[..],
+            b"Uapi16Manifest2",
+            b"Uapi16Manifes",
+            b"Uapi16Manifest\xff",
+            b"x.Uapi16Manifest",
+            b"\xffUapi16Manifest",
+        ] {
+            assert!(!Name::is_reserved_component(component), "{:?}", component);
+        }
+        for name in ["Uapi16Manifest", "Uapi16Manifest.sig", "Uapi16Manifest2", "x"] {
+            assert_eq!(
+                Name::is_reserved_component(name.as_bytes()),
+                Name::is_reserved(name),
+                "{}",
+                name
+            );
         }
     }
 

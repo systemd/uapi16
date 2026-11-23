@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::time::Duration;
 
 use rustix::fs::FileType;
 
@@ -63,7 +64,7 @@ impl Identity {
 
 /// Which inode a file is, whatever mount it was reached through: the
 /// device, the inode number and the subvolume of an [`Identity`], without
-/// its mount.
+/// its mount. A mount that shows a directory again shows the same inode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InodeId {
     pub(crate) device: DeviceNumber,
@@ -77,6 +78,19 @@ pub(crate) struct InodeId {
 pub(crate) struct Timestamp {
     pub(crate) seconds: i64,
     pub(crate) nanoseconds: u32,
+}
+
+impl Timestamp {
+    /// The time as `mTimeNSec` has it, in nanoseconds since the epoch. A
+    /// time before the epoch has none, and neither has one that does not
+    /// fit into 64 bits, after the year 2554.
+    pub(crate) fn since_epoch_nsec(self) -> Option<u64> {
+        let seconds = u64::try_from(self.seconds).ok()?;
+        // Nanoseconds of a second or more carry into the seconds, of which
+        // there are less than 2^63.
+        let since = Duration::new(seconds, self.nanoseconds);
+        u64::try_from(since.as_nanos()).ok()
+    }
 }
 
 /// What statx() says of a file: what a manifest records of it, and what

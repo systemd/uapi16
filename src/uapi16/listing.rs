@@ -305,6 +305,12 @@ impl Listing {
         self.scratch.own_files()
     }
 
+    /// The same files, for whoever has the manifest pass over one more
+    /// file, which is kept with them.
+    pub(crate) fn own_files_mut(&mut self) -> &mut OwnFiles {
+        self.scratch.own_files_mut()
+    }
+
     /// Does a part of what is to do before the next add, and returns
     /// whether it is done: the table of the hard links doubles or moves to
     /// disk, and the sort writes a run. `budget` is about how many bytes are

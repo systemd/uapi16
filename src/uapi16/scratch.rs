@@ -75,6 +75,12 @@ impl Scratch {
         &self.own
     }
 
+    /// The same files, for whoever has one more file of the manifest's own
+    /// to keep with them.
+    pub(crate) fn own_files_mut(&mut self) -> &mut OwnFiles {
+        &mut self.own
+    }
+
     /// The directory for temporary files, where `tmpdir` is the value of
     /// `TMPDIR`: the one it names, or /var/tmp if it is not set or empty.
     fn temporary_directory(tmpdir: Option<OsString>) -> PathBuf {

@@ -50,7 +50,8 @@ use pathrs::error::{Error as PathrsError, ErrorKind as PathrsErrorKind};
 use pathrs::flags::OpenFlags;
 use pathrs::HandleRef;
 use rustix::fs::{
-    AtFlags, FallocateFlags, FileType, FsWord, IFlags, OFlags, Statx, StatxAttributes, StatxFlags, StatxTimestamp, CWD,
+    AtFlags, FallocateFlags, FileType, FsWord, IFlags, OFlags, RawDir, Statx, StatxAttributes, StatxFlags,
+    StatxTimestamp, CWD,
 };
 use rustix::io::{retry_on_intr, Errno};
 use rustix::mount::OpenTreeFlags;
@@ -436,6 +437,12 @@ impl<'fd> Entry<'fd> {
         Ok(Entry::new(handle, status, automount))
     }
 
+    /// The target of the symbolic link of the entry, read through its
+    /// handle. It is the bytes of the link, which need not be UTF-8.
+    pub(crate) fn target(&self) -> Result<Vec<u8>, Failure> {
+        Ok(retry_on_intr(|| rustix::fs::readlinkat(self.handle(), c"", Vec::new()))?.into_bytes())
+    }
+
     /// Opens the regular file or the directory of the entry for reading, so
     /// that no other file takes its place. A regular file is opened through
     /// its handle and never through its name, as [`PinnedFile`] opens one.
@@ -561,6 +568,151 @@ impl Readable {
     /// 6.9.
     pub(crate) fn fs_uuid(&self) -> io::Result<Option<FsUuid>> {
         Readable::answer(|| ioctl::fs_uuid(self.as_fd()))
+    }
+
+    /// The entries of the directory this is, which lists them from the
+    /// first one on.
+    pub(crate) fn entries(self) -> Entries {
+        Entries {
+            dir: OwnedFd::from(self.0),
+            names: Vec::new(),
+            next: 0,
+            size: Entries::FIRST_SIZE,
+            done: false,
+        }
+    }
+}
+
+/// The entries of a directory of a tree, in the order getdents() gives
+/// them, read through the directory opened for reading, see
+/// [`Entry::reopen`] and [`Readable::entries`]. The entries are opened in
+/// the directory as well, so it is the one descriptor a walk keeps of a
+/// directory it is in.
+#[derive(Debug)]
+pub(crate) struct Entries {
+    dir: OwnedFd,
+    /// The names of the entries getdents() gave the last time, each with
+    /// its NUL, and where the next one to hand out starts.
+    names: Vec<u8>,
+    next: usize,
+    /// How many bytes getdents() reads into the next time.
+    size: usize,
+    /// Whether getdents() said that there are no more entries, or failed.
+    done: bool,
+}
+
+impl Entries {
+    /// The names a directory has for itself and for the one above it.
+    const ITSELF_AND_PARENT: [&'static [u8]; 2] = [b".", b".."];
+    /// How many bytes getdents() reads into the first time, and the most it
+    /// reads into. It reads twice as much each time up to that, so that a
+    /// small directory takes little memory while a walk is below it, and a
+    /// large one takes few calls, as rustix's Dir does.
+    ///
+    /// The first is room for an entry with the longest name there is, one
+    /// of FUSE with 4095 bytes, whose entry takes 4120, and whose entry for
+    /// the server takes 4248 with READDIRPLUS. FUSE asks its server for as
+    /// many bytes as getdents() has room for, and for a page at least. A
+    /// server that can't fit the first entry into that replies with
+    /// nothing, and getdents() returns that as 0, which nobody can tell
+    /// from the end of the directory. So the room has to be enough from the
+    /// first call on, and 8 KiB is, whatever the size of a page. That holds
+    /// for what FUSE means to ask for. It reads into pages it allocates for
+    /// the request, and where it gets fewer than it asked for,
+    /// fuse_readdir_alloc_buf() makes the request as small as the pages it
+    /// got, down to one. So under memory pressure a name of 4073 bytes or
+    /// more can still end the listing of its directory on 4 KiB pages,
+    /// whatever room getdents() has, and nothing here can tell. Other file
+    /// systems fail getdents() with EINVAL where the first entry does not
+    /// fit, and the room grows then, see [`Entries::read`].
+    const FIRST_SIZE: usize = 8 * 1024;
+    const MOST_SIZE: usize = 32 * 1024;
+
+    /// The descriptor of the directory, which its entries are opened in.
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        self.dir.as_fd()
+    }
+
+    /// The status of the directory now.
+    pub(crate) fn status(&self) -> Result<Status, Failure> {
+        Status::of(self.as_fd())
+    }
+
+    /// Reads the names of the next entries with getdents(), and again where
+    /// it fails with EINTR: a getdents() that fails gave no entries and
+    /// did not move on in the directory. Unlike RawDir, rustix's Dir ends a
+    /// listing at the first error with the libc backend, as on powerpc and
+    /// s390x, and can't be asked again. Where the first entry getdents()
+    /// would give does not fit, it fails with EINVAL, and it is asked again
+    /// with twice the room, up to the most there is.
+    fn read(&mut self) -> rustix::io::Result<()> {
+        self.names.clear();
+        self.next = 0;
+        loop {
+            let size = self.size;
+            // The names take less room than the entries they are of.
+            self.names.reserve(size);
+            let mut buffer = Vec::with_capacity(size);
+            self.size = (size * 2).min(Entries::MOST_SIZE);
+            let mut dir = RawDir::new(&self.dir, buffer.spare_capacity_mut());
+            loop {
+                match dir.next() {
+                    None => {
+                        self.done = true;
+                        return Ok(());
+                    }
+                    Some(Err(Errno::INTR)) => {}
+                    Some(Err(Errno::INVAL)) if self.names.is_empty() && size < Entries::MOST_SIZE => break,
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(entry)) => {
+                        self.names.extend_from_slice(entry.file_name().to_bytes_with_nul());
+                        if dir.is_buffer_empty() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for Entries {
+    type Item = Result<Listed, Failure>;
+
+    /// The next entry of the directory, passing over `.` and `..`, or
+    /// nothing after the last one. Once reading failed, nothing comes.
+    fn next(&mut self) -> Option<Result<Listed, Failure>> {
+        loop {
+            let rest = &self.names[self.next..];
+            if let Some(len) = rest.iter().position(|&byte| byte == 0) {
+                self.next += len + 1;
+                let name = &rest[..len];
+                if !Entries::ITSELF_AND_PARENT.contains(&name) {
+                    let name = CString::new(name).expect("a name getdents() gives ends at its NUL");
+                    return Some(Ok(Listed(name)));
+                }
+                continue;
+            }
+            if self.done {
+                return None;
+            }
+            if let Err(e) = self.read() {
+                self.done = true;
+                return Some(Err(e.into()));
+            }
+        }
+    }
+}
+
+/// An entry of a directory as its listing has it: its name, and nothing
+/// else that is used, since that is read through its handle.
+#[derive(Debug)]
+pub(crate) struct Listed(CString);
+
+impl Listed {
+    /// The name of the entry in the directory, which need not be UTF-8.
+    pub(crate) fn name(&self) -> &CStr {
+        &self.0
     }
 }
 
@@ -830,11 +982,11 @@ pub(crate) struct OwnFiles {
 }
 
 impl OwnFiles {
-    /// Takes the scratch file `file`, which has the inode `inode`, as one
-    /// of the files, and keeps it open for as long as they are there. A
-    /// file that was kept with that inode before stays one of them, and
-    /// open, next to it.
-    fn keep(&mut self, inode: InodeId, file: Arc<File>) {
+    /// Takes the file `file`, which has the inode `inode`, as one of the
+    /// files, and keeps it open for as long as they are there. A file that
+    /// was kept with that inode before stays one of them, and open, next to
+    /// it.
+    pub(crate) fn keep(&mut self, inode: InodeId, file: Arc<File>) {
         self.open.entry(inode).or_default().push(file);
     }
 
@@ -1160,10 +1312,12 @@ mod tests {
     use crate::testing::{OpenFile, TempDir, ST_BLOCKS_UNIT};
     use rustix::fs::{inotify, MemfdFlags, SealFlags, CWD};
     use rustix::io::FdFlags;
+    use std::ffi::CString;
     use std::fmt;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::mem::MaybeUninit;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
@@ -2055,6 +2209,85 @@ mod tests {
         assert_eq!(errno(DataHash::of(&directory, opened)), libc::EINVAL);
     }
 
+    /// A directory lists every entry once, in the order getdents() gives
+    /// them, without `.` and `..`, with names that are not UTF-8 and with
+    /// one of the longest name, over several calls of getdents(). It is
+    /// listed through itself opened by its name, its entries are opened in
+    /// it, and its status is that of its entry. An entry that does not fit
+    /// into the room of a call fails it with EINVAL where it comes first,
+    /// and the room grows until it fits.
+    #[test]
+    fn lists_the_entries() {
+        let tmp = TempDir::new("sys-entries");
+        let dir = &tmp.0;
+        fs::create_dir(dir.join("dir")).unwrap();
+        let names: Vec<std::ffi::OsString> = ["a", "b c", "\u{e9}"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .chain([std::ffi::OsString::from_vec(b"\xff\xfe".to_vec())])
+            .chain([std::ffi::OsString::from("l".repeat(255))])
+            .chain((0..1000).map(|i| std::ffi::OsString::from(format!("many-{}", i))))
+            .collect();
+        for name in &names {
+            fs::write(dir.join("dir").join(name), b"").unwrap();
+        }
+        let tree = open_dir(dir);
+        let at = |name| {
+            Some(Place {
+                dir: tree.as_fd(),
+                name,
+            })
+        };
+        let entry = Entry::open_at(tree.as_fd(), c"dir").unwrap();
+        let entries = entry.reopen(at(c"dir")).unwrap().entries();
+        assert!(!rustix::fs::fcntl_getfl(entries.as_fd()).unwrap().contains(OFlags::PATH));
+        assert!(!entries.status().unwrap().changed_since(entry.status()));
+        let listed: Vec<std::ffi::OsString> = entries
+            .map(|listed| std::ffi::OsString::from_vec(listed.unwrap().name().to_bytes().to_vec()))
+            .collect();
+        assert_eq!(listed, names_in(&dir.join("dir")));
+        let mut sorted = listed.clone();
+        sorted.sort();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+        // What it lists is opened in it.
+        let mut entries = entry.reopen(at(c"dir")).unwrap().entries();
+        let first = entries.next().unwrap().unwrap();
+        let file = Entry::open_at(entries.as_fd(), first.name()).unwrap();
+        assert_eq!(file.status().file_type, FileType::RegularFile);
+        // With room for 64 bytes first, an entry of 280 for the longest
+        // name fits once the room has grown three times.
+        let longest = "l".repeat(255);
+        fs::create_dir(dir.join("long")).unwrap();
+        fs::write(dir.join("long").join(&longest), b"").unwrap();
+        let entry = Entry::open_at(tree.as_fd(), c"long").unwrap();
+        let mut entries = entry.reopen(at(c"long")).unwrap().entries();
+        entries.size = 64;
+        let listed: Vec<CString> = entries.map(|listed| listed.unwrap().name().to_owned()).collect();
+        assert_eq!(listed, [CString::new(longest).unwrap()]);
+    }
+
+    /// The target of a symbolic link is read through its handle, as the
+    /// bytes it is: relative, absolute, long, and not UTF-8.
+    #[test]
+    fn reads_targets() {
+        let tmp = TempDir::new("sys-targets");
+        let dir = &tmp.0;
+        // xfs takes targets of up to 1024 bytes.
+        let long = "x/".repeat(500);
+        let targets: [&[u8]; 4] = [b"file", b"/etc/passwd", long.as_bytes(), b"\xff\xfe/below"];
+        for (i, target) in targets.iter().enumerate() {
+            symlink(std::ffi::OsStr::from_bytes(target), dir.join(format!("link-{}", i))).unwrap();
+        }
+        let tree = open_dir(dir);
+        for (i, target) in targets.iter().enumerate() {
+            let name = CString::new(format!("link-{}", i)).unwrap();
+            let entry = Entry::open_at(tree.as_fd(), &name).unwrap();
+            assert_eq!(entry.target().unwrap(), *target, "{}", i);
+        }
+    }
+
     /// The names of the entries of the directory `dir`.
     fn names_in(dir: &Path) -> Vec<std::ffi::OsString> {
         fs::read_dir(dir)
@@ -2623,5 +2856,7 @@ mod tests {
         send_sync::<UserXattrs>();
         send_sync::<UserDatabase>();
         send_sync::<ScratchFile>();
+        send_sync::<Entries>();
+        send_sync::<Listed>();
     }
 }
