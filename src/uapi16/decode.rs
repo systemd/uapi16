@@ -471,8 +471,15 @@ impl FileObject {
     /// [`ContentsObject::check_values`], and whose fields agree with each
     /// other. Where one of them does not, nothing is filled in for the
     /// object either, as a reader refuses its record and a writer refuses
-    /// the object.
+    /// the object. Where there are more than [`MAX_CONTENTS`] of them,
+    /// nothing is filled in at all, neither for the object nor for any of
+    /// them.
     pub(crate) fn fill_in_from_contents(&mut self) {
+        // A reader refuses the record of an object with more than
+        // MAX_CONTENTS contents objects, and nothing follows from them.
+        if self.contents.len() > MAX_CONTENTS {
+            return;
+        }
         // The object is in no record, and what is wrong with it is not
         // shown, so the number of the record does not matter.
         let subject = Subject::new(self, ROOT_RECORD);
@@ -3146,6 +3153,30 @@ mod tests {
             assert!(object.filled_in().is_empty(), "{}", record);
             assert_eq!(object.contents(), [contents], "{}", record);
         }
+        // As many contents objects as a reader takes, and one more, for
+        // which nothing is filled in at all.
+        let one = ContentsObject {
+            original_size: Some(5),
+            ..file()
+        };
+        let many = |n: usize| {
+            let record = vec![r#"{"file":"a","originalSize":5}"#; n].join(",");
+            (
+                format!(r#"{{"name":"x","contents":[{}]}}"#, record),
+                set(None, None, vec![one.clone(); n]),
+            )
+        };
+        let (record, object) = many(MAX_CONTENTS);
+        assert_eq!(object.size(), Some(5));
+        assert_eq!(object, self::object(&record));
+        let (record, object) = many(MAX_CONTENTS + 1);
+        assert_eq!(
+            refused(&record).to_string(),
+            "manifest object 1: more than 256 contents entries"
+        );
+        assert_eq!((object.size(), object.sha256()), (None, None));
+        assert!(object.filled_in().is_empty());
+        assert!(object.contents().iter().all(|contents| *contents == one));
     }
 
     #[test]
