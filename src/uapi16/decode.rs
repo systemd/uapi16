@@ -2340,6 +2340,15 @@ mod tests {
             e.to_string(),
             format!("manifest object 1: name is longer than 4095 bytes: '{}x'", name)
         );
+        // A name below one that is reserved for the manifest is reserved as
+        // well: its directory cannot be listed, so it could only come out
+        // of place.
+        let e = refused(r#"{"name":"Uapi16Manifest/x"}"#);
+        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(
+            e.to_string(),
+            "manifest object 1: name is reserved for the manifest: 'Uapi16Manifest/x'"
+        );
     }
 
     /// A `readOnly` the reader filled in is not one the object has: the

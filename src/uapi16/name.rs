@@ -38,9 +38,9 @@ const RULES: StringRules = STRING_RULES.without(StringRules::NO_NUL);
 /// single slashes, and none of them is empty, `.` or `..`. It has no
 /// control characters and no noncharacters, and it is at most
 /// [`Name::MAX_LEN`] bytes long. Its components are not limited on their
-/// own. It is not `Uapi16Manifest` and does not begin with
-/// `Uapi16Manifest.`, the names the manifest itself and what belongs to it
-/// have inside the tree.
+/// own. Its first component is not `Uapi16Manifest` and does not begin
+/// with `Uapi16Manifest.`, the names the manifest itself and what belongs
+/// to it have inside the tree.
 ///
 /// Names are ordered the way the specification orders the file objects of
 /// a manifest in code point order: component by component, each compared
@@ -74,8 +74,10 @@ pub enum NameProblem {
     Empty,
     /// It is longer than [`Name::MAX_LEN`] bytes.
     TooLong,
-    /// It is `Uapi16Manifest` or begins with `Uapi16Manifest.`, which the
-    /// specification reserves for the manifest and what belongs to it.
+    /// Its first component is `Uapi16Manifest` or begins with
+    /// `Uapi16Manifest.`, which the specification reserves for the manifest
+    /// and what belongs to it. A file below a directory of such a name
+    /// cannot be listed, since its directory cannot be.
     Reserved,
     /// It contains a control character: ASCII 0 to 31 or 127.
     ContainsControlCharacter,
@@ -216,12 +218,13 @@ impl Name {
     }
 
     /// Whether `name` is one the specification reserves for the manifest
-    /// and what belongs to it: `Uapi16Manifest`, or a name that begins
-    /// with `Uapi16Manifest.`. A file of such a name is not listed in a
-    /// manifest.
+    /// and what belongs to it: one whose first component is `Uapi16Manifest`
+    /// or begins with `Uapi16Manifest.`. A file of such a name is not listed
+    /// in a manifest, and neither is a file below a directory of such a
+    /// name.
     pub fn is_reserved(name: &str) -> bool {
         name.strip_prefix(FILENAME)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR) || rest.starts_with(SEPARATOR))
     }
 
     /// Whether this is the name of the root file object.
@@ -435,6 +438,8 @@ mod tests {
             ("Uapi16Manifest.sig", NameProblem::Reserved),
             ("Uapi16Manifest.gz", NameProblem::Reserved),
             ("Uapi16Manifest.d/inside", NameProblem::Reserved),
+            ("Uapi16Manifest/inside", NameProblem::Reserved),
+            ("Uapi16Manifest/a/b", NameProblem::Reserved),
         ] {
             assert_eq!(Name::new(name), Err(reason), "{:?}", name);
             assert_eq!(name.parse::<Name>(), Err(reason), "{:?}", name);
@@ -579,7 +584,11 @@ mod tests {
         if name.len() > Name::MAX_LEN {
             reasons.push(NameProblem::TooLong);
         }
-        if Name::is_reserved(name) {
+        let first = name.split(SEPARATOR).next().unwrap_or_default();
+        if first
+            .strip_prefix(FILENAME)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR))
+        {
             reasons.push(NameProblem::Reserved);
         }
         if name.chars().any(|c| c.is_ascii_control()) {
@@ -701,14 +710,18 @@ mod tests {
             "Uapi16Manifest.",
             "Uapi16Manifest.sig",
             "Uapi16Manifest.d/x",
+            "Uapi16Manifest/x",
+            "Uapi16Manifest/x/y",
         ] {
             assert!(Name::is_reserved(name), "{:?}", name);
         }
         for name in [
             "",
             "Uapi16Manifest2",
+            "Uapi16Manifest2/x",
             "Uapi16Manifes",
             "sub/Uapi16Manifest",
+            "sub/Uapi16Manifest/x",
             "x.Uapi16Manifest",
         ] {
             assert!(!Name::is_reserved(name), "{:?}", name);
