@@ -109,7 +109,9 @@ pub use blocking::{Reader, Writer};
 pub use content::{DataCheck, DataLocation, DataProvider, DirectoryProvider, ExternalFile, StreamProvider};
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
 pub use directory::PinnedDirectory;
-pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
+pub use error::{
+    DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, TreeProblem, UnsupportedData, ValidityProblem,
+};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{Name, NameBuf, NameError, NameProblem};
 pub use object::{

@@ -1310,12 +1310,17 @@ impl<'a> RecordDecoder<'a> {
         })
     }
 
+    /// Notes the error `error` makes, unless an error was noted before.
+    fn note(&mut self, error: impl FnOnce() -> Error) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error());
+        }
+    }
+
     /// Notes the error `problem` in `field`, which `message` describes,
     /// unless an error was noted before.
     fn note_error(&mut self, problem: Problem, field: Field, message: impl FnOnce() -> String) {
-        if self.first_error.is_none() {
-            self.first_error = Some(Error::manifest(problem, message()).at(field));
-        }
+        self.note(|| Error::manifest(problem, message()).at(field));
     }
 
     /// The value `checked` holds, or None after noting its error, unless an
@@ -1498,8 +1503,9 @@ impl<'a> RecordDecoder<'a> {
                         Ok(name) => draft.name = Some(name.to_owned()),
                         Err(reason) => {
                             let subject = self.subject();
-                            self.note_error(Problem::InvalidName, field, || {
-                                format!("{}: {}: '{}'", subject, reason, name.escape_debug())
+                            self.note(|| {
+                                let message = format!("{}: {}: '{}'", subject, reason, name.escape_debug());
+                                Error::manifest(Problem::InvalidName, message).at(field).because(reason)
                             });
                             draft.invalid_name = Some(name.into_owned());
                         }
@@ -2083,6 +2089,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::testing::{read_whole, sequence, EMPTY, HELLO, MAX_NESTING, ROOT, SIGNATURE, TRAILER, WORLD};
+    use crate::NameProblem;
 
     /// The file object of `record`, the record after the root file object.
     fn object(record: &str) -> FileObject {
@@ -2445,6 +2452,7 @@ mod tests {
         assert_eq!(object(&format!(r#"{{"name":"{}"}}"#, name)).name, name.as_str());
         let e = refused(&format!(r#"{{"name":"{}x"}}"#, name));
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(e.name_problem(), Some(NameProblem::TooLong));
         assert_eq!(
             e.to_string(),
             format!("manifest object 1: name is longer than 4095 bytes: '{}x'", name)
@@ -2454,10 +2462,27 @@ mod tests {
         // of place.
         let e = refused(r#"{"name":"Uapi16Manifest/x"}"#);
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(e.name_problem(), Some(NameProblem::Reserved));
         assert_eq!(
             e.to_string(),
             "manifest object 1: name is reserved for the manifest: 'Uapi16Manifest/x'"
         );
+        // A contents object that refers to its file by what is not a name
+        // says why it is not one.
+        for (file, reason) in [
+            ("../x", NameProblem::ContainsDotComponent),
+            ("a//b", NameProblem::EmptyComponent),
+            ("Uapi16Manifest.sig", NameProblem::Reserved),
+        ] {
+            let e = refused(&format!(r#"{{"name":"x","contents":[{{"file":"{}"}}]}}"#, file));
+            assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidContents), "{}", file);
+            assert_eq!(
+                (e.field(), e.name_problem()),
+                (Some(Field::File), Some(reason)),
+                "{}",
+                file
+            );
+        }
     }
 
     /// A `readOnly` the reader filled in is not one the object has: the
@@ -3618,6 +3643,17 @@ mod tests {
             assert_eq!(e.name(), name.as_str(), "{}", line);
             assert_eq!(e.field().map(Field::as_str), field.as_str(), "{}", line);
             assert_eq!(Some(e.to_string().as_str()), message.as_str(), "{}", line);
+            // An invalid name breaks the rule that Name::new() gives, and
+            // so does an invalid contents file reference. Nothing else is
+            // about a name.
+            if found == Problem::InvalidName {
+                assert_eq!(e.name_problem(), Name::new(e.name().unwrap()).err(), "{}", line);
+            } else {
+                let file_reference = found == Problem::InvalidContents && e.field() == Some(Field::File);
+                assert_eq!(e.name_problem().is_some(), file_reference, "{}", line);
+            }
+            let others = (e.hardlink_name(), e.raw_name(), e.feature());
+            assert_eq!(others, (None, None, None), "{}", line);
             problems.insert(found);
         }
         // Every problem a manifest can have is among them, but those of
