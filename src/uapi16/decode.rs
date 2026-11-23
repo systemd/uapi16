@@ -467,7 +467,9 @@ impl FileObject {
     /// Fills in what follows from the contents objects, as a reader does:
     /// what each of them says of its own data, and the size and the hash of
     /// the data of the object. Where fields contradict each other nothing
-    /// follows from them, and a writer refuses the object.
+    /// follows from them, and a writer refuses the object. So where the
+    /// fields of one contents object contradict each other, nothing is
+    /// filled in for the object, as a reader refuses its record.
     pub(crate) fn fill_in_from_contents(&mut self) {
         // The object is in no record, and what is wrong with it is not
         // shown, so the number of the record does not matter.
@@ -477,10 +479,16 @@ impl FileObject {
             .iter()
             .map(|contents| contents.check_consistency(subject).ok())
             .collect();
+        let consistent = data.iter().all(Option::is_some);
         for (contents, data) in self.contents.iter_mut().zip(data) {
             if let Some(data) = data {
                 contents.fill_in(data);
             }
+        }
+        // A contents object that contradicts itself gives nothing for the
+        // object either. A reader refuses its record.
+        if !consistent {
+            return;
         }
         let subject = Subject::new(self, ROOT_RECORD);
         if let Ok(data) = self.check_consistency(subject, self.contents.iter().map(ContentsObject::data)) {
@@ -2921,6 +2929,155 @@ mod tests {
         ] {
             let e = refused(&record);
             assert_eq!(e.kind(), ErrorKind::Manifest(Problem::Contradiction), "{}", record);
+        }
+    }
+
+    /// set_contents() fills in what a reader fills in for the same record,
+    /// marks and all. Where the fields of a contents object contradict each
+    /// other, a reader refuses the record, and set_contents() fills in
+    /// nothing for the object: neither its size nor its hash.
+    #[test]
+    fn set_contents_fills_in_what_a_reader_does() {
+        let hello: Option<Sha256> = HELLO.parse().ok();
+        let world: Option<Sha256> = WORLD.parse().ok();
+        let literal = || ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()));
+        let file = || ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+        let set = |size: Option<u64>, sha256: Option<Sha256>, contents: Vec<ContentsObject>| {
+            let mut object = FileObject::new(Name::new("x").unwrap());
+            object.set_size(size);
+            object.set_sha256(sha256);
+            object.set_contents(contents);
+            object
+        };
+        // The literal "hello" with the hash of "world" gave the object the
+        // size 5 and the hash of "world".
+        let mut contents = literal();
+        contents.set_original_size(Some(5));
+        contents.set_original_sha256(world);
+        let object = set(None, None, vec![contents]);
+        assert_eq!((object.size(), object.sha256()), (None, None));
+        assert!(object.filled_in().is_empty() && object.contents()[0].filled_in().is_empty());
+        let e = refused(&format!(
+            r#"{{"name":"x","contents":[{{"literal":"aGVsbG8=","originalSize":5,"originalSha256":"{}"}}]}}"#,
+            WORLD
+        ));
+        assert_eq!(
+            (e.kind(), e.field()),
+            (ErrorKind::Manifest(Problem::Contradiction), Some(Field::Literal))
+        );
+        // Contents objects that agree give what a reader gives.
+        let he = Sha256::digest(b"he");
+        for (record, object) in [
+            (
+                r#"{"name":"x","contents":[{"literal":"aGVsbG8="}]}"#.to_string(),
+                set(None, None, vec![literal()]),
+            ),
+            (
+                format!(
+                    r#"{{"name":"x","contents":[{{"literal":"aGVsbG8=","originalSha256":"{}"}}]}}"#,
+                    HELLO
+                ),
+                set(
+                    None,
+                    None,
+                    vec![ContentsObject {
+                        original_sha256: hello,
+                        ..literal()
+                    }],
+                ),
+            ),
+            (
+                format!(
+                    r#"{{"name":"x","size":2,"sha256":"{}","contents":[{{"literal":"aGVsbG8="}}]}}"#,
+                    he
+                ),
+                set(Some(2), Some(he), vec![literal()]),
+            ),
+            (
+                r#"{"name":"x","contents":[{"file":"a","offset":2,"originalSize":7}]}"#.to_string(),
+                set(
+                    None,
+                    None,
+                    vec![ContentsObject {
+                        offset: 2,
+                        original_size: Some(7),
+                        ..file()
+                    }],
+                ),
+            ),
+            (
+                format!(
+                    r#"{{"name":"x","contents":[{{"file":"a","originalSize":5,"originalSha256":"{}"}},{{"literal":"aGVsbG8="}}]}}"#,
+                    HELLO
+                ),
+                set(
+                    None,
+                    None,
+                    vec![
+                        ContentsObject {
+                            original_size: Some(5),
+                            original_sha256: hello,
+                            ..file()
+                        },
+                        literal(),
+                    ],
+                ),
+            ),
+            (
+                r#"{"name":"x","contents":[{"file":"a","encoding":"gzip","encodedSize":3,"originalSize":5}]}"#
+                    .to_string(),
+                set(
+                    None,
+                    None,
+                    vec![ContentsObject {
+                        encoding: Some("gzip".into()),
+                        encoded_size: Some(3),
+                        original_size: Some(5),
+                        ..file()
+                    }],
+                ),
+            ),
+        ] {
+            assert_eq!(object, self::object(&record), "{}", record);
+        }
+        // A contents object that contradicts itself, also next to one that
+        // agrees, which is filled in all the same.
+        for (record, contents) in [
+            (
+                r#"{"name":"x","contents":[{"file":"a","encodedSize":3,"originalSize":5}]}"#.to_string(),
+                vec![ContentsObject {
+                    encoded_size: Some(3),
+                    original_size: Some(5),
+                    ..file()
+                }],
+            ),
+            (
+                format!(
+                    r#"{{"name":"x","contents":[{{"file":"a","originalSize":5,"originalSha256":"{}"}},{{"literal":"aGVsbG8=","originalSha256":"{}"}}]}}"#,
+                    HELLO, WORLD
+                ),
+                vec![
+                    ContentsObject {
+                        original_size: Some(5),
+                        original_sha256: hello,
+                        ..file()
+                    },
+                    ContentsObject {
+                        original_sha256: world,
+                        ..literal()
+                    },
+                ],
+            ),
+        ] {
+            let e = refused(&record);
+            assert_eq!(e.kind(), ErrorKind::Manifest(Problem::Contradiction), "{}", record);
+            let object = set(None, None, contents);
+            assert_eq!((object.size(), object.sha256()), (None, None), "{}", record);
+            assert!(object.filled_in().is_empty(), "{}", record);
+            assert!(object.contents().last().unwrap().filled_in().is_empty(), "{}", record);
+            if let [agrees, _] = object.contents() {
+                assert!(agrees.filled_in().contains(Field::EncodedSize), "{}", record);
+            }
         }
     }
 
