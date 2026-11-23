@@ -202,9 +202,18 @@ impl Name {
         self.0.split(SEPARATOR).filter(|component| !component.is_empty())
     }
 
-    /// The name of the directory the file is in, which is the empty name
-    /// of the root for a file at the top. The root has none.
-    pub fn parent(&self) -> Option<&str> {
+    /// The name of the directory the file is in, [`Name::ROOT`] for a file
+    /// at the top. The root has none.
+    pub fn parent(&self) -> Option<Name> {
+        // The first component of a name is not reserved, and that is the
+        // only check a part of a name could fail. So every directory a name
+        // is in has a name, which is not checked again.
+        self.parent_str().map(|parent| Name(parent.to_owned()))
+    }
+
+    /// The name of the directory the file is in, as [`Name::parent`] has
+    /// it, without a copy.
+    pub(crate) fn parent_str(&self) -> Option<&str> {
         if self.is_root() {
             return None;
         }
@@ -403,6 +412,7 @@ mod tests {
             "xUapi16Manifest.sig",
         ] {
             let parsed = Name::new(name).unwrap_or_else(|_| panic!("{:?}", name));
+            check_parent(&parsed);
             assert_eq!(parsed, name);
             assert_eq!(parsed.as_str(), name);
             assert_eq!(parsed.to_string(), name);
@@ -652,7 +662,10 @@ mod tests {
             ] {
                 let reasons = reasons(&name);
                 match Name::new(name.as_str()) {
-                    Ok(_) => assert!(reasons.is_empty(), "{:?} {:?}", name, reasons),
+                    Ok(valid) => {
+                        assert!(reasons.is_empty(), "{:?} {:?}", name, reasons);
+                        check_parent(&valid);
+                    }
                     Err(reason) => assert!(reasons.contains(&reason), "{:?} {:?} {:?}", name, reason, reasons),
                 }
                 valid[usize::from(reasons.is_empty())] += 1;
@@ -685,14 +698,32 @@ mod tests {
         let name = Name::new("a/b/c").unwrap();
         assert_eq!(name.components().collect::<Vec<_>>(), ["a", "b", "c"]);
         assert_eq!(name.components().next_back(), Some("c"));
-        assert_eq!(name.parent(), Some("a/b"));
+        assert_eq!(name.parent(), Some(Name::new("a/b").unwrap()));
         assert_eq!(name.file_name(), Some("c"));
         let top = Name::new("a").unwrap();
-        assert_eq!(top.parent(), Some(""));
+        assert_eq!(top.parent(), Some(Name::ROOT));
         assert_eq!(top.file_name(), Some("a"));
         assert_eq!(Name::ROOT.components().count(), 0);
         assert_eq!(Name::ROOT.parent(), None);
         assert_eq!(Name::ROOT.file_name(), None);
+        // A component is not always a name: the last one of a name can be
+        // one that is reserved at the top.
+        let below = Name::new("a/Uapi16Manifest").unwrap();
+        assert_eq!(below.file_name(), Some("Uapi16Manifest"));
+        assert_eq!(Name::new("Uapi16Manifest"), Err(NameProblem::Reserved));
+        for name in full_tree_names(&["a", "...", ".hidden", "Uapi16Manifest2", "b c"], 3) {
+            check_parent(&name);
+        }
+    }
+
+    /// Checks that the directory `name` is in has a name, which is why
+    /// [`Name::parent`] does not check it again.
+    fn check_parent(name: &Name) {
+        match name.parent() {
+            None => assert!(name.is_root()),
+            Some(parent) if parent.is_root() => assert_eq!(name.components().count(), 1, "{:?}", name),
+            Some(parent) => assert_eq!(Name::new(parent.as_str()), Ok(parent), "{:?}", name),
+        }
     }
 
     #[test]

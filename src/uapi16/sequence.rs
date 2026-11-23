@@ -117,7 +117,7 @@ impl SequenceCheck {
         // at once.
         let pair = NamePair::new(&self.last, name);
         if !pair.second_is_in_open_directory(self.last_type) {
-            let directory = object.name.parent().unwrap_or_default();
+            let directory = object.name.parent_str().unwrap_or_default();
             return Err(Error::manifest(
                 Problem::Misplaced,
                 format!(
