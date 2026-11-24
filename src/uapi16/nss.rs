@@ -4,9 +4,10 @@
 //! sys calls them.
 //!
 //! This module and the module ioctl have the unsafe code of the crate, but
-//! for the one cast of the module name. The two functions write an entry
-//! into a struct of the caller and its strings into a buffer of the caller,
-//! and point from the one into the other. Nothing is read through such a
+//! for the one cast of the module name and for the C API, the module capi
+//! of the feature of that name. The two functions write an entry into a
+//! struct of the caller and its strings into a buffer of the caller, and
+//! point from the one into the other. Nothing is read through such a
 //! pointer here. It only says where in the buffer the name starts, and the
 //! name is read from the buffer, which has to hold it up to its end. A name
 //! that a manifest cannot hold is none.

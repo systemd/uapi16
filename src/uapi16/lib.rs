@@ -94,6 +94,11 @@ compile_error!("uapi16 supports Linux only");
 
 mod base64;
 mod blocking;
+// The C API, which is unsafe code as well: C hands over pointers that nothing
+// checks. The module says what it relies on.
+#[cfg(feature = "capi")]
+#[allow(unsafe_code)]
+mod capi;
 mod content;
 mod decode;
 mod digest;
@@ -103,9 +108,9 @@ mod features;
 mod hardlink;
 mod hex;
 // The ioctls rustix has no call for and the lookups in the user database
-// are the only unsafe code of the crate but for the one cast of the module
-// name. Each is in a module of its own, which says what it makes sure of.
-// Only the module sys calls them.
+// are the only unsafe code of the crate without the C API, but for the one
+// cast of the module name. Each is in a module of its own, which says what
+// it makes sure of. Only the module sys calls them.
 #[allow(unsafe_code)]
 mod ioctl;
 mod listing;

@@ -5,10 +5,10 @@
 //! them.
 //!
 //! This module and the module nss have the unsafe code of the crate, but
-//! for the one cast of the module name. An ioctl is whatever the driver
-//! behind a descriptor makes of its number, and the kernel writes its
-//! answer through a pointer of the caller. So three things are made sure of
-//! here:
+//! for the one cast of the module name and for the C API, the module capi
+//! of the feature of that name. An ioctl is whatever the driver behind a
+//! descriptor makes of its number, and the kernel writes its answer through
+//! a pointer of the caller. So three things are made sure of here:
 //!
 //! - The ioctls only go to a regular file or a directory, which the
 //!   descriptor is checked to be. Theirs go to the file system, where these
@@ -172,11 +172,11 @@ impl DosAttributes {
     /// `ATTR_RO`, include/uapi/linux/msdos_fs.h: the file is read-only.
     const READ_ONLY: u32 = 0x01;
     /// `ATTR_HIDDEN`: the file is hidden.
-    const HIDDEN: u32 = 0x02;
+    pub(crate) const HIDDEN: u32 = 0x02;
     /// `ATTR_SYS`: the file is a system file.
-    const SYSTEM: u32 = 0x04;
+    pub(crate) const SYSTEM: u32 = 0x04;
     /// `ATTR_ARCH`: the file changed since it was archived.
-    const ARCHIVE: u32 = 0x20;
+    pub(crate) const ARCHIVE: u32 = 0x20;
     /// Each of the attributes that have a flag of their own in a manifest,
     /// with that flag.
     const FLAGS: [(u32, DosFlags); 3] = [

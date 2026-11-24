@@ -1,0 +1,255 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# How cbindgen writes uapi16.h from capi.rs:
+#
+#     cbindgen --quiet --config cbindgen.toml --output uapi16.h capi.rs
+#
+# uapi16.h is checked in, and CI fails if it is not what cbindgen 0.29.4
+# writes. cbindgen is a tool here and not a dependency of the crate.
+# Without --quiet it says that it passes over the constants of capi.rs
+# that are not for C.
+#
+# cbindgen takes the enums, the functions and their comments from capi.rs.
+# What it cannot take from there is in this file: the rules at the top of
+# the header, and the macro UAPI16_FEATURES() and the helpers for
+# __attribute__((cleanup)) at its end, which are C.
+
+language = "C"
+# C++ can include the header as well.
+cpp_compat = true
+no_includes = true
+sys_includes = ["stdbool.h", "stddef.h", "stdint.h"]
+line_length = 100
+tab_width = 8
+usize_is_size_t = true
+style = "type"
+
+# The include guard is opened here and closed in the trailer. cbindgen's
+# own would close before the trailer and leave the helpers outside of it.
+header = '''
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#ifndef UAPI16_H
+#define UAPI16_H'''
+
+autogen_warning = '''
+/*
+ * cbindgen wrote this file from capi.rs and cbindgen.toml. Change those and
+ * write it again:
+ *
+ *     cbindgen --quiet --config cbindgen.toml --output uapi16.h capi.rs
+ */'''
+
+after_includes = '''
+
+/*
+ * The C API of uapi16: building UAPI.16 file manifests of trees of files,
+ * and reading and writing them record by record.
+ * https://uapi-group.org/specifications/specs/file_manifest/
+ *
+ * What holds for every function:
+ *
+ * - A function that can fail returns 0, or a negative errno if it fails.
+ *   uapi16_reader_next() and uapi16_reader_next_signature() are the one
+ *   exception: each returns a uapi16_read_t that says what it read, or a
+ *   negative errno. uapi16_error_errno() can't fail and returns an errno
+ *   as a positive number.
+ *
+ * - `reterr` is NULL or points to NULL. Unless it is NULL, a call that
+ *   fails stores a new error there, which the caller frees with
+ *   uapi16_error_free(). A call that succeeds does not write to it. A
+ *   call whose `reterr` points to anything but NULL fails with -EINVAL
+ *   before it does anything, and leaves what is there as it is.
+ *
+ * - Every call that makes an object stores it in `ret` if it succeeds,
+ *   and does not write to `ret` if it fails. uapi16_reader_next() and
+ *   uapi16_reader_next_signature() are the one exception: `*ret` is NULL
+ *   or an object of the caller, which is cleared and filled again, and
+ *   which stays the caller's whatever the call returns. A caller that
+ *   does not want a report passes NULL for its `ret`. Every other object
+ *   needs its `ret`.
+ *
+ * - Descriptors are borrowed. An object that keeps a descriptor borrows
+ *   the caller's until its free function returns, and never closes it: a
+ *   reader, a writer, a writer of records and a directory. The caller
+ *   keeps the descriptor open until then. A function that makes no object
+ *   borrows a descriptor for the call. A call that fails to make its
+ *   object leaves the descriptor with the caller. Where the name of
+ *   uapi16_manifest_writer_create_at() has several components, the
+ *   library opens the directory of the file itself. A negative number is
+ *   no descriptor, AT_FDCWD included, and fails with -EBADF.
+ *
+ * - Strings that go in are NUL-terminated UTF-8 and are read during the
+ *   call. The name of a new manifest file is the exception: `name` of
+ *   uapi16_manifest_writer_create_at() and uapi16_manifest_generate_at()
+ *   is a path, which is taken as the bytes it is. Strings and bytes that
+ *   come out belong to the object they come from. They live until it is
+ *   freed, or until a call sets their field again, takes it away or fills
+ *   the object again.
+ *
+ * - Every enum is 64 bits wide. Its numbers never change and new ones are
+ *   only added, so a switch over one needs a default case. A set of flags
+ *   has a type of its own: uapi16_add_flags_t and
+ *   uapi16_directory_flags_t. uapi16_name_order_t is the one signed enum:
+ *   it is 64 bits wide like the others, and its numbers are -1, 0 and 1.
+ *
+ * - An object is used by one thread at a time, and the library takes no
+ *   locks. Reports and errors can be read from any thread. No thread of
+ *   the library runs once a call returned, so a caller can fork() between
+ *   calls.
+ *
+ * - After fork(), the child can't use the objects of its parent: a
+ *   function that can fail fails with -ECHILD there.
+ *
+ * - The library installs no signal handlers and changes no signal masks.
+ *   A system call that a signal interrupts is made again. SIGPIPE behaves
+ *   as with write(2).
+ *
+ * - A call that is not valid fails with -EINVAL: one with an object or a
+ *   string that is NULL, with no `ret` for an object other than a report,
+ *   with a `reterr` that points to anything but NULL, or with a flag, a
+ *   feature or an order that is unknown. If memory runs out or the library
+ *   panics, the process aborts.
+ *
+ * - A call is checked in this order: what it is given first, which fails
+ *   with -EINVAL or -EBADF, then the process it is made in, which fails
+ *   with -ECHILD, and then its options or its writer. Options with a
+ *   feature of partitions fail with -EINVAL in the calls that make a
+ *   manifest writer, the generate functions among them, and a writer fails
+ *   with -ESTALE once it takes nothing more. So a call that is not valid
+ *   fails for that in a child and on such a writer as well, and a child
+ *   gets -ECHILD for options with a feature of partitions.
+ *
+ * - Options whose order is UAPI16_ORDER_NONE are for a writer of records.
+ *   The functions that sort refuse them with -EINVAL, where options with
+ *   a feature of partitions fail too: uapi16_manifest_writer_create_at(),
+ *   uapi16_manifest_writer_open(), uapi16_manifest_generate_at() and
+ *   uapi16_manifest_generate().
+ *
+ * - Bytes go in as a pointer and a size, and are copied during the call.
+ *   The pointer is not read where the size is 0. Bytes that are there and
+ *   empty come out as a pointer that is not NULL, with the size 0.
+ *
+ * - A list of features goes in as a pointer to an array and its length,
+ *   and is read during the call. The pointer is not read where the length
+ *   is 0. A feature can be in a list more than once, and
+ *   UAPI16_FEATURE_NONE in a list is passed over.
+ *
+ * - A getter of a field that an object does not have fails with -ENODATA
+ *   and stores nothing, or returns NULL for a string.
+ *
+ * - A file object that no thread changes can be read from any thread, and
+ *   several threads can open files from one uapi16_directory at the same
+ *   time.
+ *
+ * - A reader that failed to read an object or a writer that failed to
+ *   write a record, and a writer of records, a computation and a check
+ *   that are finished, take nothing more: a later call fails with -ESTALE.
+ */'''
+
+trailer = '''
+#ifndef __cplusplus
+/**
+ * A list of features, as an array and its length, for the calls that take
+ * one:
+ *
+ *     uapi16_manifest_options_add_features(o,
+ *             UAPI16_FEATURES(UAPI16_FEATURE_MTIME, UAPI16_FEATURE_USER_XATTR));
+ */
+#define UAPI16_FEATURES(...)                                    \
+        ((uapi16_feature_t[]) { __VA_ARGS__ }),                 \
+        (sizeof((uapi16_feature_t[]) { __VA_ARGS__ }) /         \
+         sizeof(uapi16_feature_t))
+#endif
+
+/*
+ * For __attribute__((cleanup(...))): each frees the object that its
+ * argument points to, unless that is NULL.
+ */
+static inline void uapi16_manifest_options_freep(uapi16_manifest_options **o) {
+        if (*o)
+                *o = uapi16_manifest_options_free(*o);
+}
+
+static inline void uapi16_manifest_writer_freep(uapi16_manifest_writer **w) {
+        if (*w)
+                *w = uapi16_manifest_writer_free(*w);
+}
+
+static inline void uapi16_manifest_report_freep(uapi16_manifest_report **r) {
+        if (*r)
+                *r = uapi16_manifest_report_free(*r);
+}
+
+static inline void uapi16_error_freep(uapi16_error **e) {
+        if (*e)
+                *e = uapi16_error_free(*e);
+}
+
+static inline void uapi16_file_object_freep(uapi16_file_object **o) {
+        if (*o)
+                *o = uapi16_file_object_free(*o);
+}
+
+static inline void uapi16_writer_freep(uapi16_writer **w) {
+        if (*w)
+                *w = uapi16_writer_free(*w);
+}
+
+static inline void uapi16_signature_freep(uapi16_signature **s) {
+        if (*s)
+                *s = uapi16_signature_free(*s);
+}
+
+static inline void uapi16_sha256_freep(uapi16_sha256 **s) {
+        if (*s)
+                *s = uapi16_sha256_free(*s);
+}
+
+static inline void uapi16_reader_freep(uapi16_reader **r) {
+        if (*r)
+                *r = uapi16_reader_free(*r);
+}
+
+static inline void uapi16_directory_freep(uapi16_directory **d) {
+        if (*d)
+                *d = uapi16_directory_free(*d);
+}
+
+static inline void uapi16_data_check_freep(uapi16_data_check **c) {
+        if (*c)
+                *c = uapi16_data_check_free(*c);
+}
+
+#endif /* UAPI16_H */'''
+
+[export]
+# No function has an enum as the type of an argument or of what it
+# returns, see below, so cbindgen is told to write them.
+include = [
+    "uapi16_feature_t",
+    "uapi16_order_t",
+    "uapi16_add_flag_t",
+    "uapi16_error_kind_t",
+    "uapi16_name_problem_t",
+    "uapi16_read_only_t",
+    "uapi16_name_order_t",
+    "uapi16_read_t",
+    "uapi16_data_location_t",
+    "uapi16_directory_flag_t",
+]
+
+# In Rust, a function of the C API takes and returns the number of an enum
+# as a u64 and checks it: an enum of Rust that holds a number it has no
+# variant for is undefined behavior, and nothing holds a caller in C to the
+# numbers. In C the number has the type of its enum, which is 64 bits wide.
+[export.rename]
+"OrderNumber" = "uapi16_order_t"
+"ErrorKindNumber" = "uapi16_error_kind_t"
+"FeatureNumber" = "uapi16_feature_t"
+"NameProblemNumber" = "uapi16_name_problem_t"
+"DataLocationNumber" = "uapi16_data_location_t"
+"ReadOnlyNumber" = "uapi16_read_only_t"
+
+[fn]
+args = "auto"

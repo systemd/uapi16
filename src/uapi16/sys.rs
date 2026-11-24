@@ -1402,7 +1402,20 @@ impl NewFile {
     /// gets its name, see [`NewFile::link`]. An error says which file it is
     /// of.
     pub(crate) fn create_at(dir: BorrowedFd<'_>, name: &Path, sync: bool) -> io::Result<(File, NewFile)> {
-        NewFile::create(dir, name, sync).map_err(|e| NewFile::about(name, e))
+        let own = || Ok(Arc::new(dir.try_clone_to_owned()?));
+        NewFile::create(dir, own, name, sync).map_err(|e| NewFile::about(name, e))
+    }
+
+    /// [`NewFile::create_at`] for a caller of the C API, which lends the
+    /// library its directory `dir` for as long as the file is written. A
+    /// file whose name has one component goes into `dir` itself, and what
+    /// else is kept in its directory shares `dir` with it: no duplicate is
+    /// made of it. For a longer name the directory of the file is opened,
+    /// as always.
+    #[cfg(feature = "capi")]
+    pub(crate) fn create_at_lent(dir: &Arc<OwnedFd>, name: &Path, sync: bool) -> io::Result<(File, NewFile)> {
+        let lent = || Ok(Arc::clone(dir));
+        NewFile::create(dir.as_fd(), lent, name, sync).map_err(|e| NewFile::about(name, e))
     }
 
     /// The I/O error `error` of the new file `name`, which says so.
@@ -1410,8 +1423,14 @@ impl NewFile {
         Error::io_about(format!("the manifest file '{}'", name.display()), error)
     }
 
-    /// What [`NewFile::create_at`] does, for the name `path`.
-    fn create(dir: BorrowedFd<'_>, path: &Path, sync: bool) -> io::Result<(File, NewFile)> {
+    /// What [`NewFile::create_at`] does, for the name `path`. `itself` gives
+    /// `dir` as the directory of a file that goes into it.
+    fn create(
+        dir: BorrowedFd<'_>,
+        itself: impl FnOnce() -> io::Result<Arc<OwnedFd>>,
+        path: &Path,
+        sync: bool,
+    ) -> io::Result<(File, NewFile)> {
         let (parent, file_name) = NewFile::split(path).ok_or(Errno::INVAL)?;
         // A negative number is no descriptor, and fails before anything is
         // opened or duplicated. AT_FDCWD is such a number, which rustix has
@@ -1422,8 +1441,8 @@ impl NewFile {
             return Err(Errno::BADF.into());
         }
         let directory = match parent {
-            Some(parent) => NewFile::open_parent(dir, parent)?,
-            None => dir.try_clone_to_owned()?,
+            Some(parent) => Arc::new(NewFile::open_parent(dir, parent)?),
+            None => itself()?,
         };
         let name = CString::new(file_name).map_err(|_| Errno::INVAL)?;
         // Something that has the name fails now and not once the manifest
@@ -1458,7 +1477,7 @@ impl NewFile {
         // is dropped, also when there is no descriptor left to write it
         // through.
         let new = NewFile {
-            directory: Arc::new(directory),
+            directory,
             name,
             path: path.to_path_buf(),
             file: Arc::new(File::from(file)),
@@ -1662,6 +1681,14 @@ impl NewFile {
                 Err(e)
             }
         }
+    }
+
+    /// Drops the file in a process that did not make it, without removing the
+    /// name it has until it gets its own. The process that made it has the
+    /// file still, under that name.
+    #[cfg(feature = "capi")]
+    pub(crate) fn abandon(mut self) {
+        self.temporary = None;
     }
 
     /// Renames the file from its name `temporary` to its own, without
@@ -3392,6 +3419,57 @@ mod tests {
         expected.sort();
         assert_eq!(names, expected);
         assert_eq!(fs::metadata(dir.join("file")).unwrap().nlink(), 2);
+    }
+
+    /// A new file that is abandoned keeps the name it has until it gets its
+    /// own, as the child of a fork() leaves it to its parent, which gives
+    /// the file its name after that.
+    #[cfg(feature = "capi")]
+    #[test]
+    fn abandoned_new_files_keep_their_names() {
+        let tmp = TempDir::new("sys-new-abandoned");
+        let dir = &tmp.0;
+        let directory = File::open(dir).unwrap();
+        let named = TemporaryName::create(
+            directory.as_fd(),
+            NewFile::NAME_PREFIX,
+            NewFile::NAMED_FLAGS,
+            NewFile::MODE,
+        );
+        let (file, temporary) = named.unwrap();
+        let made = NewFile {
+            directory: Arc::new(directory.as_fd().try_clone_to_owned().unwrap()),
+            name: c"m".to_owned(),
+            path: PathBuf::from("m"),
+            file: Arc::new(File::from(file)),
+            temporary: Some(temporary),
+            sync: false,
+        };
+        let temporary = names_in(dir);
+        assert_eq!(temporary.len(), 1);
+        // What the child has of the file is the same descriptors and the
+        // same name.
+        let name = made.temporary.as_ref().unwrap().as_c_str().to_owned();
+        let inherited = NewFile {
+            directory: Arc::new(made.directory.try_clone().unwrap()),
+            name: made.name.clone(),
+            path: made.path.clone(),
+            file: Arc::new(made.file.try_clone().unwrap()),
+            temporary: Some(TemporaryName(name)),
+            sync: false,
+        };
+        inherited.abandon();
+        assert_eq!(names_in(dir), temporary);
+        made.link().unwrap();
+        assert_eq!(names_in(dir), ["m"]);
+        // One that has no such name is dropped as it is. Where the file
+        // system makes no file without a name it has one too, which stays.
+        let (_, other) = NewFile::create_at(directory.as_fd(), Path::new("other"), false).unwrap();
+        let named = usize::from(other.temporary.is_some());
+        other.abandon();
+        let left = names_in(dir);
+        assert_eq!(left.len(), 1 + named);
+        assert!(left.contains(&"m".into()));
     }
 
     /// The names of the entries of the directory `dir`.

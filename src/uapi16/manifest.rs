@@ -3,10 +3,14 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::ops::ControlFlow;
+#[cfg(feature = "capi")]
+use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
+#[cfg(feature = "capi")]
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, TreeProblem};
 use crate::listing::{Listing, Totals, Writing};
@@ -347,8 +351,28 @@ impl ManifestOptions {
 
     /// What [`ManifestOptions::create_at`] does.
     fn create_at_dir(&self, dir: BorrowedFd<'_>, name: &Path) -> Result<ManifestWriter<File>, Error> {
+        self.create_with(NewFile::create_at, dir, name)
+    }
+
+    /// [`ManifestOptions::create_at`] for a caller of the C API, which
+    /// lends the library its directory `dir` until the writer is dropped,
+    /// see [`NewFile::create_at_lent`].
+    #[cfg(feature = "capi")]
+    pub(crate) fn create_at_lent(&self, dir: &Arc<OwnedFd>, name: &Path) -> Result<ManifestWriter<File>, Error> {
+        self.create_with(NewFile::create_at_lent, dir, name)
+    }
+
+    /// What [`ManifestOptions::create_at`] does, for a directory of any
+    /// kind: `create` makes the new file `name` below `dir`, and is told
+    /// whether the file is synced.
+    fn create_with<D>(
+        &self,
+        create: impl FnOnce(D, &Path, bool) -> io::Result<(File, NewFile)>,
+        dir: D,
+        name: &Path,
+    ) -> Result<ManifestWriter<File>, Error> {
         self.check()?;
-        let (out, new_file) = NewFile::create_at(dir, name, self.sync)?;
+        let (out, new_file) = create(dir, name, self.sync)?;
         let mut walker = self.walker(Scratch::beside(new_file.directory()))?;
         // A file with a name of its own until it is complete is in the
         // directory it is created in, which can be in the tree.
@@ -371,7 +395,33 @@ impl ManifestOptions {
         top: BorrowedFd<'_>,
         flags: AddFlags,
     ) -> Result<ManifestReport, Error> {
-        let writer = self.create_at_dir(dir, name)?;
+        self.generate_with(NewFile::create_at, dir, name, top, flags)
+    }
+
+    /// [`ManifestOptions::generate_at`] for a caller of the C API, which
+    /// lends the library its directory `dir` for the call.
+    #[cfg(feature = "capi")]
+    pub(crate) fn generate_at_lent(
+        &self,
+        dir: &Arc<OwnedFd>,
+        name: &Path,
+        top: BorrowedFd<'_>,
+        flags: AddFlags,
+    ) -> Result<ManifestReport, Error> {
+        self.generate_with(NewFile::create_at_lent, dir, name, top, flags)
+    }
+
+    /// What [`ManifestOptions::generate_at`] does, for a directory of any
+    /// kind, as [`ManifestOptions::create_with`] takes one.
+    fn generate_with<D>(
+        &self,
+        create: impl FnOnce(D, &Path, bool) -> io::Result<(File, NewFile)>,
+        dir: D,
+        name: &Path,
+        top: BorrowedFd<'_>,
+        flags: AddFlags,
+    ) -> Result<ManifestReport, Error> {
+        let writer = self.create_with(create, dir, name)?;
         writer.generate(top, flags).map(|(_, report)| report)
     }
 }
@@ -549,6 +599,21 @@ impl<W: Write> ManifestWriter<W> {
             new_file.link()?;
         }
         Ok(totals)
+    }
+
+    /// Drops the writer in a process that did not make it, such as the child
+    /// of a fork() of a caller of the C API. Nothing changes for the process
+    /// that made the writer, which has the writer still. Where the file of
+    /// [`ManifestOptions::create_at`] has a name until it is complete, the
+    /// name is left alone: that process removes it or gives the file its
+    /// own. The files the writer keeps on disk are closed and not emptied,
+    /// as with every writer that is dropped, so that process reads them
+    /// still.
+    #[cfg(feature = "capi")]
+    pub(crate) fn abandon(mut self) {
+        if let Some(new_file) = self.new_file.take() {
+            new_file.abandon();
+        }
     }
 }
 

@@ -4,7 +4,8 @@
 //!
 //! The crate denies unsafe code. One of the exceptions is here: the cast
 //! that makes a `&Name` of a `&str`, in `Name::from_str_unchecked()`. The
-//! others are the modules ioctl and nss.
+//! others are the modules ioctl and nss, and the module capi where the
+//! feature of that name is on.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;

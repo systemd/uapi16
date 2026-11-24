@@ -11,11 +11,29 @@ repository = "https://github.com/systemd/uapi16"
 keywords = ["uapi", "manifest", "filesystem", "systemd", "json-seq"]
 categories = ["filesystem", "parser-implementations", "encoding"]
 # What the package cargo publish uploads holds next to Cargo.toml and
-# Cargo.lock.
-include = ["/*.rs", "/refused.jsonl", "/tests/", "/README.md", "/LICENSE"]
+# Cargo.lock. The header, the configuration of cbindgen, the version script
+# and the two scripts are what the C library is built and installed with.
+include = [
+    "/*.rs",
+    "/refused.jsonl",
+    "/tests/",
+    "/examples/",
+    "/README.md",
+    "/LICENSE",
+    "/build.sh",
+    "/cbindgen.toml",
+    "/install.sh",
+    "/libuapi16.sym",
+    "/uapi16.h",
+]
 
 [lib]
 path = "lib.rs"
+
+[features]
+# The C API of the crate, which uapi16.h declares. build.sh builds the
+# static and the shared library of it, and install.sh installs them.
+capi = []
 
 [dependencies]
 # getpwuid_r() and getgrgid_r(), which give the names of the owners of the

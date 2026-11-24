@@ -2,6 +2,7 @@
 //! The data of the files a manifest describes: where it is, and copying
 //! it from there with the sizes and hashes of the manifest checked.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -382,7 +383,7 @@ impl ContentsObject {
 #[derive(Debug)]
 pub struct DataCheck<'a> {
     /// The name of the object, which an error carries.
-    name: &'a Name,
+    name: Cow<'a, Name>,
     /// The size the object gives.
     size: Option<u64>,
     /// The hash the object gives.
@@ -397,11 +398,25 @@ impl<'a> DataCheck<'a> {
     /// A check of the data of `object`, of which nothing has passed yet.
     pub fn new(object: &'a FileObject) -> DataCheck<'a> {
         DataCheck {
-            name: &object.name,
+            name: Cow::Borrowed(&object.name),
             size: object.size,
             sha256: object.sha256,
             context: object.sha256.map(|_| Sha256Context::default()),
             len: 0,
+        }
+    }
+
+    /// The check with a name of its own instead of the one it borrows from
+    /// its object, with what passed so far. The C API keeps such a check:
+    /// its caller can change or free the object while the check is there.
+    #[cfg(feature = "capi")]
+    pub(crate) fn into_owned(self) -> DataCheck<'static> {
+        DataCheck {
+            name: Cow::Owned(self.name.into_owned()),
+            size: self.size,
+            sha256: self.sha256,
+            context: self.context,
+            len: self.len,
         }
     }
 
@@ -2736,6 +2751,26 @@ mod tests {
         check.update_zeros(u64::MAX).unwrap();
         check.update_zeros(u64::MAX).unwrap();
         assert_eq!(check.finish().unwrap(), u64::MAX);
+    }
+
+    /// A check that has the name of its object as its own goes on where it
+    /// was, without the object: with what passed so far, and with the name,
+    /// the size and the hash it holds the data against.
+    #[cfg(feature = "capi")]
+    #[test]
+    fn owned_checks_go_on() {
+        let o = object(&format!(r#"{{"name":"x","size":5,"sha256":"{}"}}"#, HELLO));
+        let mut borrowed = DataCheck::new(&o);
+        borrowed.update(b"hel").unwrap();
+        let mut check = borrowed.into_owned();
+        drop(o);
+        let e = check.update(b"lo!").unwrap_err();
+        assert_eq!(
+            (e.kind(), e.name(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), Some("x"), Some(5))
+        );
+        check.update(b"lo").unwrap();
+        assert_eq!(check.finish().unwrap(), 5);
     }
 
     /// Takes a few bytes and then fails.

@@ -370,6 +370,15 @@ impl<W: Write> Writer<W> {
         Ok(self.out)
     }
 
+    /// The number of the record that is written next, counting from 0 for
+    /// the root: the number a record that is refused would have had. The C
+    /// API names that record in an error about an object that it refuses
+    /// itself.
+    #[cfg(feature = "capi")]
+    pub(crate) fn next_record(&self) -> u64 {
+        self.encoder.next_record
+    }
+
     /// What the manifest is written to. Every method writes its record to
     /// it before it returns, so it has the manifest up to the last record.
     /// Before the first signature object, that is what the signature

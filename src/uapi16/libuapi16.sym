@@ -1,0 +1,145 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+/*
+ * The symbols of libuapi16.so: the functions uapi16.h declares, each under
+ * the node of the release that added it. Nothing else is exported.
+ *
+ * A node is never changed once it is released. A release that adds
+ * functions adds a node for them, which names the node before it:
+ *
+ *     LIBUAPI16_0.1.1 {
+ *     global:
+ *             uapi16_...;
+ *     } LIBUAPI16_0.1.0;
+ */
+
+LIBUAPI16_0.1.0 {
+global:
+        uapi16_manifest_options_new;
+        uapi16_manifest_options_set_features;
+        uapi16_manifest_options_add_features;
+        uapi16_manifest_options_remove_features;
+        uapi16_manifest_options_set_order;
+        uapi16_manifest_options_set_sync;
+        uapi16_manifest_options_free;
+        uapi16_manifest_generate_at;
+        uapi16_manifest_generate;
+        uapi16_manifest_writer_create_at;
+        uapi16_manifest_writer_open;
+        uapi16_manifest_writer_add_object;
+        uapi16_manifest_writer_finish;
+        uapi16_manifest_writer_free;
+        uapi16_manifest_report_files;
+        uapi16_manifest_report_directories;
+        uapi16_manifest_report_others;
+        uapi16_manifest_report_bytes;
+        uapi16_manifest_report_entries_omitted;
+        uapi16_manifest_report_fields_omitted;
+        uapi16_manifest_report_free;
+        uapi16_reader_open;
+        uapi16_reader_root;
+        uapi16_reader_has_feature;
+        uapi16_reader_feature;
+        uapi16_reader_order;
+        uapi16_reader_require_order;
+        uapi16_reader_check_validity;
+        uapi16_reader_next;
+        uapi16_reader_next_signature;
+        uapi16_reader_signed_len;
+        uapi16_reader_free;
+        uapi16_writer_begin;
+        uapi16_writer_file;
+        uapi16_writer_signature;
+        uapi16_writer_finish;
+        uapi16_writer_free;
+        uapi16_signature_new;
+        uapi16_signature_mechanism;
+        uapi16_signature_set_key;
+        uapi16_signature_key;
+        uapi16_signature_set_data;
+        uapi16_signature_data;
+        uapi16_signature_free;
+        uapi16_file_object_new;
+        uapi16_file_object_free;
+        uapi16_file_object_set_name;
+        uapi16_file_object_name;
+        uapi16_file_object_set_type;
+        uapi16_file_object_type;
+        uapi16_file_object_set_mode;
+        uapi16_file_object_mode;
+        uapi16_file_object_set_uid;
+        uapi16_file_object_uid;
+        uapi16_file_object_set_gid;
+        uapi16_file_object_gid;
+        uapi16_file_object_set_user_name;
+        uapi16_file_object_user_name;
+        uapi16_file_object_set_group_name;
+        uapi16_file_object_group_name;
+        uapi16_file_object_set_mtime_nsec;
+        uapi16_file_object_mtime_nsec;
+        uapi16_file_object_set_size;
+        uapi16_file_object_size;
+        uapi16_file_object_set_sha256;
+        uapi16_file_object_sha256;
+        uapi16_file_object_set_major;
+        uapi16_file_object_major;
+        uapi16_file_object_set_minor;
+        uapi16_file_object_minor;
+        uapi16_file_object_set_inode_token;
+        uapi16_file_object_inode_token;
+        uapi16_file_object_set_user_xattrs;
+        uapi16_file_object_add_user_xattr;
+        uapi16_file_object_user_xattrs;
+        uapi16_file_object_user_xattr;
+        uapi16_file_object_set_read_only;
+        uapi16_file_object_read_only;
+        uapi16_file_object_set_inode_flags;
+        uapi16_file_object_inode_flags;
+        uapi16_file_object_set_dos_attributes;
+        uapi16_file_object_dos_attributes;
+        uapi16_file_object_set_target;
+        uapi16_file_object_set_contents_file;
+        uapi16_file_object_contents_file;
+        uapi16_file_object_data_location;
+        uapi16_file_object_literal;
+        uapi16_file_object_set_fs_label;
+        uapi16_file_object_fs_label;
+        uapi16_file_object_set_fs_uuid;
+        uapi16_file_object_fs_uuid;
+        uapi16_file_object_set_fat_serial;
+        uapi16_file_object_fat_serial;
+        uapi16_file_object_has_stated_feature;
+        uapi16_file_object_stated_feature;
+        uapi16_file_object_retain_features;
+        uapi16_file_object_check_validity;
+        uapi16_directory_new;
+        uapi16_directory_open_data;
+        uapi16_directory_free;
+        uapi16_data_check_new;
+        uapi16_data_check_update;
+        uapi16_data_check_update_zeros;
+        uapi16_data_check_finish;
+        uapi16_data_check_free;
+        uapi16_sha256_new;
+        uapi16_sha256_update;
+        uapi16_sha256_update_zeros;
+        uapi16_sha256_finish;
+        uapi16_sha256_free;
+        uapi16_name_compare;
+        uapi16_feature_name;
+        uapi16_feature_from_name;
+        uapi16_feature_probe;
+        uapi16_error_kind;
+        uapi16_error_errno;
+        uapi16_error_path;
+        uapi16_error_hardlink_path;
+        uapi16_error_feature;
+        uapi16_error_raw_name;
+        uapi16_error_name_problem;
+        uapi16_error_field;
+        uapi16_error_record;
+        uapi16_error_problem;
+        uapi16_error_free;
+local:
+        *;
+};

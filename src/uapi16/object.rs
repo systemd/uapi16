@@ -2407,6 +2407,33 @@ impl RootObject {
             .fold(Features::NONE, |features, (_, feature)| features | feature)
     }
 
+    /// Takes away `field`, one of [`RootObject::FEATURE_FIELDS`], as its
+    /// setter does with None.
+    #[cfg(feature = "capi")]
+    fn take_feature_field(&mut self, field: Field) {
+        match field {
+            Field::FatSerial => self.file_system.fat_serial = None,
+            Field::FsLabel => self.file_system.label = None,
+            Field::FsUuid => self.file_system.uuid = None,
+            Field::GptDiskUuid => self.gpt_disk_uuid = None,
+            _ => {}
+        }
+    }
+
+    /// Takes away the fields of every feature that is not in `features`,
+    /// those of the inode attributes among them, as
+    /// [`FileObject::retain_features`] does for a file object. The C API
+    /// has one function for the two.
+    #[cfg(feature = "capi")]
+    pub(crate) fn retain_features(&mut self, features: Features) {
+        for (field, feature) in RootObject::FEATURE_FIELDS {
+            if !features.contains(feature) {
+                self.take_feature_field(field);
+            }
+        }
+        self.inode.retain_features(features);
+    }
+
     /// What the manifest records: the features the root file object lists
     /// in `features`, or [`Features::DEFAULT`] if it lists none.
     pub fn recorded_features(&self) -> Features {

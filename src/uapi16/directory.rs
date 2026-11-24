@@ -133,6 +133,14 @@ impl PinnedDirectory {
         Ok(file)
     }
 
+    /// The descriptor the directory was made of, which it is taken apart
+    /// for. A caller of the C API lends its descriptor to a directory and
+    /// gets it back this way, so that nothing closes it.
+    #[cfg(feature = "capi")]
+    pub(crate) fn into_fd(self) -> OwnedFd {
+        self.root.into()
+    }
+
     /// Pins the file `file` names below the directory and checks that it
     /// is a regular file. Returns it with its size.
     fn pin(&self, file: &Name) -> Result<(Handle, u64), OpenError> {
