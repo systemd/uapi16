@@ -41,12 +41,12 @@
 //!   against the manifest with a [`DataCheck`].
 //!
 //! A manifest that does not come through a [`Read`], such as one from an
-//! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::step`] says
-//! what comes next. When it asks for more of the manifest with
+//! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::process`]
+//! says what comes next. When it asks for more of the manifest with
 //! [`Step::Input`], [`Decoder::feed`] takes the bytes that came, up to the
 //! end of the record it reads, and returns how many it took. The others go
-//! in with a later call. [`Decoder::end`] says that there are no more. The
-//! other steps hand out the root file object, the objects after it, and
+//! in with a later call. [`Decoder::end_feed`] says that there are no more.
+//! The other steps hand out the root file object, the objects after it, and
 //! the end of the manifest. A record ends where the next one starts, so an
 //! object comes once the separator of the record after it was fed, or the
 //! input ended, and the end of the manifest once the input ended. A step

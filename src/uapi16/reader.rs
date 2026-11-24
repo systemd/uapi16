@@ -253,36 +253,37 @@ enum Stage {
 /// [`Step::Input`] asks for more of the manifest, [`Step::End`] says that
 /// there is nothing more, and the other steps hand something out. A step
 /// the caller does not know needs nothing from it but another call to
-/// [`Decoder::step`], so the caller can pass over it. Steps that come in
+/// [`Decoder::process`], so the caller can pass over it. Steps that come in
 /// later releases only hand something out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Step {
     /// More of the manifest: [`Decoder::feed`] takes it, and
-    /// [`Decoder::end`] says that the input ended.
+    /// [`Decoder::end_feed`] says that the input ended.
     Input,
     /// The root file object. It comes first, once.
     Root(Box<RootObject>),
     /// A file object or a signature object.
     Object(Object),
     /// The end of the manifest, after its trailer object. Once
-    /// [`Decoder::step`] returned an error, it returns this as well.
+    /// [`Decoder::process`] returned an error, it returns this as well.
     End,
 }
 
 /// Reads a manifest from the bytes it is fed, and does no I/O itself.
 ///
-/// [`Decoder::step`] says what comes next. [`Step::Input`] asks for more
+/// [`Decoder::process`] says what comes next. [`Step::Input`] asks for more
 /// of the manifest: [`Decoder::feed`] takes the bytes that come next, and
-/// [`Decoder::end`] says that there are no more. [`Step::Root`] is the root
-/// file object, [`Step::Object`] each object after it, and [`Step::End`]
-/// the end of the manifest.
+/// [`Decoder::end_feed`] says that there are no more. [`Step::Root`] is the
+/// root file object, [`Step::Object`] each object after it, and
+/// [`Step::End`] the end of the manifest.
 ///
 /// A record ends where the next one starts, so an object comes once the
-/// separator of the record after it was fed, or [`Decoder::end`] was
+/// separator of the record after it was fed, or [`Decoder::end_feed`] was
 /// called. Nothing may follow the trailer object, so [`Step::End`] comes
-/// only after [`Decoder::end`]. [`Decoder::step`] reads a whole record, of
-/// up to [`MAX_RECORD_SIZE`] bytes with its record separator, in one call.
+/// only after [`Decoder::end_feed`]. [`Decoder::process`] reads a whole
+/// record, of up to [`MAX_RECORD_SIZE`] bytes with its record separator, in
+/// one call.
 ///
 /// A decoder checks and fills in what a [`Reader`] does, which is a
 /// decoder fed from a [`Read`]. It takes the bytes of one record at a time,
@@ -304,8 +305,8 @@ pub enum Step {
 /// let mut decoder = Decoder::new();
 /// let mut names = Vec::new();
 /// loop {
-///     match decoder.step()? {
-///         Step::Input if input.is_empty() => decoder.end(),
+///     match decoder.process()? {
+///         Step::Input if input.is_empty() => decoder.end_feed(),
 ///         // The manifest comes in pieces of at most five bytes.
 ///         Step::Input => {
 ///             let taken = decoder.feed(&input[..input.len().min(5)]);
@@ -364,14 +365,14 @@ impl Decoder {
 
     /// Says that the input ended, after [`Step::Input`].
     #[inline]
-    pub fn end(&mut self) {
+    pub fn end_feed(&mut self) {
         self.splitter.end_input();
     }
 
     /// What comes next. Once it returned an error, it returns
     /// [`Step::End`].
     #[inline]
-    pub fn step(&mut self) -> Result<Step, Error> {
+    pub fn process(&mut self) -> Result<Step, Error> {
         if !matches!(self.stage, Stage::Done) {
             // The next record goes on in input that was not fed yet, as it
             // does right after every object that was handed out.
@@ -1002,11 +1003,11 @@ mod tests {
         let mut whole = None;
         let mut numbers = Vec::new();
         loop {
-            match decoder.step()? {
+            match decoder.process()? {
                 Step::Input => {
                     if piece.is_empty() {
                         let Some(next) = pieces.next() else {
-                            decoder.end();
+                            decoder.end_feed();
                             continue;
                         };
                         piece = next;
@@ -1107,8 +1108,8 @@ mod tests {
             let mut decoder = Decoder::new();
             let mut taken = 0;
             loop {
-                match decoder.step().unwrap() {
-                    Step::Input if taken == bytes.len() => decoder.end(),
+                match decoder.process().unwrap() {
+                    Step::Input if taken == bytes.len() => decoder.end_feed(),
                     Step::Input => taken += decoder.feed(&bytes[taken..][..size.min(bytes.len() - taken)]),
                     Step::Object(_) => assert_eq!(decoder.splitter.record.len(), MAX_RECORD_TEXT),
                     Step::Root(_) => {}
@@ -1195,8 +1196,8 @@ mod tests {
                 let mut decoder = Decoder::new();
                 let mut taken = 0;
                 let e = loop {
-                    match decoder.step() {
-                        Ok(Step::Input) if taken == bytes.len() => decoder.end(),
+                    match decoder.process() {
+                        Ok(Step::Input) if taken == bytes.len() => decoder.end_feed(),
                         Ok(Step::Input) => taken += decoder.feed(&bytes[taken..][..size.min(bytes.len() - taken)]),
                         Ok(Step::Root(_)) => {}
                         Ok(step) => panic!("{} at a time: {:?}", size, step),
@@ -1214,7 +1215,7 @@ mod tests {
                 // no more than the largest record, and does not print it.
                 assert_eq!(taken, start.len() + READ_LIMIT, "{} at a time", size);
                 assert_eq!(decoder.feed(&bytes[taken..]), 0);
-                assert_eq!(decoder.step().unwrap(), Step::End);
+                assert_eq!(decoder.process().unwrap(), Step::End);
                 assert!(
                     decoder.splitter.record.capacity() <= MAX_RECORD_TEXT,
                     "{} at a time",

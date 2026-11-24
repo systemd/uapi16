@@ -139,7 +139,7 @@ impl<R: Read> Reader<R> {
     /// Feeds the decoder until it takes a step other than [`Step::Input`].
     fn pull(&mut self) -> Result<Step, Error> {
         loop {
-            match self.decoder.step()? {
+            match self.decoder.process()? {
                 Step::Input => self.fill()?,
                 step => return Ok(step),
             }
@@ -158,7 +158,7 @@ impl<R: Read> Reader<R> {
         };
         let input = input.map_err(|e| self.decoder.input_error(e))?;
         if input.is_empty() {
-            self.decoder.end();
+            self.decoder.end_feed();
         } else {
             let taken = self.decoder.feed(input);
             self.input.consume(taken);
