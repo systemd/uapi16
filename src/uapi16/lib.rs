@@ -45,12 +45,44 @@
 //! [`DataCheck::finish`] says whether it has the size and the hash the
 //! manifest gives.
 //!
+//! The manifest of a tree of files on the host is written by a
+//! [`ManifestWriter`]. [`ManifestOptions`] says what it records and makes
+//! the writer: [`ManifestOptions::create_at`] for a new file, and
+//! [`ManifestOptions::open`] for a [`Write`]. The writer takes the file
+//! objects of a caller in any order, with [`ManifestWriter::add_root`] and
+//! [`ManifestWriter::add_object`], and [`ManifestWriter::finish`] writes the
+//! manifest. [`ManifestOptions::generate_at`] does all of that for a
+//! directory and everything below it:
+//!
+//! ```no_run
+//! use std::fs::File;
+//! use std::path::Path;
+//! use uapi16::{AddFlags, Features, ManifestOptions};
+//!
+//! let esp = File::open("/efi")?;
+//! let out_dir = File::open("/var/lib/manifests")?;
+//! let report = ManifestOptions::new()
+//!     .features(Features::DEFAULT | Features::MTIME)
+//!     .generate_at(&out_dir, Path::new("esp.manifest"), &esp, AddFlags::NONE)?;
+//! println!("{} files, {} bytes", report.files(), report.bytes());
+//! # Ok::<(), uapi16::Error>(())
+//! ```
+//!
+//! The new file appears once the manifest is complete.
+//!
+//! The feature `capi` adds the C API of the crate, which uapi16.h
+//! declares. build.sh and install.sh, which come with the crate, build it
+//! as the C library libuapi16 and install it, see the README. The feature
+//! adds nothing to the Rust API.
+//!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
 //! separator and the name of the file object before it in memory: less
 //! than [`MAX_RECORD_SIZE`] and at most [`Name::MAX_LEN`] bytes. Nothing
 //! grows with the manifest. Writing one keeps the record it puts together,
 //! its separator included, and the name of the file object before it.
+//! Building a large manifest takes room on disk instead of memory, see
+//! [`ManifestOptions::create_at`] and [`ManifestOptions::open`].
 //!
 //! Two checks are up to the caller: whether a manifest declares the order
 //! of its file objects, [`RootObject::require_order`], and whether an

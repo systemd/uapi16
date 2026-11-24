@@ -1,8 +1,16 @@
 # uapi16
 
 This repository holds uapi16, a Rust crate that reads, checks and
-writes [UAPI.16 file manifests][spec]. The crate is in src/uapi16, and
-its README describes what it does.
+writes [UAPI.16 file manifests][spec], and its C library, libuapi16. The
+crate is in src/uapi16, and its README describes both.
+
+## C library
+
+From the top of the repository, these build the C library and install
+it into /usr:
+
+    src/uapi16/build.sh
+    src/uapi16/install.sh --prefix=/usr
 
 ## Submitting changes
 
