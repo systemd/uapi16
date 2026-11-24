@@ -1826,7 +1826,8 @@ impl FileObject {
     /// reader filled in that no longer follows is dropped, and what the
     /// object states stays. A writer refuses an object whose fields
     /// contradict each other or that has such a value, and more than
-    /// [`MAX_CONTENTS`] contents objects.
+    /// [`MAX_CONTENTS`] contents objects, for which nothing is filled in at
+    /// all.
     ///
     /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
     pub fn set_contents(&mut self, contents: Vec<ContentsObject>) {

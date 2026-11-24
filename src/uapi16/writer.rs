@@ -20,8 +20,8 @@ use crate::object::{
 };
 use crate::sequence::SequenceCheck;
 use crate::{
-    Features, Name, Order, Sha256, MAX_CONTENTS, MAX_RECORD_SIZE, MEDIA_TYPE, RECORD_END, RECORD_SEPARATOR,
-    SIGNATURE_MEDIA_TYPE, STRING_RULES, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
+    Features, Name, NameProblem, Order, Sha256, MAX_CONTENTS, MAX_RECORD_SIZE, MEDIA_TYPE, RECORD_END,
+    RECORD_SEPARATOR, SIGNATURE_MEDIA_TYPE, STRING_RULES, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
 };
 
 /// The most room for a record that an [`Encoder`] keeps from one record to
@@ -728,6 +728,12 @@ impl ContentsObject {
     fn check(&self, subject: Subject<'_>) -> Result<(), Error> {
         if let Some(encoding) = &self.encoding {
             ContentsObject::check_encoding(encoding, subject)?;
+        }
+        // Every name is one a reader takes for a file, but the root's: it is
+        // empty.
+        if let Some(file) = self.file().filter(|file| file.is_root()) {
+            let reason = NameProblem::Empty;
+            return Err(Error::invalid_file_reference(subject, reason, file.as_str()));
         }
         // A reader checks the header fields in the order they are written.
         if !self.http_headers.is_empty() {
@@ -1785,7 +1791,7 @@ mod tests {
                 ..GptPartition::default()
             }))
         }
-        let cases: [(Give, Problem, Field); 19] = [
+        let cases: [(Give, Problem, Field); 20] = [
             (|o| o.inode.uid = Some(u32::MAX), Problem::FieldOutOfRange, Field::Uid),
             (|o| o.inode.gid = Some(u32::MAX), Problem::FieldOutOfRange, Field::Gid),
             // -1 as a 16-bit ID is no ID either.
@@ -1856,6 +1862,11 @@ mod tests {
                 Problem::InvalidContents,
                 Field::Contents,
             ),
+            (
+                |o| o.contents = vec![ContentsObject::new(ContentsSource::File(Name::ROOT))],
+                Problem::InvalidContents,
+                Field::File,
+            ),
         ];
         let (root, _) = recording_all();
         for (give, problem, field) in cases {
@@ -1870,6 +1881,36 @@ mod tests {
                 object
             );
         }
+        // A contents object can't refer to the root. Name::ROOT, the default
+        // name and the parent of a name at the top are all the name of the
+        // root. A reader refuses the record a writer would write for such an
+        // object with the same error, only without the name of the object,
+        // which it doesn't know yet.
+        for file in [Name::ROOT, Name::default(), name("a").parent().unwrap()] {
+            let mut object = FileObject::new(name("x"));
+            object.contents = vec![ContentsObject::new(ContentsSource::File(file))];
+            let mut writer = Writer::begin(Vec::new(), &root).unwrap();
+            let e = writer.file(&object).unwrap_err();
+            assert_eq!(
+                (e.kind(), e.field(), e.to_string()),
+                (
+                    ErrorKind::Manifest(Problem::InvalidContents),
+                    Some(Field::File),
+                    "manifest object 1 (x): contents file reference: name is empty: ''".to_string()
+                )
+            );
+        }
+        let (_, root_text) = recording_all();
+        let record = r#"{"contents":[{"file":""}],"name":"x"}"#;
+        let e = read_whole(&sequence(&[&root_text, record, TRAILER])).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.field(), e.to_string()),
+            (
+                ErrorKind::Manifest(Problem::InvalidContents),
+                Some(Field::File),
+                "manifest object 1: contents file reference: name is empty: ''".to_string()
+            )
+        );
         // A field of a feature the manifest does not record, also one of
         // those the specification added last.
         let mut object = FileObject::new(name("x"));

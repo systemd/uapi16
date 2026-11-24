@@ -471,8 +471,15 @@ impl FileObject {
     /// [`ContentsObject::check_values`], and whose fields agree with each
     /// other. Where one of them does not, nothing is filled in for the
     /// object either, as a reader refuses its record and a writer refuses
-    /// the object.
+    /// the object. Where there are more than [`MAX_CONTENTS`] of them,
+    /// nothing is filled in at all, neither for the object nor for any of
+    /// them.
     pub(crate) fn fill_in_from_contents(&mut self) {
+        // A reader refuses the record of an object with more than
+        // MAX_CONTENTS contents objects, and nothing follows from them.
+        if self.contents.len() > MAX_CONTENTS {
+            return;
+        }
         // The object is in no record, and what is wrong with it is not
         // shown, so the number of the record does not matter.
         let subject = Subject::new(self, ROOT_RECORD);
@@ -1862,19 +1869,11 @@ impl<'a> Part<'a> for ContentsElement {
             match field {
                 Field::File => {
                     if let Some(file) = decoder.string(field, value) {
-                        match Name::new(file.as_ref()) {
-                            Ok(file) => {
-                                contents.source = ContentsSource::File(file);
-                                places += 1;
-                            }
-                            Err(reason) => decoder.note_error(Problem::InvalidContents, field, || {
-                                format!(
-                                    "{}: contents file reference: {}: '{}'",
-                                    subject,
-                                    reason,
-                                    file.escape_debug()
-                                )
-                            }),
+                        let name = Name::new(file.as_ref())
+                            .map_err(|reason| Error::invalid_file_reference(subject, reason, &file));
+                        if let Some(name) = decoder.note_err(name) {
+                            contents.source = ContentsSource::File(name);
+                            places += 1;
                         }
                     }
                 }
@@ -3101,8 +3100,9 @@ mod tests {
             }
         }
         // A contents object with a value a reader refuses: a URL that is
-        // neither http nor https, the encoding that stands for none and a
-        // name that is not one of an HTTP header field.
+        // neither http nor https, the encoding that stands for none, a name
+        // that is not one of an HTTP header field, and the name of the root
+        // as the file.
         let ftp = || ContentsObject::new(ContentsSource::Url("ftp://example.com/x".into()));
         let https = || ContentsObject::new(ContentsSource::Url("https://example.com/x".into()));
         for (record, contents, field) in [
@@ -3132,6 +3132,14 @@ mod tests {
                 },
                 Field::HttpHeaders,
             ),
+            (
+                r#"{"name":"x","contents":[{"file":"","originalSize":5}]}"#,
+                ContentsObject {
+                    original_size: Some(5),
+                    ..ContentsObject::new(ContentsSource::File(Name::ROOT))
+                },
+                Field::File,
+            ),
         ] {
             let e = refused(record);
             assert_eq!(
@@ -3145,6 +3153,30 @@ mod tests {
             assert!(object.filled_in().is_empty(), "{}", record);
             assert_eq!(object.contents(), [contents], "{}", record);
         }
+        // As many contents objects as a reader takes, and one more, for
+        // which nothing is filled in at all.
+        let one = ContentsObject {
+            original_size: Some(5),
+            ..file()
+        };
+        let many = |n: usize| {
+            let record = vec![r#"{"file":"a","originalSize":5}"#; n].join(",");
+            (
+                format!(r#"{{"name":"x","contents":[{}]}}"#, record),
+                set(None, None, vec![one.clone(); n]),
+            )
+        };
+        let (record, object) = many(MAX_CONTENTS);
+        assert_eq!(object.size(), Some(5));
+        assert_eq!(object, self::object(&record));
+        let (record, object) = many(MAX_CONTENTS + 1);
+        assert_eq!(
+            refused(&record).to_string(),
+            "manifest object 1: more than 256 contents entries"
+        );
+        assert_eq!((object.size(), object.sha256()), (None, None));
+        assert!(object.filled_in().is_empty());
+        assert!(object.contents().iter().all(|contents| *contents == one));
     }
 
     #[test]
