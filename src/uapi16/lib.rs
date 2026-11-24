@@ -31,12 +31,8 @@
 //!   [`ValidityWindow`].
 //! - [`DataProvider`] is where the data of the files comes from when a
 //!   manifest is applied. [`StreamProvider`] takes it from one stream
-//!   that carries it all.
-#![cfg_attr(
-    target_os = "linux",
-    doc = "  On Linux, [`DirectoryProvider`] takes it from the files next to the",
-    doc = "  manifest, in a [`PinnedDirectory`]."
-)]
+//!   that carries it all. [`DirectoryProvider`] takes it from the files
+//!   next to the manifest, in a [`PinnedDirectory`].
 //!   [`FileObject::copy_data`] copies the data of a file and checks it
 //!   against the manifest with a [`DataCheck`].
 //!
@@ -107,15 +103,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-compile_error!("uapi16 supports Linux and Android only");
+#[cfg(not(target_os = "linux"))]
+compile_error!("uapi16 supports Linux only");
 
 mod base64;
 mod blocking;
 mod content;
 mod decode;
 mod digest;
-#[cfg(target_os = "linux")]
 mod directory;
 mod error;
 mod features;
@@ -129,11 +124,8 @@ mod strict;
 mod writer;
 
 pub use blocking::{Reader, Writer};
-#[cfg(target_os = "linux")]
-pub use content::DirectoryProvider;
-pub use content::{DataCheck, DataLocation, DataProvider, ExternalFile, StreamProvider};
+pub use content::{DataCheck, DataLocation, DataProvider, DirectoryProvider, ExternalFile, StreamProvider};
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
-#[cfg(target_os = "linux")]
 pub use directory::PinnedDirectory;
 pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};

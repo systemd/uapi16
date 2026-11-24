@@ -31,13 +31,13 @@ uapi16 reads JSON with serde_json. If another crate in the same build
 turns on serde_json's arbitrary_precision feature, numbers are read
 differently, see the crate documentation.
 
-uapi16 supports Linux 5.10 or newer, the minimum baseline of systemd,
-and Android. Reading the data of the files from the directory next to
-the manifest works on Linux only. uapi16 needs Rust 1.85 or newer. Some
-of its dependencies need a newer Rust in later releases, such as sha2
-from version 0.11.1 on. With an older Rust, use resolver 3, the default
-of edition 2024, so that cargo picks versions that build, or pin such a
-dependency, for example with `cargo update -p sha2 --precise 0.11.0`.
+uapi16 supports Linux 5.10 or newer, the minimum baseline of systemd. It
+does not build for any other system, Android included. uapi16 needs Rust
+1.85 or newer. Some of its dependencies need a newer Rust in later
+releases, such as sha2 from version 0.11.1 on. With an older Rust, use
+resolver 3, the default of edition 2024, so that cargo picks versions
+that build, or pin such a dependency, for example with
+`cargo update -p sha2 --precise 0.11.0`.
 
 A new minor release, such as 0.2.0, may change the API in ways that
 break callers. Releases within a minor version, such as 0.1.1 after

@@ -2,9 +2,8 @@
 #
 # The build and the tests with the oldest and the newest rustc on x86_64,
 # the same with musl, the build and the tests on i686, the lints for
-# fourteen targets, the formatting, the documentation for Linux and
-# Android, the package cargo publish uploads, the dependency check and
-# the sign-offs.
+# twelve targets, the formatting, the documentation, the package cargo
+# publish uploads, the dependency check and the sign-offs.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS,
 # clippy's -D warnings and RUSTDOCFLAGS.
@@ -157,8 +156,6 @@ jobs:
         s390x-unknown-linux-gnu
         sparc64-unknown-linux-gnu
         x86_64-unknown-linux-musl
-        aarch64-linux-android
-        armv7-linux-androideabi
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -218,20 +215,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add aarch64-linux-android
           rustc --version
 
       - name: rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps
-
-      # What is there on Linux only is missing on Android, and no link may
-      # lead to it there. The documentation needs no NDK.
-      - name: rustdoc for Android
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --no-deps --target aarch64-linux-android
 
   package:
     name: Package

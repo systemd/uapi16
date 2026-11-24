@@ -53,8 +53,6 @@ static EMPTYPATH: AtomicU8 = AtomicU8::new(EmptyPath::UNKNOWN);
 /// that leads through one fails with [`SourceProblem::Unreadable`], and
 /// [`Error::io_error`] gives ELOOP.
 ///
-/// It exists on Linux only, not on Android.
-///
 /// [`SourceProblem::Missing`]: crate::SourceProblem::Missing
 /// [`SourceProblem::NotRegular`]: crate::SourceProblem::NotRegular
 /// [`SourceProblem::Unreadable`]: crate::SourceProblem::Unreadable

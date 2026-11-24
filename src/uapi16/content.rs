@@ -2,17 +2,12 @@
 //! The data of the files a manifest describes: where it is, and copying
 //! it from there with the sizes and hashes of the manifest checked.
 
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Read, Write};
-#[cfg(target_os = "linux")]
-use std::io::{Seek, SeekFrom};
-#[cfg(target_os = "linux")]
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
 use crate::digest::Sha256Context;
-#[cfg(target_os = "linux")]
 use crate::directory::PinnedDirectory;
 use crate::error::{DataProblem, Error, ErrorKind, Field, SourceProblem, UnsupportedData};
 use crate::object::{ContentsObject, ContentsSource, FileObject, InodeType};
@@ -26,16 +21,13 @@ const COPY_SIZE: usize = 1024 * 1024;
 /// file takes besides, see [`PieceHashes::stored_bytes`]. The map that
 /// holds them adds up to about half a MiB, with many small files, which
 /// does not grow with the manifest either.
-#[cfg(target_os = "linux")]
 const PIECE_HASH_BYTES: usize = 1024 * 1024;
 /// What a file takes in [`PieceHashes`] besides the hashes of its pieces:
 /// its hash and its length, which it is known by, and the pointer to the
 /// hashes of its pieces.
-#[cfg(target_os = "linux")]
 const FILE_ENTRY_BYTES: usize = size_of::<(Sha256, u64)>() + size_of::<Box<[Sha256]>>();
 /// The most pieces a file is hashed in, so that the hashes of a file of
 /// any length fit into [`PIECE_HASH_BYTES`].
-#[cfg(target_os = "linux")]
 const MAX_PIECES: u64 = ((PIECE_HASH_BYTES - FILE_ENTRY_BYTES) / size_of::<Sha256>()) as u64;
 
 /// Where the data of a file object is, as [`FileObject::data_location`]
@@ -114,7 +106,6 @@ impl<'a> ExternalFile<'a> {
     /// as long as the object says, whatever else the file holds. So the
     /// file has to be long enough for it, and as long as `originalSize`
     /// where the manifest gives that.
-    #[cfg(target_os = "linux")]
     fn check_len(&self, object: &FileObject, len: u64) -> Result<u64, Error> {
         let name = &object.name;
         let mismatch =
@@ -146,7 +137,6 @@ impl<'a> ExternalFile<'a> {
 
     /// The error for the file that the data of `object` cannot be taken
     /// from.
-    #[cfg(target_os = "linux")]
     fn unavailable(&self, object: &FileObject, error: OpenError) -> Error {
         let name = &object.name;
         let error = match error {
@@ -366,8 +356,7 @@ impl ContentsObject {
 /// It checks what the object says of its data, the check the
 /// specification has for the data of every file. What its contents
 /// objects say of the files the data is in, their sizes and hashes, is
-/// for whoever reads those files to check.
-#[cfg_attr(target_os = "linux", doc = "A [`DirectoryProvider`] does.")]
+/// for whoever reads those files to check. A [`DirectoryProvider`] does.
 ///
 /// [`FileObject::copy_data`] checks what it copies with one. A caller
 /// that moves the data itself, such as a copy in an async runtime, hands
@@ -508,15 +497,11 @@ pub(crate) mod sealed {
 /// manifest.
 ///
 /// [`StreamProvider`] takes it from one stream that carries it all, in the
-/// order of the manifest.
-#[cfg_attr(
-    target_os = "linux",
-    doc = "[`DirectoryProvider`] takes it from the files next to the manifest."
-)]
-/// A consumer hands a provider every file object, in the order of the
-/// manifest: those whose data it takes to [`FileObject::copy_data`],
-/// which calls [`DataProvider::copy`], and the others to
-/// [`DataProvider::skip`]. After the last one it calls
+/// order of the manifest. [`DirectoryProvider`] takes it from the files
+/// next to the manifest. A consumer hands a provider every file object, in
+/// the order of the manifest: those whose data it takes to
+/// [`FileObject::copy_data`], which calls [`DataProvider::copy`], and the
+/// others to [`DataProvider::skip`]. After the last one it calls
 /// [`DataProvider::end`].
 ///
 /// The trait is sealed: the providers of this crate implement it, and it
@@ -544,7 +529,6 @@ pub trait DataProvider: sealed::Sealed {
 }
 
 /// Why a [`Directory`] does not hand out a file.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) enum OpenError {
     /// What the name names is not a regular file.
@@ -554,7 +538,6 @@ pub(crate) enum OpenError {
     Io(io::Error),
 }
 
-#[cfg(target_os = "linux")]
 impl From<io::Error> for OpenError {
     fn from(e: io::Error) -> OpenError {
         OpenError::Io(e)
@@ -572,7 +555,6 @@ impl From<io::Error> for OpenError {
 ///
 /// The trait is the crate's own: [`PinnedDirectory`] is the one directory
 /// a caller has, and the tests have one in memory.
-#[cfg(target_os = "linux")]
 pub(crate) trait Directory {
     /// A file of the directory, open for reading.
     type File: Read + Seek;
@@ -609,18 +591,13 @@ pub(crate) trait Directory {
 /// specification allows. So the memory the provider takes does not grow
 /// with the manifest, and while copies succeed, a file of more than one
 /// piece is read whole once at most for its parts.
-///
-/// It exists on Linux only, not on Android.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DirectoryProvider {
     inner: Provider<PinnedDirectory>,
 }
 
-#[cfg(target_os = "linux")]
 impl sealed::Sealed for DirectoryProvider {}
 
-#[cfg(target_os = "linux")]
 impl DirectoryProvider {
     /// A provider that takes the files from `directory`.
     pub fn new(directory: PinnedDirectory) -> DirectoryProvider {
@@ -630,7 +607,6 @@ impl DirectoryProvider {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl DataProvider for DirectoryProvider {
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
         self.inner.copy(object, file, sink)
@@ -639,7 +615,6 @@ impl DataProvider for DirectoryProvider {
 
 /// What a [`DirectoryProvider`] is, over any [`Directory`], so that the
 /// tests can give it one in memory.
-#[cfg(target_os = "linux")]
 struct Provider<D> {
     directory: D,
     /// What a copy goes through, made when the first file is copied.
@@ -648,7 +623,6 @@ struct Provider<D> {
     hashes: PieceHashes,
 }
 
-#[cfg(target_os = "linux")]
 impl<D: Directory> Provider<D> {
     /// A provider that takes the files from `directory`.
     fn new(directory: D) -> Provider<D> {
@@ -660,7 +634,6 @@ impl<D: Directory> Provider<D> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl<D: fmt::Debug> fmt::Debug for Provider<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provider")
@@ -686,7 +659,6 @@ impl<D: fmt::Debug> fmt::Debug for Provider<D> {
 /// fit are not checked against the hash of the whole file, which the
 /// specification allows for a file that is taken only in part. A part that
 /// gives a hash of its own is checked against that one in any case.
-#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct PieceHashes {
     /// The hashes of the pieces of each file, by its hash and its length.
@@ -695,7 +667,6 @@ struct PieceHashes {
     bytes: usize,
 }
 
-#[cfg(target_os = "linux")]
 impl PieceHashes {
     /// The size of the pieces a file of the length `len` is hashed in:
     /// [`COPY_SIZE`], or more for a file that would have more than
@@ -745,7 +716,6 @@ impl PieceHashes {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl fmt::Debug for PieceHashes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PieceHashes")
@@ -756,8 +726,7 @@ impl fmt::Debug for PieceHashes {
 }
 
 /// Why a copy from a file or a stream did not go through. A copy from a
-/// stream fails the first two ways only, and the files of a directory are
-/// read on Linux only.
+/// stream fails the first two ways only.
 #[derive(Debug)]
 enum CopyFailure {
     /// Reading the file or the stream failed.
@@ -765,11 +734,9 @@ enum CopyFailure {
     /// The sink did not take what was read.
     WriteFailed(io::Error),
     /// The file does not have the hash it is checked against.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     HashMismatch,
     /// The file is not as long as it was when it was opened, or longer:
     /// it changed while it was read.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     SourceChanged,
 }
 
@@ -843,7 +810,6 @@ impl<R: Read + ?Sized> ReadSome for R {}
 
 /// A file a [`DirectoryProvider`] copies the data of an object from, in
 /// pieces where it checks them.
-#[cfg(target_os = "linux")]
 struct Pieces<'a, F> {
     file: F,
     /// What the file is read into: [`COPY_SIZE`] bytes.
@@ -858,7 +824,6 @@ struct Pieces<'a, F> {
     data: Range<u64>,
 }
 
-#[cfg(target_os = "linux")]
 impl<F: Read + Seek> Pieces<'_, F> {
     /// Copies the data without a look at the rest of the file. A file that
     /// ends before the data does changed since it was opened.
@@ -979,7 +944,6 @@ impl<F: Read + Seek> Pieces<'_, F> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl<D: Directory> Provider<D> {
     /// Copies the data of `object`, which is in `file`, to `sink`, see
     /// [`DataProvider::copy`].
@@ -1183,9 +1147,7 @@ impl<R: Read> DataProvider for StreamProvider<R> {
     }
 }
 
-// The tests build their directories in memory, and DirectoryProvider is
-// for Linux only.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Problem;

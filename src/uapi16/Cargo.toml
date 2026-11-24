@@ -24,12 +24,12 @@ serde_core.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 
-# PinnedDirectory, which only Linux has.
+# uapi16 supports Linux only. A build for another system fails with the
+# error of lib.rs, and builds neither of the two for it.
 [target.'cfg(target_os = "linux")'.dependencies]
+# PinnedDirectory.
 pathrs.workspace = true
-
 # PinnedDirectory, and the device numbers of FileObject::from_metadata().
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
