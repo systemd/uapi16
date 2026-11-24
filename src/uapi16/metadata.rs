@@ -5,7 +5,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 
 use crate::object::{FileObject, InodeType, Mode, UnknownInodeType};
-use crate::{Features, Name};
+use crate::{Features, NameBuf};
 
 impl FileObject {
     /// A file object for the file `name`, whose metadata is `meta`, with
@@ -27,7 +27,7 @@ impl FileObject {
     /// It fails for a file whose type is not an inode type.
     ///
     /// [`RootObject::recorded_features`]: crate::RootObject::recorded_features
-    pub fn from_metadata(name: Name, meta: &Metadata, features: Features) -> Result<FileObject, UnknownInodeType> {
+    pub fn from_metadata(name: NameBuf, meta: &Metadata, features: Features) -> Result<FileObject, UnknownInodeType> {
         let mut object = FileObject::new(name);
         object.inode_type = InodeType::try_from(meta.file_type())?;
         let inode = &mut object.inode;
@@ -98,7 +98,7 @@ mod tests {
             let mut writer = Writer::begin(Vec::new(), &root).unwrap();
             for (name, path, inode_type) in &files {
                 let meta = fs::symlink_metadata(path).unwrap();
-                let mut object = FileObject::from_metadata(Name::new(*name).unwrap(), &meta, features).unwrap();
+                let mut object = FileObject::from_metadata(NameBuf::new(*name).unwrap(), &meta, features).unwrap();
                 assert_eq!(object.inode_type(), *inode_type, "{}", name);
                 let has = |feature: Features| features.contains(feature);
                 let mut inode = InodeAttributes {

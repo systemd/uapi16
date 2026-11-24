@@ -137,7 +137,7 @@ pub use digest::{InvalidDigest, Sha256, Sha256Context};
 pub use directory::PinnedDirectory;
 pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
-pub use name::{Name, NameProblem};
+pub use name::{Name, NameBuf, NameError, NameProblem};
 pub use object::{
     ContentsObject, ContentsSource, FatSerial, FileObject, FileSystemIdentity, FilledIn, GptPartition, InodeAttributes,
     InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject, SignatureObject, UnknownInodeType, Uuid,
@@ -183,7 +183,7 @@ pub(crate) mod testing {
     use super::blocking::READ_SIZE;
     use super::object::{DosFlags, InodeFlags};
     use super::{
-        ContentsObject, ContentsSource, Error, Features, FileObject, GptPartition, InodeType, Mode, Name, Object,
+        ContentsObject, ContentsSource, Error, Features, FileObject, GptPartition, InodeType, Mode, NameBuf, Object,
         Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
@@ -302,9 +302,9 @@ pub(crate) mod testing {
     /// The names of the full tree in which every directory has an entry
     /// for each of `pieces`, down to `depth` components: every name of at
     /// most `depth` components made of `pieces`, the root among them.
-    pub(crate) fn full_tree_names(pieces: &[&str], depth: usize) -> Vec<Name> {
-        let mut names = vec![Name::ROOT];
-        let mut level = vec![Name::ROOT];
+    pub(crate) fn full_tree_names(pieces: &[&str], depth: usize) -> Vec<NameBuf> {
+        let mut names = vec![NameBuf::default()];
+        let mut level = vec![NameBuf::default()];
         for _ in 0..depth {
             level = level
                 .iter()
@@ -327,8 +327,8 @@ pub(crate) mod testing {
         writer.finish()
     }
 
-    pub(crate) fn name(name: &str) -> Name {
-        Name::new(name).unwrap()
+    pub(crate) fn name(name: &str) -> NameBuf {
+        NameBuf::new(name).unwrap()
     }
 
     /// The records `writer` wrote after `root`, without the frame of

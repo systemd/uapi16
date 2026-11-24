@@ -242,11 +242,11 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// text where it can. The writer refuses such a record.
 ///
 /// ```
-/// use uapi16::{FileObject, Name, Object, Order, Reader, RootObject, Writer};
+/// use uapi16::{FileObject, NameBuf, Object, Order, Reader, RootObject, Writer};
 ///
 /// let mut root = RootObject::default();
 /// root.set_order(Some(Order::CodePoint));
-/// let mut file = FileObject::new(Name::new("a")?);
+/// let mut file = FileObject::new(NameBuf::new("a")?);
 /// file.set_size(Some(3));
 /// let mut writer = Writer::begin(Vec::new(), &root)?;
 /// writer.file(&file)?;
