@@ -204,7 +204,7 @@ mod tests {
     /// What `dir` has under `name`: the text of a regular file, or why it
     /// has none.
     fn text(dir: &PinnedDirectory, name: &str) -> Result<String, Opened> {
-        let (mut file, len) = dir.open(&Name::new(name).unwrap()).map_err(Opened::from)?;
+        let (mut file, len) = dir.open(Name::new(name).unwrap()).map_err(Opened::from)?;
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         assert_eq!(text.len() as u64, len, "{}", name);
@@ -250,7 +250,7 @@ mod tests {
         // itself, which the root file object names.
         assert_eq!(text(&plain, "sub"), Err(Opened::NotRegular));
         assert_eq!(
-            plain.open(&Name::ROOT).map(|_| ()).map_err(Opened::from),
+            plain.open(Name::ROOT).map(|_| ()).map_err(Opened::from),
             Err(Opened::NotRegular)
         );
         assert_eq!(text(&plain, "missing"), Err(Opened::Errno(libc::ENOENT)));
@@ -303,7 +303,7 @@ mod tests {
         };
         for state in [EmptyPath::UNKNOWN, EmptyPath::MISSING] {
             EMPTYPATH.store(state, Ordering::Relaxed);
-            let (handle, _) = directory.pin(&Name::new("file").unwrap()).unwrap();
+            let (handle, _) = directory.pin(Name::new("file").unwrap()).unwrap();
             fs::rename(dir.join("file"), dir.join("moved")).unwrap();
             fs::write(dir.join("file"), b"impostor").unwrap();
             assert_eq!(read(&mut PinnedDirectory::reopen(&handle).unwrap()), "pinned");
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(text(&directory, "fifo"), Err(Opened::NotRegular));
         assert_eq!(text(&directory, "file").as_deref(), Ok("data"));
         // The file is the one that was pinned, open for reading only.
-        let (file, len) = directory.open(&Name::new("file").unwrap()).unwrap();
+        let (file, len) = directory.open(Name::new("file").unwrap()).unwrap();
         assert_eq!(len, 4);
         let flags = rustix::fs::fcntl_getfl(&file).unwrap();
         assert_eq!(flags & OFlags::RWMODE, OFlags::RDONLY);

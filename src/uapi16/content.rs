@@ -375,9 +375,9 @@ impl ContentsObject {
 /// and calls [`DataCheck::finish`] after the last one.
 ///
 /// ```
-/// use uapi16::{DataCheck, FileObject, Name, Sha256};
+/// use uapi16::{DataCheck, FileObject, NameBuf, Sha256};
 ///
-/// let mut object = FileObject::new(Name::new("hello.txt")?);
+/// let mut object = FileObject::new(NameBuf::new("hello.txt")?);
 /// object.set_size(Some(5));
 /// object.set_sha256(Some(Sha256::digest(b"hello")));
 /// let mut check = DataCheck::new(&object);
@@ -1190,6 +1190,7 @@ mod tests {
     use super::*;
     use crate::error::Problem;
     use crate::testing::{json, manifest, read_whole, sequence, HELLO, TRAILER, WORLD};
+    use crate::NameBuf;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -2451,7 +2452,7 @@ mod tests {
         assert_eq!(check(&sized, b"hello").unwrap(), b"hello");
         assert_eq!(check(&sized, b"world").unwrap_err().kind(), hash);
         // An object that is all of its file without a hash of its own.
-        let mut whole = FileObject::new(Name::new("x").unwrap());
+        let mut whole = FileObject::new(NameBuf::new("x").unwrap());
         whole.size = Some(5);
         let mut contents = ContentsObject::new(ContentsSource::Implied);
         contents.original_size = Some(5);

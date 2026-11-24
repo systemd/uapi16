@@ -28,7 +28,8 @@ use crate::object::{
 };
 use crate::strict::{FieldTable, Key, Members, Skip, Strict};
 use crate::{
-    Features, Name, Order, Sha256, MAX_CONTENTS, MEDIA_TYPE, SIGNATURE_MEDIA_TYPE, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
+    Features, Name, NameBuf, Order, Sha256, MAX_CONTENTS, MEDIA_TYPE, SIGNATURE_MEDIA_TYPE, TRAILER_MEDIA_TYPE,
+    USER_NAMESPACE,
 };
 
 /// The user and group ID that is -1 as an unsigned 32-bit integer,
@@ -260,7 +261,7 @@ impl Field {
 /// draft and every other record a [`FileObject`].
 struct Draft {
     object: Box<FileObject>,
-    name: Option<Name>,
+    name: Option<NameBuf>,
     /// The name as the record has it, when it is not a valid one.
     invalid_name: Option<String>,
     inode_type: Option<InodeType>,
@@ -281,7 +282,7 @@ impl Draft {
     /// The draft of a record no member of which was read yet.
     fn new() -> Draft {
         Draft {
-            object: Box::new(FileObject::new(Name::ROOT)),
+            object: Box::new(FileObject::new(NameBuf::default())),
             name: None,
             invalid_name: None,
             inode_type: None,
@@ -298,7 +299,7 @@ impl Draft {
         if !self.object.name.is_root() {
             return Some(self.object.name.as_str());
         }
-        self.name.as_ref().map(Name::as_str).or(self.invalid_name.as_deref())
+        self.name.as_deref().map(Name::as_str).or(self.invalid_name.as_deref())
     }
 
     /// The fields of a partition, which are made when the first of them is
@@ -1488,7 +1489,7 @@ impl<'a> RecordDecoder<'a> {
             Field::Name => {
                 if let Some(name) = self.string(field, value) {
                     match Name::new(name.as_ref()) {
-                        Ok(name) => draft.name = Some(name),
+                        Ok(name) => draft.name = Some(name.to_owned()),
                         Err(reason) => {
                             let subject = self.subject();
                             self.note_error(Problem::InvalidName, field, || {
@@ -1872,7 +1873,7 @@ impl<'a> Part<'a> for ContentsElement {
                         let name = Name::new(file.as_ref())
                             .map_err(|reason| Error::invalid_file_reference(subject, reason, &file));
                         if let Some(name) = decoder.note_err(name) {
-                            contents.source = ContentsSource::File(name);
+                            contents.source = ContentsSource::File(name.to_owned());
                             places += 1;
                         }
                     }
@@ -2272,7 +2273,7 @@ mod tests {
     fn what_a_field_can_look_like() {
         // An object says as little as its name.
         let o = object(r#"{"name":"x"}"#);
-        assert_eq!(o, FileObject::new(Name::new("x").unwrap()));
+        assert_eq!(o, FileObject::new(NameBuf::new("x").unwrap()));
         // A field that is null is not there. Fields this crate does not
         // know are passed over, whatever they hold.
         let nulls = concat!(
@@ -2505,7 +2506,7 @@ mod tests {
             object.check_consistency(subject, contents_data.into_iter())
         };
         let file = |size: Option<u64>, contents: ContentsObject| {
-            let mut object = FileObject::new(Name::new("x").unwrap());
+            let mut object = FileObject::new(NameBuf::new("x").unwrap());
             object.size = size;
             object.contents = vec![contents];
             object
@@ -2520,7 +2521,7 @@ mod tests {
         );
         let mut beyond = hello();
         beyond.offset = 7;
-        let mut headers = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+        let mut headers = ContentsObject::new(ContentsSource::File(NameBuf::new("a").unwrap()));
         headers.http_headers = vec![("A".to_string(), "b".to_string())];
         let mut empty = file(Some(3), hello());
         empty.contents.clear();
@@ -2560,7 +2561,7 @@ mod tests {
     #[test]
     fn set_contents_with_an_offset_beyond_the_data() {
         let file = |offset: u64, original_size: u64| {
-            let mut contents = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+            let mut contents = ContentsObject::new(ContentsSource::File(NameBuf::new("a").unwrap()));
             contents.set_offset(offset);
             contents.set_original_size(Some(original_size));
             contents
@@ -2573,7 +2574,7 @@ mod tests {
         encoded.set_encoding(Some("gzip".to_string()));
         encoded.set_original_size(Some(3));
         encoded.set_offset(4);
-        let whole = ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+        let whole = ContentsObject::new(ContentsSource::File(NameBuf::new("a").unwrap()));
         for (size, contents) in [
             (None, vec![file(6, 5)]),
             (Some(1), vec![file(6, 5)]),
@@ -2582,7 +2583,7 @@ mod tests {
             (None, vec![whole, file(5, 4)]),
             (None, vec![file(u64::MAX, 0)]),
         ] {
-            let mut object = FileObject::new(Name::new("x").unwrap());
+            let mut object = FileObject::new(NameBuf::new("x").unwrap());
             object.set_size(size);
             object.set_contents(contents);
             assert_eq!(object.size(), size, "{:?}", object);
@@ -2948,9 +2949,9 @@ mod tests {
         let hello: Option<Sha256> = HELLO.parse().ok();
         let world: Option<Sha256> = WORLD.parse().ok();
         let literal = || ContentsObject::new(ContentsSource::Literal(b"hello".to_vec()));
-        let file = || ContentsObject::new(ContentsSource::File(Name::new("a").unwrap()));
+        let file = || ContentsObject::new(ContentsSource::File(NameBuf::new("a").unwrap()));
         let set = |size: Option<u64>, sha256: Option<Sha256>, contents: Vec<ContentsObject>| {
-            let mut object = FileObject::new(Name::new("x").unwrap());
+            let mut object = FileObject::new(NameBuf::new("x").unwrap());
             object.set_size(size);
             object.set_sha256(sha256);
             object.set_contents(contents);
@@ -3136,7 +3137,7 @@ mod tests {
                 r#"{"name":"x","contents":[{"file":"","originalSize":5}]}"#,
                 ContentsObject {
                     original_size: Some(5),
-                    ..ContentsObject::new(ContentsSource::File(Name::ROOT))
+                    ..ContentsObject::new(ContentsSource::File(NameBuf::default()))
                 },
                 Field::File,
             ),

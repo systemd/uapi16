@@ -58,12 +58,12 @@ enum Stage {
 /// trailer object, so after [`Encoder::finish`] every method fails.
 ///
 /// ```
-/// use uapi16::{Encoder, FileObject, Name, RootObject};
+/// use uapi16::{Encoder, FileObject, NameBuf, RootObject};
 ///
 /// let mut text = String::new();
 /// let mut encoder = Encoder::begin(&RootObject::default(), &mut text)?;
 /// for name in ["a", "b"] {
-///     encoder.file(&FileObject::new(Name::new(name)?), &mut text)?;
+///     encoder.file(&FileObject::new(NameBuf::new(name)?), &mut text)?;
 /// }
 /// encoder.finish(&mut text)?;
 /// assert_eq!(
@@ -851,7 +851,7 @@ mod tests {
         directory, everything, json, name, read_whole, record, recording_all, sequence, write_whole, written, Whole,
         EMPTY, HELLO, ROOT, SIGNATURE, TRAILER, WORLD,
     };
-    use crate::{Sha256, Writer};
+    use crate::{NameBuf, Sha256, Writer};
     use std::collections::BTreeMap;
 
     /// What `systemd-manifest` writes, see the manifests in tests/fixtures:
@@ -1206,14 +1206,14 @@ mod tests {
         // Every other file object has a name, and comes before the
         // signatures.
         let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
-        let e = writer.file(&FileObject::new(Name::ROOT)).unwrap_err();
+        let e = writer.file(&FileObject::new(NameBuf::default())).unwrap_err();
         assert_eq!(kind(e), (Problem::NoName, Some(1), Some(Field::Name)));
         writer.file(&FileObject::new(name("a"))).unwrap();
         writer.signature(&SignatureObject::new("pkcs7")).unwrap();
         let e = writer.file(&FileObject::new(name("b"))).unwrap_err();
         assert_eq!(kind(e), (Problem::FileAfterSignature, Some(3), None));
         // As for a reader, that comes before a missing name.
-        let e = writer.file(&FileObject::new(Name::ROOT)).unwrap_err();
+        let e = writer.file(&FileObject::new(NameBuf::default())).unwrap_err();
         assert_eq!(kind(e), (Problem::FileAfterSignature, Some(3), None));
         writer.signature(&SignatureObject::new("openpgp")).unwrap();
         let bytes = writer.finish().unwrap();
@@ -1652,7 +1652,7 @@ mod tests {
             // A value, before a missing name.
             (
                 r#"{"uid":65535}"#.into(),
-                |o| (o.name, o.inode.uid) = (Name::ROOT, Some(65535)),
+                |o| (o.name, o.inode.uid) = (NameBuf::default(), Some(65535)),
                 Problem::FieldOutOfRange,
             ),
             // A value, before a field the inode type does not permit.
@@ -1728,7 +1728,7 @@ mod tests {
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::FileAfterSignature));
         let mut writer = Writer::begin(Vec::new(), &root).unwrap();
         writer.signature(&SignatureObject::new("pkcs7")).unwrap();
-        let mut nameless = FileObject::new(Name::ROOT);
+        let mut nameless = FileObject::new(NameBuf::default());
         nameless.inode.uid = Some(65535);
         let w = writer.file(&nameless).unwrap_err();
         assert_eq!((w.kind(), w.record_number()), (e.kind(), e.record_number()));
@@ -1863,7 +1863,7 @@ mod tests {
                 Field::Contents,
             ),
             (
-                |o| o.contents = vec![ContentsObject::new(ContentsSource::File(Name::ROOT))],
+                |o| o.contents = vec![ContentsObject::new(ContentsSource::File(NameBuf::default()))],
                 Problem::InvalidContents,
                 Field::File,
             ),
@@ -1886,7 +1886,11 @@ mod tests {
         // root. A reader refuses the record a writer would write for such an
         // object with the same error, only without the name of the object,
         // which it doesn't know yet.
-        for file in [Name::ROOT, Name::default(), name("a").parent().unwrap()] {
+        for file in [
+            Name::ROOT.to_owned(),
+            NameBuf::default(),
+            name("a").parent().unwrap().to_owned(),
+        ] {
             let mut object = FileObject::new(name("x"));
             object.contents = vec![ContentsObject::new(ContentsSource::File(file))];
             let mut writer = Writer::begin(Vec::new(), &root).unwrap();
@@ -2250,7 +2254,9 @@ mod tests {
         let appended = text.len();
         for e in [
             encoder.file(&FileObject::new(name("z")), &mut text).unwrap_err(),
-            encoder.file(&FileObject::new(Name::ROOT), &mut text).unwrap_err(),
+            encoder
+                .file(&FileObject::new(NameBuf::default()), &mut text)
+                .unwrap_err(),
             encoder
                 .signature(&SignatureObject::new("pkcs7"), &mut text)
                 .unwrap_err(),

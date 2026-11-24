@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::decode::ROOT_RECORD;
 use crate::error::{Error, ErrorKind, Field, Problem, ValidityProblem};
 use crate::hex::Hex;
-use crate::{Features, Name, Order, Sha256, STRING_RULES};
+use crate::{Features, Name, NameBuf, Order, Sha256, STRING_RULES};
 
 /// The inode type of a file object, its `type` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1094,7 +1094,7 @@ pub enum ContentsSource {
     #[default]
     Implied,
     /// `file`: the data is in this file next to the manifest.
-    File(Name),
+    File(NameBuf),
     /// `url`: the data is at this http or https URL.
     Url(String),
     /// `literal`: the data is in the manifest, and here.
@@ -1700,7 +1700,7 @@ impl InodeAttributes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileObject {
-    pub(crate) name: Name,
+    pub(crate) name: NameBuf,
     pub(crate) inode_type: InodeType,
     pub(crate) size: Option<u64>,
     pub(crate) sha256: Option<Sha256>,
@@ -1741,7 +1741,7 @@ impl FileObject {
 
     /// A file object for the regular file `name` that says nothing else
     /// about it.
-    pub fn new(name: Name) -> FileObject {
+    pub fn new(name: NameBuf) -> FileObject {
         FileObject {
             name,
             inode_type: InodeType::Regular,
@@ -1765,12 +1765,12 @@ impl FileObject {
     }
 
     /// Sets `name`.
-    pub fn set_name(&mut self, name: Name) {
+    pub fn set_name(&mut self, name: NameBuf) {
         self.name = name;
     }
 
     /// The name, the object taken apart for it.
-    pub fn into_name(self) -> Name {
+    pub fn into_name(self) -> NameBuf {
         self.name
     }
 
@@ -1931,7 +1931,7 @@ impl FileObject {
     /// [`FilledIn`].
     ///
     /// ```
-    /// use uapi16::{FileObject, Name, Object, Reader, Sha256};
+    /// use uapi16::{FileObject, NameBuf, Object, Reader, Sha256};
     ///
     /// let manifest = concat!(
     ///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
@@ -1943,7 +1943,7 @@ impl FileObject {
     ///     panic!("no file object");
     /// };
     /// // The reader filled in the hash of no data for the size 0.
-    /// let mut set = FileObject::new(Name::new("e")?);
+    /// let mut set = FileObject::new(NameBuf::new("e")?);
     /// set.set_size(Some(0));
     /// set.set_sha256(Some(Sha256::EMPTY));
     /// assert!(read.eq_ignore_filled_in(&set));
@@ -2555,7 +2555,7 @@ mod tests {
         assert_eq!(Validity::Revoked.to_string(), "revoked");
         assert_eq!(ValidityWindow::default().state, Validity::Good);
         let kind = |object: &FileObject, now| object.check_validity(now).map_err(|e| e.kind());
-        let mut object = FileObject::new(Name::new("d/x").unwrap());
+        let mut object = FileObject::new(NameBuf::new("d/x").unwrap());
         assert_eq!(kind(&object, 0), Ok(()));
         assert_eq!(kind(&object, u64::MAX), Ok(()));
         object.validity.since_usec = 10;
@@ -2700,7 +2700,7 @@ mod tests {
                 assert_eq!(attributes.flags.get(flag), state, "{:?}", flag);
             }
             for (flag, get, set) in dos {
-                let mut object = FileObject::new(Name::new("f").unwrap());
+                let mut object = FileObject::new(NameBuf::new("f").unwrap());
                 set(&mut object, state);
                 assert_eq!(get(&object), state, "{:?}", flag);
                 let stated = if state.is_some() { flag } else { DosFlags::default() };
@@ -2738,7 +2738,7 @@ mod tests {
         assert_eq!(every, Features::ALL);
         // A field makes a file object state its feature.
         assert_eq!(
-            FileObject::new(Name::new("f").unwrap()).stated_features(),
+            FileObject::new(NameBuf::new("f").unwrap()).stated_features(),
             Features::NONE
         );
         let partition = |set: Give<GptPartition>| {
@@ -2769,7 +2769,7 @@ mod tests {
             (|o| o.inode.read_only = Some(false), Features::READ_ONLY),
         ];
         for (set, feature) in cases {
-            let mut object = FileObject::new(Name::new("f").unwrap());
+            let mut object = FileObject::new(NameBuf::new("f").unwrap());
             set(&mut object);
             assert_eq!(object.stated_features(), feature, "{:?}", object);
         }
@@ -2785,27 +2785,27 @@ mod tests {
             ),
         ];
         for (set, feature) in partitions {
-            let mut object = FileObject::new(Name::new("f").unwrap());
+            let mut object = FileObject::new(NameBuf::new("f").unwrap());
             object.gpt = partition(set);
             assert_eq!(object.stated_features(), feature, "{:?}", object);
         }
-        let mut object = FileObject::new(Name::new("f").unwrap());
+        let mut object = FileObject::new(NameBuf::new("f").unwrap());
         (object.inode.gid, object.inode.group_name) = (Some(0), Some("g".into()));
         assert_eq!(object.stated_features(), Features::GID | Features::GROUP_NAME);
         for &(flag, _, feature) in InodeFlags::FIELDS {
-            let mut object = FileObject::new(Name::new("f").unwrap());
+            let mut object = FileObject::new(NameBuf::new("f").unwrap());
             object.inode.flags.put(flag, Some(true));
             assert_eq!(object.stated_features(), feature, "{:?}", flag);
         }
         // The contents of a symbolic link are its target, which a feature
         // records. Those of other files are not.
-        let mut object = FileObject::new(Name::new("f").unwrap());
+        let mut object = FileObject::new(NameBuf::new("f").unwrap());
         object.contents = vec![ContentsObject::new(ContentsSource::Literal(b"t".to_vec()))];
         assert_eq!(object.stated_features(), Features::NONE);
         object.inode_type = InodeType::Symlink;
         assert_eq!(object.stated_features(), Features::SYMLINK);
         // What a reader filled in does not count.
-        let mut object = FileObject::new(Name::new("f").unwrap());
+        let mut object = FileObject::new(NameBuf::new("f").unwrap());
         (object.size, object.sha256) = (Some(0), Some(Sha256::EMPTY));
         object.filled_in.insert(Field::Size);
         assert_eq!(object.stated_features(), Features::SHA256);
@@ -2848,7 +2848,7 @@ mod tests {
         let literal = ContentsObject::new(ContentsSource::Literal(b"data".to_vec()));
         assert_eq!(literal.literal(), Some(&b"data"[..]));
         assert_eq!((literal.file(), literal.url(), literal.offset), (None, None, 0));
-        let file = ContentsObject::new(ContentsSource::File(Name::new("blob").unwrap()));
+        let file = ContentsObject::new(ContentsSource::File(NameBuf::new("blob").unwrap()));
         assert_eq!(file.file().map(Name::as_str), Some("blob"));
         let url = ContentsObject::new(ContentsSource::Url("https://example.com/x".to_string()));
         assert_eq!(url.url(), Some("https://example.com/x"));
@@ -2881,7 +2881,7 @@ mod tests {
     /// The fields of a partition change in place, and come out whole.
     #[test]
     fn gpt_in_place() {
-        let mut object = FileObject::new(Name::new("a").unwrap());
+        let mut object = FileObject::new(NameBuf::new("a").unwrap());
         assert!(object.gpt_mut().is_none());
         object.set_gpt(Some(GptPartition::default()));
         object.gpt_mut().unwrap().set_label(Some("esp".to_string()));
@@ -2963,7 +2963,7 @@ mod tests {
         let object = read(r#"{"name":"a","contents":[{"literal":"aGVsbG8="}]}"#);
         let mut contents = object.contents()[0].clone();
         assert_eq!((contents.encoded_size(), contents.original_size()), (Some(5), Some(5)));
-        contents.set_source(ContentsSource::File(Name::new("blob").unwrap()));
+        contents.set_source(ContentsSource::File(NameBuf::new("blob").unwrap()));
         assert_eq!(
             (contents.encoded_size(), contents.original_size(), contents.filled_in()),
             (None, None, none)
@@ -3053,7 +3053,7 @@ mod tests {
             filled_in: FilledIn::default(),
         };
         let object = FileObject {
-            name: Name::new("f").unwrap(),
+            name: NameBuf::new("f").unwrap(),
             inode_type: InodeType::Regular,
             size: Some(5),
             sha256: Some(Sha256::digest(b"hello")),
@@ -3113,7 +3113,7 @@ mod tests {
         each_differs(
             &object,
             &[
-                |o| o.name = Name::new("g").unwrap(),
+                |o| o.name = NameBuf::new("g").unwrap(),
                 |o| o.inode_type = InodeType::Symlink,
                 |o| o.size = None,
                 |o| o.sha256 = None,

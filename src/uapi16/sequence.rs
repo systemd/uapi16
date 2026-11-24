@@ -117,7 +117,7 @@ impl SequenceCheck {
         // at once.
         let pair = NamePair::new(&self.last, name);
         if !pair.second_is_in_open_directory(self.last_type) {
-            let directory = object.name.parent_str().unwrap_or_default();
+            let directory = object.name.parent().unwrap_or_default().as_str();
             return Err(Error::manifest(
                 Problem::Misplaced,
                 format!(
@@ -159,14 +159,14 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::object::{DosFlags, InodeFlags};
     use crate::testing::full_tree_names;
-    use crate::{ContentsObject, ContentsSource, FatSerial, Mode, Name, Uuid};
+    use crate::{ContentsObject, ContentsSource, FatSerial, Mode, Name, NameBuf, Uuid};
     use std::num::NonZeroU64;
 
     /// Gives an object a field.
     type Give<T> = fn(&mut T);
 
     fn object(name: &str, inode_type: InodeType) -> FileObject {
-        let mut object = FileObject::new(Name::new(name).unwrap());
+        let mut object = FileObject::new(NameBuf::new(name).unwrap());
         object.inode_type = inode_type;
         object
     }

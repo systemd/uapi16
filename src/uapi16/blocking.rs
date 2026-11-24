@@ -139,7 +139,7 @@ impl<R: Read> Reader<R> {
     /// Feeds the decoder until it takes a step other than [`Step::Input`].
     fn pull(&mut self) -> Result<Step, Error> {
         loop {
-            match self.decoder.step()? {
+            match self.decoder.process()? {
                 Step::Input => self.fill()?,
                 step => return Ok(step),
             }
@@ -158,7 +158,7 @@ impl<R: Read> Reader<R> {
         };
         let input = input.map_err(|e| self.decoder.input_error(e))?;
         if input.is_empty() {
-            self.decoder.end();
+            self.decoder.end_feed();
         } else {
             let taken = self.decoder.feed(input);
             self.input.consume(taken);
@@ -242,11 +242,11 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// text where it can. The writer refuses such a record.
 ///
 /// ```
-/// use uapi16::{FileObject, Name, Object, Order, Reader, RootObject, Writer};
+/// use uapi16::{FileObject, NameBuf, Object, Order, Reader, RootObject, Writer};
 ///
 /// let mut root = RootObject::default();
 /// root.set_order(Some(Order::CodePoint));
-/// let mut file = FileObject::new(Name::new("a")?);
+/// let mut file = FileObject::new(NameBuf::new("a")?);
 /// file.set_size(Some(3));
 /// let mut writer = Writer::begin(Vec::new(), &root)?;
 /// writer.file(&file)?;
