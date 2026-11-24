@@ -57,6 +57,35 @@ jobs:
           host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
 
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
+
       - name: Build
         run: cargo build --locked --workspace --all-targets
 
@@ -89,6 +118,35 @@ jobs:
           t=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
 
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
+
       # rustc links a musl binary with the C library and the startup
       # files that come with the target, so no musl toolchain is needed.
       - name: Build
@@ -110,11 +168,15 @@ jobs:
 
       - name: Install dependencies
         # The tests run on the x86_64 kernel with the i386 libraries of
-        # the runner.
+        # the runner. Tests mount fuse-overlayfs in their namespaces, a
+        # FUSE file system that takes no privileges, for what the
+        # kernel's own don't do. It is the runner's own program here as
+        # well.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386-cross libc6-i386 lib32gcc-s1
+            gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386-cross libc6-i386 lib32gcc-s1 \
+            fuse-overlayfs
 
       - name: Install rustc
         run: |
@@ -127,6 +189,28 @@ jobs:
             echo "CARGO_TARGET_${t}_LINKER=i686-linux-gnu-gcc"
             echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings"
           } >> "$GITHUB_ENV"
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
 
       - name: Build
         run: cargo build --locked --target "$TARGET" --workspace --all-targets
@@ -238,6 +322,35 @@ jobs:
           rustc --version
           host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
 
       - name: cargo publish --dry-run
         # Builds the package that would be uploaded, from its unpacked
