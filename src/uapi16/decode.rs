@@ -700,11 +700,17 @@ impl FileObject {
         Ok(())
     }
 
+    /// Whether `id` is a user or a group ID a manifest can have: any but the
+    /// two that stand for no ID.
+    pub(crate) fn is_valid_id(id: u32) -> bool {
+        id != INVALID_ID && id != INVALID_ID_16
+    }
+
     /// The user or group ID `id`, the value of `field`, if it is one. The
     /// two IDs that stand for no ID are none.
     pub(crate) fn check_id(field: Field, id: u64, subject: Subject<'_>) -> Result<u32, Error> {
         match u32::try_from(id) {
-            Ok(id) if id != INVALID_ID && id != INVALID_ID_16 => Ok(id),
+            Ok(id) if FileObject::is_valid_id(id) => Ok(id),
             _ => Err(Error::manifest(
                 Problem::FieldOutOfRange,
                 format!("{}: {} {} is out of range", subject, field, id),
