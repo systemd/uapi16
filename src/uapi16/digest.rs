@@ -121,6 +121,10 @@ impl FromStr for Sha256 {
 pub struct Sha256Context(sha2::Sha256);
 
 impl Sha256Context {
+    /// The zero bytes [`Sha256Context::update_zeros`] takes at a time. A
+    /// run of any size goes through them.
+    const ZEROS: &'static [u8] = &[0; 4096];
+
     /// A computation that has taken no data yet, the same as the default
     /// one.
     pub fn new() -> Sha256Context {
@@ -130,6 +134,18 @@ impl Sha256Context {
     /// Takes more of the data.
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data);
+    }
+
+    /// Takes `size` zero bytes as more of the data, such as a hole of a
+    /// sparse file that the caller did not read.
+    pub fn update_zeros(&mut self, size: u64) {
+        let zeros = Sha256Context::ZEROS;
+        let mut left = size;
+        while left > 0 {
+            let piece = usize::try_from(left).map_or(zeros.len(), |left| left.min(zeros.len()));
+            self.update(&zeros[..piece]);
+            left -= piece as u64;
+        }
     }
 
     /// Ends the computation and gives the hash of all the data.
@@ -193,6 +209,91 @@ mod tests {
     fn contexts() {
         assert_eq!(computed(b""), Sha256::EMPTY);
         assert_eq!(computed(b"hello"), Sha256::digest(b"hello"));
+    }
+
+    /// The hash of `data` computed with a context that takes `data` in
+    /// the pieces `pieces`, each as data or, where it says so, as a run of
+    /// as many zero bytes.
+    fn in_pieces(data: &[u8], pieces: &[(usize, bool)]) -> Sha256 {
+        let mut context = Sha256Context::new();
+        let mut rest = data;
+        for &(size, as_zeros) in pieces {
+            let (piece, after) = rest.split_at(size);
+            if as_zeros {
+                assert!(piece.iter().all(|&byte| byte == 0));
+                context.update_zeros(size as u64);
+            } else {
+                context.update(piece);
+            }
+            rest = after;
+        }
+        assert!(rest.is_empty());
+        context.finalize()
+    }
+
+    /// A run of zero bytes gives the hash that as many zero bytes give
+    /// as data: a run of no bytes, runs around the size of the pieces a run
+    /// is hashed in, and a run between other data.
+    #[test]
+    fn runs_of_zeros() {
+        // What sha256sum prints for no data, for 4096 zero bytes and for
+        // 1 MiB of them.
+        for (size, expected) in [
+            (0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (4096, "ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7"),
+            (
+                1024 * 1024,
+                "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+            ),
+        ] {
+            let mut context = Sha256Context::new();
+            context.update_zeros(size);
+            assert_eq!(context.finalize().to_string(), expected, "{}", size);
+        }
+        let piece = Sha256Context::ZEROS.len();
+        // 64 bytes are a block of SHA-256.
+        let sizes = [
+            0,
+            1,
+            63,
+            64,
+            65,
+            piece - 1,
+            piece,
+            piece + 1,
+            2 * piece - 1,
+            2 * piece,
+            2 * piece + 1,
+            5 * piece + 7,
+        ];
+        for size in sizes {
+            let zeros = vec![0u8; size];
+            assert_eq!(in_pieces(&zeros, &[(size, true)]), Sha256::digest(&zeros), "{}", size);
+            // Between other data, which leaves a part of a block for the
+            // run to go on in.
+            let data = [&b"before"[..], &zeros, b"after"].concat();
+            assert_eq!(
+                in_pieces(&data, &[(6, false), (size, true), (5, false)]),
+                Sha256::digest(&data),
+                "{}",
+                size
+            );
+            // In two runs, in a run and as data, and as data and in a run.
+            let half = size / 2;
+            for (first, second) in [(true, true), (true, false), (false, true)] {
+                assert_eq!(
+                    in_pieces(&zeros, &[(half, first), (size - half, second)]),
+                    Sha256::digest(&zeros),
+                    "{}",
+                    size
+                );
+            }
+        }
+        // A run of no bytes takes nothing.
+        let mut context = Sha256Context::new();
+        context.update(b"hello");
+        context.update_zeros(0);
+        assert_eq!(context.finalize(), Sha256::digest(b"hello"));
     }
 
     #[test]

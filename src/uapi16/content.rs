@@ -409,7 +409,29 @@ impl<'a> DataCheck<'a> {
     /// them, when they would make the data larger than the size the object
     /// gives.
     pub fn update(&mut self, data: &[u8]) -> Result<(), Error> {
-        let added = data.len() as u64;
+        self.count(data.len() as u64)?;
+        if let Some(context) = &mut self.context {
+            context.update(data);
+        }
+        Ok(())
+    }
+
+    /// Takes `size` zero bytes as the next bytes of the data, such as a
+    /// hole of a sparse file that the caller did not read. Fails, and takes
+    /// none of them, when they would make the data larger than the size the
+    /// object gives.
+    pub fn update_zeros(&mut self, size: u64) -> Result<(), Error> {
+        self.count(size)?;
+        if let Some(context) = &mut self.context {
+            context.update_zeros(size);
+        }
+        Ok(())
+    }
+
+    /// Counts `added` more bytes of the data. Fails, and counts none of
+    /// them, when they would make the data larger than the size the object
+    /// gives.
+    fn count(&mut self, added: u64) -> Result<(), Error> {
         if let Some(size) = self.size.filter(|&size| added > size.saturating_sub(self.len)) {
             let message = format!(
                 "'{}' has more than the {} bytes the manifest says",
@@ -419,9 +441,6 @@ impl<'a> DataCheck<'a> {
             return Err(Error::new(ErrorKind::Data(DataProblem::SizeMismatch), message)
                 .named(self.name.as_str())
                 .sizes(None, Some(size)));
-        }
-        if let Some(context) = &mut self.context {
-            context.update(data);
         }
         self.len = self.len.saturating_add(added);
         Ok(())
@@ -2592,6 +2611,131 @@ mod tests {
             assert_eq!((e.found_size(), e.expected_size()), (None, Some(5)));
             assert!(out.is_empty());
         }
+    }
+
+    /// A run of zero bytes passes a check as the same bytes do that are
+    /// handed to it as data: they are counted and hashed. A run that would
+    /// make the data larger than the object says is refused, and none of
+    /// it is taken.
+    #[test]
+    fn checks_runs_of_zeros() {
+        // A sparse file: a hole, data, and a hole at its end.
+        let data = [&[0u8; 5000][..], b"hello", &[0; 3]].concat();
+        let size = data.len() as u64;
+        let o = object(&format!(
+            r#"{{"name":"x","size":{},"sha256":"{}"}}"#,
+            size,
+            Sha256::digest(&data)
+        ));
+        let mut check = DataCheck::new(&o);
+        check.update(&data).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        check.update_zeros(0).unwrap();
+        check.update_zeros(3).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // A hole in two runs, and holes of which a part is read as data.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(1).unwrap();
+        check.update_zeros(4096).unwrap();
+        check.update(&[0; 903]).unwrap();
+        check.update(b"hello\0").unwrap();
+        check.update_zeros(2).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // Zero bytes where the data has others, and too few of them.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(size).unwrap();
+        let e = check.finish().unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::HashMismatch),
+                Some("x"),
+                None,
+                None,
+                "'x' does not match the hash in the manifest".to_string()
+            )
+        );
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        check.update_zeros(2).unwrap();
+        let e = check.finish().unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::SizeMismatch),
+                Some("x"),
+                Some(5007),
+                Some(5008),
+                "'x' is 5007 bytes, the manifest says 5008".to_string()
+            )
+        );
+        // Too many of them, after data and as the first bytes.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        let e = check.update_zeros(4).unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::SizeMismatch),
+                Some("x"),
+                None,
+                Some(5008),
+                "'x' has more than the 5008 bytes the manifest says".to_string()
+            )
+        );
+        // What it refused it did not take.
+        check.update_zeros(3).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        let mut check = DataCheck::new(&o);
+        let e = check.update_zeros(size + 1).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Data(DataProblem::SizeMismatch));
+        check.update(&data).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // An object of the size 0 takes a run of no bytes and no other.
+        let o = object(r#"{"name":"x","size":0}"#);
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(0).unwrap();
+        let e = check.update_zeros(1).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.found_size(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), None, Some(0))
+        );
+        assert_eq!(check.finish().unwrap(), 0);
+        /// A hole of 1 TiB, which no test could hash.
+        const HOLE: u64 = 1 << 40;
+        // Without a hash the zero bytes are counted and not hashed, so a
+        // run of any size takes no time. The size holds for it too.
+        let o = object(&format!(r#"{{"name":"x","size":{}}}"#, HOLE + 5));
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(HOLE).unwrap();
+        let e = check.update_zeros(u64::MAX).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.found_size(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), None, Some(HOLE + 5))
+        );
+        assert_eq!(
+            check.update_zeros(6).unwrap_err().kind(),
+            ErrorKind::Data(DataProblem::SizeMismatch)
+        );
+        check.update(b"hello").unwrap();
+        assert_eq!(check.finish().unwrap(), HOLE + 5);
+        // Without a size and a hash it counts.
+        let o = object(r#"{"name":"x","contents":[{"url":"https://example.com/x"}]}"#);
+        let mut check = DataCheck::new(&o);
+        check.update(b"any").unwrap();
+        check.update_zeros(HOLE).unwrap();
+        check.update_zeros(2).unwrap();
+        assert_eq!(check.finish().unwrap(), HOLE + 5);
+        // More zero bytes than a number counts are the largest number.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(u64::MAX).unwrap();
+        check.update_zeros(u64::MAX).unwrap();
+        assert_eq!(check.finish().unwrap(), u64::MAX);
     }
 
     /// Takes a few bytes and then fails.
