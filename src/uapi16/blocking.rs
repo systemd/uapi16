@@ -6,8 +6,10 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::iter::FusedIterator;
 
+use rustix::io::Errno;
+
 use crate::decode::ROOT_RECORD;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::object::{FileObject, RootObject, SignatureObject};
 use crate::reader::{Decoder, Object, Step};
 use crate::writer::Encoder;
@@ -192,6 +194,41 @@ impl<R: Read> Iterator for Reader<R> {
 
 impl<R: Read> FusedIterator for Reader<R> {}
 
+/// A write of a [`Writer`] that failed: the number of its record and what
+/// its error said.
+#[derive(Debug)]
+struct FailedWrite {
+    record_number: u64,
+    said: String,
+}
+
+impl FailedWrite {
+    /// The errno of the error that every call after the write fails with.
+    const ERRNO: Errno = Errno::STALE;
+
+    /// The write of the record with the number `record_number`, which
+    /// failed with `error`.
+    fn new(record_number: u64, error: &io::Error) -> FailedWrite {
+        FailedWrite {
+            record_number,
+            said: error.to_string(),
+        }
+    }
+
+    /// The error of a call that comes after the write: an I/O error of
+    /// [`FailedWrite::ERRNO`] about the record of the write, which says
+    /// what the write failed with.
+    fn error(&self) -> Error {
+        let message = format!(
+            "the write of record {} failed earlier: {}",
+            self.record_number, self.said
+        );
+        Error::new(ErrorKind::Io, message)
+            .caused_by(io::Error::from(FailedWrite::ERRNO))
+            .in_record(self.record_number)
+    }
+}
+
 /// Writes a manifest record by record.
 ///
 /// [`Writer::begin`] writes the root file object, [`Writer::file`] the
@@ -222,7 +259,8 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// [`MAX_RECORD_SIZE`], its record separator included, and no file object
 /// has more than [`MAX_CONTENTS`] contents objects. An object the writer
 /// refuses is not written, and the writer goes on as if it had not been
-/// given it.
+/// given it. A write that fails ends the writer: every later call fails
+/// with an [`ErrorKind::Io`] error that names the write that failed.
 ///
 /// The writer leaves out what the manifest says without it: where the
 /// manifest records them, a flag that is cleared, `readOnly` of false,
@@ -296,13 +334,19 @@ impl<R: Read> FusedIterator for Reader<R> {}
 pub struct Writer<W> {
     out: W,
     encoder: Encoder,
+    /// The write that failed, which ended the writer.
+    failed: Option<FailedWrite>,
 }
 
 impl<W: Write> Writer<W> {
     /// Starts a manifest in `out` with the root file object `root`.
     pub fn begin(out: W, root: &RootObject) -> Result<Writer<W>, Error> {
         let encoder = Encoder::start(root)?;
-        let mut writer = Writer { out, encoder };
+        let mut writer = Writer {
+            out,
+            encoder,
+            failed: None,
+        };
         writer.write_out(ROOT_RECORD)?;
         Ok(writer)
     }
@@ -344,32 +388,43 @@ impl<W: Write> Writer<W> {
     }
 
     /// Writes out the record that `encode` has the encoder put together.
+    /// After a write that failed the encoder is given nothing more.
     fn send_record(&mut self, encode: impl FnOnce(&mut Encoder) -> Result<(), Error>) -> Result<(), Error> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.error());
+        }
         let record_number = self.encoder.next_record;
         encode(&mut self.encoder)?;
         self.write_out(record_number)
     }
 
     /// Writes out the record the encoder put together, the one with the
-    /// number `record_number`, in one write.
+    /// number `record_number`, in one write. A write that fails is the last
+    /// one: the encoder has taken the record by then, and a part of it may
+    /// be written.
     fn write_out(&mut self, record_number: u64) -> Result<(), Error> {
         let written = self.out.write_all(&self.encoder.record);
         self.encoder.clear_record();
-        written.map_err(|e| Error::from(e).in_record(record_number))
+        written.map_err(|e| {
+            self.failed = Some(FailedWrite::new(record_number, &e));
+            Error::from(e).in_record(record_number)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{ErrorKind, Problem};
+    use crate::error::Problem;
     use crate::testing::{
         directory, everything, manifest, name, read_whole, read_whole_from, record, recording_all, sequence,
         write_whole, Whole, EMPTY, PIECES, ROOT, SIGNATURE, TRAILER,
     };
     use crate::writer::RECORD_CAPACITY;
     use crate::{InodeType, Name, Sha256, MAX_RECORD_SIZE, RECORD_SEPARATOR};
+    use rustix::pipe::PipeFlags;
     use std::collections::BTreeMap;
+    use std::fs::File;
 
     #[test]
     fn the_reader_as_an_iterator() {
@@ -760,5 +815,203 @@ mod tests {
             assert_eq!((e.kind(), e.record_number()), (ErrorKind::Io, Some(record_number)));
             assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOSPC));
         }
+    }
+
+    /// What the tests compare of an error of a writer: its kind, the errno
+    /// of its I/O error, the number of its record and what it says.
+    fn facts(e: &Error) -> (ErrorKind, Option<i32>, Option<u64>, String) {
+        (
+            e.kind(),
+            e.io_error().and_then(io::Error::raw_os_error),
+            e.record_number(),
+            e.to_string(),
+        )
+    }
+
+    /// Makes every later call on `writer`, whose write of the record
+    /// `record_number` failed with `first`: file() with `again`,
+    /// signature() and finish(). Each fails with an I/O error of ESTALE
+    /// about that record, which says what the write failed with.
+    fn later_calls_fail<W: Write>(mut writer: Writer<W>, again: &FileObject, record_number: u64, first: &io::Error) {
+        let ended = (
+            ErrorKind::Io,
+            Some(libc::ESTALE),
+            Some(record_number),
+            format!("the write of record {} failed earlier: {}", record_number, first),
+        );
+        assert_eq!(facts(&writer.file(again).unwrap_err()), ended);
+        assert_eq!(
+            facts(&writer.signature(&SignatureObject::new("pkcs7")).unwrap_err()),
+            ended
+        );
+        assert_eq!(facts(&writer.finish().map(drop).unwrap_err()), ended);
+    }
+
+    /// A pipe that does not block: a write to it fails with EAGAIN while it
+    /// is full, and a read from it while it is empty.
+    #[derive(Debug)]
+    struct Pipe {
+        /// The end that is read from.
+        read_end: File,
+        /// What was read from it so far.
+        read: Vec<u8>,
+    }
+
+    impl Pipe {
+        /// How both ends are made: no read or write waits.
+        const FLAGS: PipeFlags = PipeFlags::NONBLOCK.union(PipeFlags::CLOEXEC);
+        /// More bytes than the pipe takes, which has room for 16 pages at
+        /// most.
+        const MORE_THAN_FITS: usize = MAX_RECORD_SIZE / 2;
+
+        /// A pipe without a name, and the end of it that is written to.
+        fn new() -> (Pipe, File) {
+            let (read_end, write_end) = rustix::pipe::pipe_with(Pipe::FLAGS).unwrap();
+            let pipe = Pipe {
+                read_end: File::from(read_end),
+                read: Vec::new(),
+            };
+            (pipe, File::from(write_end))
+        }
+
+        /// Reads the pipe empty, and says how many bytes that were.
+        fn drain(&mut self) -> usize {
+            let before = self.read.len();
+            match self.read_end.read_to_end(&mut self.read) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{}", e),
+            }
+            self.read.len() - before
+        }
+    }
+
+    /// A pipe that is full fails the write of a record with EAGAIN, and
+    /// takes nothing of a record of at most a page. The writer ends there.
+    /// Once the pipe is empty, the same object again fails for the write
+    /// that failed, and not as a duplicate of itself, and so do signature()
+    /// and finish(). What the pipe took has no trailer, so no reader takes
+    /// it for a manifest that lacks the object.
+    #[test]
+    fn a_full_pipe_ends_the_writer() {
+        let (mut pipe, write_end) = Pipe::new();
+        let mut writer = Writer::begin(write_end, &RootObject::default()).unwrap();
+        // File objects until the pipe is full. It takes each of their
+        // records whole or not at all.
+        let small = |number: u64| FileObject::new(name(&format!("{:08}", number)));
+        let (failed, e) = (1..=Pipe::MORE_THAN_FITS as u64)
+            .find_map(|number| writer.file(&small(number)).err().map(|e| (number, e)))
+            .unwrap();
+        let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        assert_eq!(
+            facts(&e),
+            (ErrorKind::Io, Some(libc::EAGAIN), Some(failed), eagain.to_string())
+        );
+        // The pipe is empty again, and has room for the record.
+        pipe.drain();
+        later_calls_fail(writer, &small(failed), failed, &eagain);
+        // None of them wrote anything. A reader finds every file object
+        // before the one that was not written, and no trailer.
+        assert_eq!(pipe.drain(), 0);
+        let mut reader = Reader::open(&pipe.read[..]).unwrap();
+        for number in 1..failed {
+            assert!(matches!(reader.next(), Some(Ok(Object::File(object))) if object.name == small(number).name));
+        }
+        let e = reader.next().unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::NoTrailer));
+    }
+
+    /// A record of more than a page that the pipe has no room for is cut
+    /// off: the pipe takes a part of it before the write fails. The writer
+    /// ends there as well, and nothing follows that part, where a trailer
+    /// would end a manifest with a broken record in it.
+    #[test]
+    fn a_record_cut_off_ends_the_writer() {
+        let (mut pipe, write_end) = Pipe::new();
+        let (root, root_text) = recording_all();
+        let mut large = FileObject::new(name("large"));
+        let pad = vec![b'x'; Pipe::MORE_THAN_FITS];
+        large.inode.user_xattrs = Some(Box::new(BTreeMap::from([("p".to_string(), pad)])));
+        let mut writer = Writer::begin(write_end, &root).unwrap();
+        let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        let e = writer.file(&large).unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (ErrorKind::Io, Some(libc::EAGAIN), Some(1), eagain.to_string())
+        );
+        // The pipe took the root file object and a part of the record.
+        pipe.drain();
+        let whole = sequence(&[root_text.as_str(), record(&large).as_str()]);
+        assert!(whole.starts_with(&pipe.read));
+        assert!(sequence(&[root_text.as_str()]).len() < pipe.read.len() && pipe.read.len() < whole.len());
+        later_calls_fail(writer, &large, 1, &eagain);
+        // None of them wrote anything. A reader finds the record that was
+        // cut off, and nothing behind it.
+        assert_eq!(pipe.drain(), 0);
+        let e = read_whole(&pipe.read).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.record_number()),
+            (ErrorKind::Manifest(Problem::NotJson), Some(1))
+        );
+    }
+
+    /// Takes `room` bytes and then says that no space is left, as a file
+    /// does on a file system that is full. /dev/full has no room at all:
+    /// the root file object is not written to it, so no writer begins
+    /// there.
+    #[derive(Debug)]
+    struct Full {
+        room: usize,
+        taken: Vec<u8>,
+    }
+
+    impl Write for Full {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let n = data.len().min(self.room);
+            if n == 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            self.room -= n;
+            self.taken.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// No space left ends the writer as a pipe that is full does, with a
+    /// part of the record written. Room that there is later changes
+    /// nothing.
+    #[test]
+    fn no_space_left_ends_the_writer() {
+        // Room for the root file object, for a file object and for half of
+        // the record of the next one.
+        let before = sequence(&[ROOT, r#"{"name":"a"}"#]);
+        let half = sequence(&[r#"{"name":"b"}"#]);
+        let half = &half[..half.len() / 2];
+        let mut full = Full {
+            room: before.len() + half.len(),
+            taken: Vec::new(),
+        };
+        let mut writer = Writer::begin(&mut full, &RootObject::default()).unwrap();
+        writer.file(&FileObject::new(name("a"))).unwrap();
+        let b = FileObject::new(name("b"));
+        let enospc = io::Error::from_raw_os_error(libc::ENOSPC);
+        let e = writer.file(&b).unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (ErrorKind::Io, Some(libc::ENOSPC), Some(2), enospc.to_string())
+        );
+        // There is room again, which the writer does not use.
+        writer.get_mut().room = MAX_RECORD_SIZE;
+        later_calls_fail(writer, &b, 2, &enospc);
+        assert_eq!(full.taken, [&before[..], half].concat());
+        let e = read_whole(&full.taken).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.record_number()),
+            (ErrorKind::Manifest(Problem::NotJson), Some(2))
+        );
     }
 }

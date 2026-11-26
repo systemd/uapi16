@@ -717,7 +717,10 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.0.kind, &self.0.cause) {
-            (ErrorKind::Io, Some(Cause::Io(e))) => e.fmt(f),
+            // An I/O error shows as its cause, but for one that says what
+            // it was about, such as one of a Writer after a write that
+            // failed.
+            (ErrorKind::Io, Some(Cause::Io(e))) if self.0.message.is_empty() => e.fmt(f),
             _ => f.write_str(&self.0.message),
         }
     }
