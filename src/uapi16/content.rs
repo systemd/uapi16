@@ -106,7 +106,7 @@ impl<'a> ExternalFile<'a> {
     /// as long as the object says, whatever else the file holds. So the
     /// file has to be long enough for it, and as long as `originalSize`
     /// where the manifest gives that.
-    fn check_len(&self, object: &FileObject, len: u64) -> Result<u64, Error> {
+    pub(crate) fn check_len(&self, object: &FileObject, len: u64) -> Result<u64, Error> {
         let name = &object.name;
         let mismatch =
             |message: String| Error::new(ErrorKind::Data(DataProblem::SizeMismatch), message).named(name.as_str());
@@ -137,7 +137,7 @@ impl<'a> ExternalFile<'a> {
 
     /// The error for the file that the data of `object` cannot be taken
     /// from.
-    fn unavailable(&self, object: &FileObject, error: OpenError) -> Error {
+    pub(crate) fn unavailable(&self, object: &FileObject, error: OpenError) -> Error {
         let name = &object.name;
         let error = match error {
             OpenError::NotRegular => {
