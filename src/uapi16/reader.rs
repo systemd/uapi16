@@ -223,7 +223,7 @@ impl fmt::Debug for RecordSplitter {
 }
 
 /// An object of a manifest after its root file object, as a [`Reader`]
-/// and a [`Decoder`] hand it out.
+/// hands it out.
 ///
 /// [`Reader`]: crate::Reader
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,13 +251,9 @@ enum Stage {
 /// What a [`Decoder`] has for its caller next.
 ///
 /// [`Step::Input`] asks for more of the manifest, [`Step::End`] says that
-/// there is nothing more, and the other steps hand something out. A step
-/// the caller does not know needs nothing from it but another call to
-/// [`Decoder::process`], so the caller can pass over it. Steps that come in
-/// later releases only hand something out.
+/// there is nothing more, and the other steps hand something out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Step {
+pub(crate) enum Step {
     /// More of the manifest: [`Decoder::feed`] takes it, and
     /// [`Decoder::end_feed`] says that the input ended.
     Input,
@@ -292,39 +288,10 @@ pub enum Step {
 /// [`MAX_RECORD_SIZE`] and at most [`Name::MAX_LEN`](crate::Name::MAX_LEN)
 /// bytes, in whatever pieces the manifest comes.
 ///
-/// ```
-/// use uapi16::{Decoder, Object, Step};
-///
-/// let manifest = concat!(
-///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
-///     "\x1e{\"name\":\"a\",\"size\":3}\n",
-///     "\x1e{\"name\":\"b\",\"type\":\"dir\"}\n",
-///     "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
-/// );
-/// let mut input = manifest.as_bytes();
-/// let mut decoder = Decoder::new();
-/// let mut names = Vec::new();
-/// loop {
-///     match decoder.process()? {
-///         Step::Input if input.is_empty() => decoder.end_feed(),
-///         // The manifest comes in pieces of at most five bytes.
-///         Step::Input => {
-///             let taken = decoder.feed(&input[..input.len().min(5)]);
-///             input = &input[taken..];
-///         }
-///         Step::Object(Object::File(object)) => names.push(object.into_name()),
-///         Step::End => break,
-///         _ => {}
-///     }
-/// }
-/// assert_eq!(names, ["a", "b"]);
-/// # Ok::<(), uapi16::Error>(())
-/// ```
-///
 /// [`Read`]: std::io::Read
 /// [`Reader`]: crate::Reader
 #[derive(Debug)]
-pub struct Decoder {
+pub(crate) struct Decoder {
     splitter: RecordSplitter,
     /// The number of the record that is read next.
     next_record: u64,
@@ -335,15 +302,9 @@ pub struct Decoder {
     signed: Option<u64>,
 }
 
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
 impl Decoder {
     /// A decoder at the start of a manifest.
-    pub fn new() -> Decoder {
+    pub(crate) fn new() -> Decoder {
         Decoder {
             splitter: RecordSplitter::default(),
             next_record: ROOT_RECORD,
@@ -359,20 +320,20 @@ impl Decoder {
     /// call, after the next step.
     #[inline]
     #[must_use]
-    pub fn feed(&mut self, input: &[u8]) -> usize {
+    pub(crate) fn feed(&mut self, input: &[u8]) -> usize {
         self.splitter.feed(input)
     }
 
     /// Says that the input ended, after [`Step::Input`].
     #[inline]
-    pub fn end_feed(&mut self) {
+    pub(crate) fn end_feed(&mut self) {
         self.splitter.end_input();
     }
 
     /// What comes next. Once it returned an error, it returns
     /// [`Step::End`].
     #[inline]
-    pub fn process(&mut self) -> Result<Step, Error> {
+    pub(crate) fn process(&mut self) -> Result<Step, Error> {
         if !matches!(self.stage, Stage::Done) {
             // The next record goes on in input that was not fed yet, as it
             // does right after every object that was handed out.
@@ -395,7 +356,7 @@ impl Decoder {
     /// The number of the record the object handed out last came from. The
     /// record of the root file object is number 0. Records that are empty
     /// do not count.
-    pub fn record_number(&self) -> u64 {
+    pub(crate) fn record_number(&self) -> u64 {
         self.last_record
     }
 
@@ -403,13 +364,13 @@ impl Decoder {
     /// sign, see [`Reader::signed_len`].
     ///
     /// [`Reader::signed_len`]: crate::Reader::signed_len
-    pub fn signed_len(&self) -> Option<u64> {
+    pub(crate) fn signed_len(&self) -> Option<u64> {
         self.signed
     }
 
     /// An error `e` of the input the manifest is read from, as an error
     /// about the record the decoder reads.
-    pub fn input_error(&self, e: io::Error) -> Error {
+    pub(crate) fn input_error(&self, e: io::Error) -> Error {
         Error::from(e).in_record(self.next_record)
     }
 

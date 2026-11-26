@@ -43,11 +43,11 @@ enum Stage {
 /// Puts a manifest together record by record, and does no I/O.
 ///
 /// [`Encoder::begin`] appends the record of the root file object to a
-/// string, [`Encoder::file`] the record of a file object,
-/// [`Encoder::signature`] that of a signature object and
+/// string, [`Encoder::file`] the record of a file object and
 /// [`Encoder::finish`] that of the trailer object. Whoever calls them sends
 /// the records on, each one as it comes or many at once. A [`Writer`] is
-/// an encoder whose records go to a [`Write`] one at a time.
+/// an encoder whose records go to a [`Write`] one at a time, and writes
+/// signature objects as well.
 ///
 /// An encoder checks every object the way a [`Reader`](crate::Reader)
 /// does, see [`Writer`], and keeps the name of the last file object for
@@ -57,31 +57,10 @@ enum Stage {
 /// encoder goes on as if it had not been called. Nothing can follow the
 /// trailer object, so after [`Encoder::finish`] every method fails.
 ///
-/// ```
-/// use uapi16::{Encoder, FileObject, NameBuf, RootObject};
-///
-/// let mut text = String::new();
-/// let mut encoder = Encoder::begin(&RootObject::default(), &mut text)?;
-/// for name in ["a", "b"] {
-///     encoder.file(&FileObject::new(NameBuf::new(name)?), &mut text)?;
-/// }
-/// encoder.finish(&mut text)?;
-/// assert_eq!(
-///     text,
-///     concat!(
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
-///         "\x1e{\"name\":\"a\"}\n",
-///         "\x1e{\"name\":\"b\"}\n",
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
-///     )
-/// );
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-///
 /// [`Write`]: std::io::Write
 /// [`Writer`]: crate::Writer
 #[derive(Debug)]
-pub struct Encoder {
+pub(crate) struct Encoder {
     /// The number of the record that is appended next.
     pub(crate) next_record: u64,
     stage: Stage,
@@ -94,39 +73,42 @@ pub struct Encoder {
     pub(crate) record: Vec<u8>,
 }
 
+// Nothing but the tests appends records to a string until the listing of
+// the manifest builder does, so what does that is expected to be unused
+// until then.
+#[cfg_attr(not(test), expect(dead_code, reason = "the listing is the first user"))]
 impl Encoder {
     /// Starts a manifest with the root file object `root`: appends its
     /// record to `text`.
-    pub fn begin(root: &RootObject, text: &mut String) -> Result<Encoder, Error> {
+    pub(crate) fn begin(root: &RootObject, text: &mut String) -> Result<Encoder, Error> {
         let mut encoder = Encoder::start(root)?;
         encoder.append_to(text);
         Ok(encoder)
     }
 
     /// Appends the record of the file object `file` to `text`.
-    pub fn file(&mut self, file: &FileObject, text: &mut String) -> Result<(), Error> {
+    pub(crate) fn file(&mut self, file: &FileObject, text: &mut String) -> Result<(), Error> {
         self.encode_file(file)?;
-        self.append_to(text);
-        Ok(())
-    }
-
-    /// Appends the record of the signature object `signature` to `text`.
-    /// No file object can follow it: it would be one the signature does
-    /// not cover.
-    pub fn signature(&mut self, signature: &SignatureObject, text: &mut String) -> Result<(), Error> {
-        self.encode_signature(signature)?;
         self.append_to(text);
         Ok(())
     }
 
     /// Ends the manifest: appends the record of the trailer object to
     /// `text`.
-    pub fn finish(&mut self, text: &mut String) -> Result<(), Error> {
+    pub(crate) fn finish(&mut self, text: &mut String) -> Result<(), Error> {
         self.encode_trailer()?;
         self.append_to(text);
         Ok(())
     }
 
+    /// Appends the record that was put together to `text`.
+    fn append_to(&mut self, text: &mut String) {
+        text.push_str(std::str::from_utf8(&self.record).expect("serde_json writes UTF-8"));
+        self.clear_record();
+    }
+}
+
+impl Encoder {
     /// An encoder that puts together the record of the root file object
     /// `root` first.
     pub(crate) fn start(root: &RootObject) -> Result<Encoder, Error> {
@@ -235,12 +217,6 @@ impl Encoder {
             return Err(Error::record_too_large());
         }
         Ok(())
-    }
-
-    /// Appends the record that was put together to `text`.
-    fn append_to(&mut self, text: &mut String) {
-        text.push_str(std::str::from_utf8(&self.record).expect("serde_json writes UTF-8"));
-        self.clear_record();
     }
 
     /// Forgets the record that was put together. A record larger than
@@ -2229,7 +2205,7 @@ mod tests {
         let whole = Whole {
             root: root.clone(),
             objects: vec![directory("a"), everything()],
-            signatures: vec![SignatureObject::new("pkcs7")],
+            signatures: Vec::new(),
         };
         let mut text = String::new();
         let mut encoder = Encoder::begin(&root, &mut text).unwrap();
@@ -2245,9 +2221,6 @@ mod tests {
             (ErrorKind::Manifest(Problem::DuplicateName), Some(3))
         );
         assert_eq!(text, appended);
-        for signature in &whole.signatures {
-            encoder.signature(signature, &mut text).unwrap();
-        }
         encoder.finish(&mut text).unwrap();
         assert_eq!(text.as_bytes(), write_whole(&whole).unwrap());
         // Nothing follows the trailer.
@@ -2257,14 +2230,11 @@ mod tests {
             encoder
                 .file(&FileObject::new(NameBuf::default()), &mut text)
                 .unwrap_err(),
-            encoder
-                .signature(&SignatureObject::new("pkcs7"), &mut text)
-                .unwrap_err(),
             encoder.finish(&mut text).unwrap_err(),
         ] {
             assert_eq!(
                 (e.kind(), e.record_number()),
-                (ErrorKind::Manifest(Problem::DataAfterTrailer), Some(5))
+                (ErrorKind::Manifest(Problem::DataAfterTrailer), Some(4))
             );
         }
         assert_eq!(text.len(), appended);

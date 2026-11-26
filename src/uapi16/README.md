@@ -13,7 +13,6 @@ uapi16 can:
 - read a manifest and check every object against the rules of the
   specification,
 - write a manifest and check it the same way,
-- do both without doing any I/O itself, for example in an async runtime,
 - copy the data of the files a manifest describes and check its size and
   hash.
 

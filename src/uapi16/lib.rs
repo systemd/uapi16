@@ -14,11 +14,11 @@
 //!   where it comes: right after the object of its directory, in the order
 //!   the manifest declares, and with the fields of the [`Features`] the
 //!   manifest records.
-//! - [`Decoder`] does the same with the bytes it is fed, and does no I/O.
 //! - [`Writer`] writes a manifest record by record to a [`Write`], and
-//!   checks it the way the reader does. [`Encoder`] does the same into a
-//!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
-//!   while it is read, and [`Sha256Context::finalize`] returns it.
+//!   checks it the way the reader does. [`Sha256Context`] computes the
+//!   hash of data the caller passes it, such as a file while the caller
+//!   copies it, and does no I/O of its own. [`Sha256Context::finalize`]
+//!   returns the hash.
 //! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
 //!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
 //!   [`Mode`], [`Sha256`] and [`Uuid`] what their fields hold. Each field
@@ -35,24 +35,6 @@
 //!   next to the manifest, in a [`PinnedDirectory`].
 //!   [`FileObject::copy_data`] copies the data of a file and checks it
 //!   against the manifest with a [`DataCheck`].
-//!
-//! A manifest that does not come through a [`Read`], such as one from an
-//! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::process`]
-//! says what comes next. When it asks for more of the manifest with
-//! [`Step::Input`], [`Decoder::feed`] takes the bytes that came, up to the
-//! end of the record it reads, and returns how many it took. The others go
-//! in with a later call. [`Decoder::end_feed`] says that there are no more.
-//! The other steps hand out the root file object, the objects after it, and
-//! the end of the manifest. A record ends where the next one starts, so an
-//! object comes once the separator of the record after it was fed, or the
-//! input ended, and the end of the manifest once the input ended. A step
-//! reads a whole record, of up to [`MAX_RECORD_SIZE`] bytes with its record
-//! separator, at once.
-//!
-//! A manifest that does not go to a [`Write`] is put together by an
-//! [`Encoder`]: [`Encoder::begin`], [`Encoder::file`],
-//! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
-//! string, and the caller sends them on.
 //!
 //! Data that does not go through a [`Write`] is checked with a
 //! [`DataCheck`]: [`DataCheck::update`] takes it as it comes, and
@@ -135,8 +117,7 @@ pub use object::{
     InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject, SignatureObject, UnknownInodeType, Uuid,
     Validity, ValidityWindow,
 };
-pub use reader::{Decoder, Object, Step};
-pub use writer::Encoder;
+pub use reader::Object;
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";

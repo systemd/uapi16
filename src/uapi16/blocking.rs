@@ -241,9 +241,8 @@ impl FailedWrite {
 /// separator, the object with its keys sorted and without whitespace, and
 /// a newline, the way `systemd-manifest` writes it. A field that says
 /// nothing is left out. So is the inode type where the specification
-/// implies it, on the root file object and on regular files. An
-/// [`Encoder`] puts each record together, and it goes out in one write, so
-/// a file wants a `BufWriter` around it.
+/// implies it, on the root file object and on regular files. Each
+/// record goes out in one write, so a file wants a `BufWriter` around it.
 ///
 /// The root file object says what the manifest records in `features` and
 /// which order it lists its file objects in in `order`. The writer checks
