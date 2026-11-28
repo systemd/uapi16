@@ -14,11 +14,15 @@
 //!   where it comes: right after the object of its directory, in the order
 //!   the manifest declares, and with the fields of the [`Features`] the
 //!   manifest records.
-//! - [`Decoder`] does the same with the bytes it is fed, and does no I/O.
 //! - [`Writer`] writes a manifest record by record to a [`Write`], and
-//!   checks it the way the reader does. [`Encoder`] does the same into a
-//!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
-//!   while it is read, and [`Sha256Context::finalize`] returns it.
+//!   checks it the way the reader does. [`Sha256Context`] computes the
+//!   hash of data the caller passes it, such as a file while the caller
+//!   copies it, and does no I/O of its own. [`Sha256Context::finalize`]
+//!   returns the hash.
+//! - [`ManifestOptions`] builds the manifest of a tree of files on the
+//!   host, which it reads through descriptors, and [`ManifestWriter`] one
+//!   of file objects that the caller made. [`ManifestReport`] says what it
+//!   lists.
 //! - [`RootObject`], [`FileObject`], [`ContentsObject`] and
 //!   [`SignatureObject`] are the objects, and [`Name`], [`InodeType`],
 //!   [`Mode`], [`Sha256`] and [`Uuid`] what their fields hold. Each field
@@ -31,37 +35,45 @@
 //!   [`ValidityWindow`].
 //! - [`DataProvider`] is where the data of the files comes from when a
 //!   manifest is applied. [`StreamProvider`] takes it from one stream
-//!   that carries it all.
-#![cfg_attr(
-    target_os = "linux",
-    doc = "  On Linux, [`DirectoryProvider`] takes it from the files next to the",
-    doc = "  manifest, in a [`PinnedDirectory`]."
-)]
+//!   that carries it all. [`DirectoryProvider`] takes it from the files
+//!   next to the manifest, in a [`PinnedDirectory`].
 //!   [`FileObject::copy_data`] copies the data of a file and checks it
 //!   against the manifest with a [`DataCheck`].
-//!
-//! A manifest that does not come through a [`Read`], such as one from an
-//! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::process`]
-//! says what comes next. When it asks for more of the manifest with
-//! [`Step::Input`], [`Decoder::feed`] takes the bytes that came, up to the
-//! end of the record it reads, and returns how many it took. The others go
-//! in with a later call. [`Decoder::end_feed`] says that there are no more.
-//! The other steps hand out the root file object, the objects after it, and
-//! the end of the manifest. A record ends where the next one starts, so an
-//! object comes once the separator of the record after it was fed, or the
-//! input ended, and the end of the manifest once the input ended. A step
-//! reads a whole record, of up to [`MAX_RECORD_SIZE`] bytes with its record
-//! separator, at once.
-//!
-//! A manifest that does not go to a [`Write`] is put together by an
-//! [`Encoder`]: [`Encoder::begin`], [`Encoder::file`],
-//! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
-//! string, and the caller sends them on.
 //!
 //! Data that does not go through a [`Write`] is checked with a
 //! [`DataCheck`]: [`DataCheck::update`] takes it as it comes, and
 //! [`DataCheck::finish`] says whether it has the size and the hash the
 //! manifest gives.
+//!
+//! The manifest of a tree of files on the host is written by a
+//! [`ManifestWriter`]. [`ManifestOptions`] says what it records and makes
+//! the writer: [`ManifestOptions::create_at`] for a new file, and
+//! [`ManifestOptions::open`] for a [`Write`]. The writer takes the file
+//! objects of a caller in any order, with [`ManifestWriter::add_root`] and
+//! [`ManifestWriter::add_object`], and [`ManifestWriter::finish`] writes the
+//! manifest. [`ManifestOptions::generate_at`] does all of that for a
+//! directory and everything below it:
+//!
+//! ```no_run
+//! use std::fs::File;
+//! use std::path::Path;
+//! use uapi16::{AddFlags, Features, ManifestOptions};
+//!
+//! let esp = File::open("/efi")?;
+//! let out_dir = File::open("/var/lib/manifests")?;
+//! let report = ManifestOptions::new()
+//!     .features(Features::DEFAULT | Features::MTIME)
+//!     .generate_at(&out_dir, Path::new("esp.manifest"), &esp, AddFlags::NONE)?;
+//! println!("{} files, {} bytes", report.files(), report.bytes());
+//! # Ok::<(), uapi16::Error>(())
+//! ```
+//!
+//! The new file appears once the manifest is complete.
+//!
+//! The feature `capi` adds the C API of the crate, which uapi16.h
+//! declares. build.sh and install.sh, which come with the crate, build it
+//! as the C library libuapi16 and install it, see the README. The feature
+//! adds nothing to the Rust API.
 //!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
@@ -69,6 +81,8 @@
 //! than [`MAX_RECORD_SIZE`] and at most [`Name::MAX_LEN`] bytes. Nothing
 //! grows with the manifest. Writing one keeps the record it puts together,
 //! its separator included, and the name of the file object before it.
+//! Building a large manifest takes room on disk instead of memory, see
+//! [`ManifestOptions::create_at`] and [`ManifestOptions::open`].
 //!
 //! Two checks are up to the caller: whether a manifest declares the order
 //! of its file objects, [`RootObject::require_order`], and whether an
@@ -107,44 +121,66 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-compile_error!("uapi16 supports Linux and Android only");
+#[cfg(not(target_os = "linux"))]
+compile_error!("uapi16 supports Linux only");
 
 mod base64;
 mod blocking;
+// The C API, which is unsafe code as well: C hands over pointers that nothing
+// checks. The module says what it relies on.
+#[cfg(feature = "capi")]
+#[allow(unsafe_code)]
+mod capi;
 mod content;
 mod decode;
 mod digest;
-#[cfg(target_os = "linux")]
 mod directory;
 mod error;
 mod features;
+mod hardlink;
 mod hex;
+// The ioctls rustix has no call for and the lookups in the user database
+// are the only unsafe code of the crate without the C API, but for the one
+// cast of the module name. Each is in a module of its own, which says what
+// it makes sure of. Only the module sys calls them.
+#[allow(unsafe_code)]
+mod ioctl;
+mod listing;
+mod manifest;
 mod metadata;
 mod name;
+#[allow(unsafe_code)]
+mod nss;
 mod object;
+mod optional;
 mod reader;
+mod record;
+mod scratch;
 mod sequence;
+mod sort;
 mod strict;
+mod sys;
+mod tree;
+mod walk;
 mod writer;
 
 pub use blocking::{Reader, Writer};
-#[cfg(target_os = "linux")]
-pub use content::DirectoryProvider;
-pub use content::{DataCheck, DataLocation, DataProvider, ExternalFile, StreamProvider};
+pub use content::{DataCheck, DataLocation, DataProvider, DirectoryProvider, ExternalFile, StreamProvider};
 pub use digest::{InvalidDigest, Sha256, Sha256Context};
-#[cfg(target_os = "linux")]
 pub use directory::PinnedDirectory;
-pub use error::{DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedData, ValidityProblem};
+pub use error::{
+    DataProblem, Error, ErrorKind, Field, Problem, SourceProblem, TreeProblem, UnsupportedData, ValidityProblem,
+};
 pub use features::{Features, Order, UnknownFeature};
+pub use manifest::{ManifestOptions, ManifestReport, ManifestWriter};
 pub use name::{Name, NameBuf, NameError, NameProblem};
 pub use object::{
     ContentsObject, ContentsSource, FatSerial, FileObject, FileSystemIdentity, FilledIn, GptPartition, InodeAttributes,
     InodeType, InvalidFatSerial, InvalidMode, InvalidUuid, Mode, RootObject, SignatureObject, UnknownInodeType, Uuid,
     Validity, ValidityWindow,
 };
-pub use reader::{Decoder, Object, Step};
-pub use writer::Encoder;
+pub use reader::Object;
+pub use walk::AddFlags;
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";
@@ -187,17 +223,43 @@ pub(crate) mod testing {
         Reader, RootObject, Sha256, SignatureObject, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
     use crate::strict::{ParseError, Skip, Strict};
+    use crate::tree::{InodeId, Status};
+    use rustix::fs::OFlags;
     use serde_core::de::DeserializeSeed;
     use std::collections::BTreeMap;
     use std::fs;
     use std::num::NonZeroU64;
-    use std::path::PathBuf;
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Whether the kernel has O_EMPTYPATH, asked of the kernel itself. What
+    /// the process found out about it is no answer while tests run: those
+    /// that open a file both ways set it for a while.
+    pub(crate) fn has_empty_path() -> bool {
+        use rustix::fs::{Mode, OFlags};
+        let handle = rustix::fs::open(".", OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::from_bits_retain(crate::sys::EmptyPath::FLAG);
+        match rustix::fs::openat(&handle, "", flags, Mode::empty()) {
+            Ok(_) => true,
+            Err(rustix::io::Errno::NOENT) => false,
+            Err(e) => panic!("{}", e),
+        }
+    }
 
     /// A directory of its own below the temporary directory, removed with
     /// everything in it when the test ends.
     pub(crate) struct TempDir(pub(crate) PathBuf);
 
+    /// The unit `st_blocks` counts the room of a file in, in bytes.
+    pub(crate) const ST_BLOCKS_UNIT: u64 = 512;
+
     impl TempDir {
+        /// What the script of [`TempDir::rerun_on`] exits with where it
+        /// cannot mount the file system.
+        const NOT_MOUNTED: i32 = 77;
+
         pub(crate) fn new(name: &str) -> TempDir {
             let path = std::env::temp_dir().join(format!("uapi16-{}-{}", name, std::process::id()));
             // What a test of the same name in a process of the same number
@@ -206,11 +268,102 @@ pub(crate) mod testing {
             fs::create_dir(&path).unwrap();
             TempDir(path)
         }
+
+        /// Runs the test `test` of the test binary again in a process for
+        /// which a file system of the type `file_system` is mounted over
+        /// this directory, with the mount options `options` if there are
+        /// any, and with the directory as the value of the variable
+        /// `variable`.
+        ///
+        /// The mount takes a user and a mount namespace, which unshare(1)
+        /// makes. Where it cannot, or where the file system can't be
+        /// mounted in them, the test is skipped.
+        pub(crate) fn rerun_on(&self, file_system: &str, options: Option<&str>, test: &str, variable: &str) {
+            let works = Command::new("unshare").args(["-Urm", "true"]).output();
+            if !works.is_ok_and(|output| output.status.success()) {
+                eprintln!("skipping: unshare -Urm does not work here");
+                return;
+            }
+            // What is mounted has the name of its type, as for every file
+            // system without a device, and -o is there only with options.
+            let script = format!(
+                r#"mount -t "$1" ${{2:+-o "$2"}} "$1" "$3" || exit {}; exec "$4" --exact "$5" --nocapture"#,
+                TempDir::NOT_MOUNTED
+            );
+            let output = Command::new("unshare")
+                .args(["-Urm", "sh", "-c", &script, "sh", file_system])
+                .arg(options.unwrap_or_default())
+                .arg(&self.0)
+                .arg(std::env::current_exe().unwrap())
+                .arg(test)
+                .env(variable, &self.0)
+                .output()
+                .unwrap();
+            if output.status.code() == Some(TempDir::NOT_MOUNTED) {
+                eprintln!("skipping: no {} can be mounted here", file_system);
+                return;
+            }
+            // A test binary that runs no test succeeds as well.
+            let ran = String::from_utf8_lossy(&output.stdout).contains("1 passed");
+            assert!(output.status.success() && ran, "{:?}", output);
+        }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file this process has open: its status, as a walk finds it, with
+    /// the inode and the size the status has.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct OpenFile {
+        pub(crate) inode: InodeId,
+        pub(crate) size: u64,
+        pub(crate) status: Status,
+        /// The descriptor the process has of it.
+        pub(crate) descriptor: RawFd,
+    }
+
+    impl OpenFile {
+        /// The files this process has open that were made in the directory
+        /// `dir`, which are the scratch files made there where a test opens
+        /// nothing else in it. procfs says of every descriptor where its
+        /// file was made.
+        ///
+        /// Looking takes a handle of every file the process has open, for
+        /// a moment. So one test looks at a time: another one would take
+        /// such a handle for one more descriptor of a file of its own.
+        pub(crate) fn made_in(dir: &Path) -> Vec<OpenFile> {
+            static LOOKING: Mutex<()> = Mutex::new(());
+            let _looking = LOOKING.lock().unwrap_or_else(PoisonError::into_inner);
+            let dir = fs::canonicalize(dir).unwrap();
+            let flags = OFlags::PATH | OFlags::CLOEXEC;
+            let mut files = Vec::new();
+            for entry in fs::read_dir("/proc/self/fd").unwrap() {
+                let entry = entry.unwrap();
+                // Other tests close their descriptors meanwhile. A handle
+                // of the file stays the file it is while it is looked at.
+                let Ok(handle) = rustix::fs::open(entry.path(), flags, rustix::fs::Mode::empty()) else {
+                    continue;
+                };
+                // Another test can have a file open that is so deep in a
+                // tree that procfs cannot say where: that is none of these.
+                let Ok(made_at) = fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())) else {
+                    continue;
+                };
+                if made_at.parent() == Some(dir.as_path()) {
+                    let status = Status::of(handle.as_fd()).unwrap();
+                    files.push(OpenFile {
+                        inode: status.identity.inode_id(),
+                        size: status.size,
+                        status,
+                        descriptor: entry.file_name().to_str().unwrap().parse().unwrap(),
+                    });
+                }
+            }
+            files
         }
     }
 

@@ -93,11 +93,12 @@ enum SizeHashConflict {
 }
 
 /// The object a message is about: `manifest object 5`, and with its name
-/// `manifest object 5 (EFI/BOOT)`.
+/// `manifest object 5 (EFI/BOOT)`. A file object that is in no manifest
+/// yet is `file object (EFI/BOOT)`.
 #[derive(Clone, Copy)]
 pub(crate) struct Subject<'a> {
-    /// The number of the record the object is in.
-    record_number: u64,
+    /// The number of the record the object is in, if it is in one.
+    record_number: Option<u64>,
     name: Option<&'a str>,
 }
 
@@ -123,15 +124,32 @@ impl<'a> Subject<'a> {
     /// `record_number`.
     pub(crate) fn new(object: &'a FileObject, record_number: u64) -> Subject<'a> {
         Subject {
-            record_number,
+            record_number: Some(record_number),
             name: (!object.name.is_root()).then_some(object.name.as_str()),
+        }
+    }
+
+    /// The file object `object`, which is in no manifest yet.
+    pub(crate) fn unwritten(object: &'a FileObject) -> Subject<'a> {
+        Subject {
+            record_number: None,
+            name: (!object.name.is_root()).then_some(object.name.as_str()),
+        }
+    }
+
+    /// A file object of the record with the number `record_number` that
+    /// has no name, or whose name is not known yet.
+    pub(crate) fn unnamed(record_number: u64) -> Subject<'static> {
+        Subject {
+            record_number: Some(record_number),
+            name: None,
         }
     }
 
     /// The root file object, which the first record holds.
     pub(crate) fn root() -> Subject<'static> {
         Subject {
-            record_number: ROOT_RECORD,
+            record_number: Some(ROOT_RECORD),
             name: Some(ROOT_NAME),
         }
     }
@@ -139,7 +157,10 @@ impl<'a> Subject<'a> {
 
 impl fmt::Display for Subject<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "manifest object {}", self.record_number)?;
+        match self.record_number {
+            Some(record_number) => write!(f, "manifest object {}", record_number)?,
+            None => f.write_str("file object")?,
+        }
         match self.name {
             Some(name) => write!(f, " ({})", name.escape_debug()),
             None => Ok(()),
@@ -373,7 +394,7 @@ impl Draft {
     /// follows from them.
     fn finish(&mut self, record_number: u64) -> Result<(), Error> {
         let Some(name) = self.name.take() else {
-            return Err(Error::no_name(record_number));
+            return Err(Error::no_name(Subject::unnamed(record_number)).in_record(record_number));
         };
         let object = &mut *self.object;
         object.name = name;
@@ -700,11 +721,17 @@ impl FileObject {
         Ok(())
     }
 
+    /// Whether `id` is a user or a group ID a manifest can have: any but the
+    /// two that stand for no ID.
+    pub(crate) fn is_valid_id(id: u32) -> bool {
+        id != INVALID_ID && id != INVALID_ID_16
+    }
+
     /// The user or group ID `id`, the value of `field`, if it is one. The
     /// two IDs that stand for no ID are none.
     pub(crate) fn check_id(field: Field, id: u64, subject: Subject<'_>) -> Result<u32, Error> {
         match u32::try_from(id) {
-            Ok(id) if id != INVALID_ID && id != INVALID_ID_16 => Ok(id),
+            Ok(id) if FileObject::is_valid_id(id) => Ok(id),
             _ => Err(Error::manifest(
                 Problem::FieldOutOfRange,
                 format!("{}: {} {} is out of range", subject, field, id),
@@ -713,19 +740,24 @@ impl FileObject {
         }
     }
 
-    /// Checks `name`, the value of `field`, as the name of a user or of a
-    /// group. systemd's relaxed rules take anything that is not obviously
-    /// broken or a number in disguise.
-    pub(crate) fn check_owner_name(field: Field, name: &str, subject: Subject<'_>) -> Result<(), Error> {
+    /// Whether `name` can be the name of a user or of a group. systemd's
+    /// relaxed rules take anything that is not obviously broken or a number
+    /// in disguise.
+    pub(crate) fn is_owner_name(name: &str) -> bool {
         let digits = name.strip_prefix('-').unwrap_or(name);
-        if name.is_empty()
+        !(name.is_empty()
             || name.starts_with(' ')
             || name.ends_with(' ')
             || name == "."
             || name == ".."
             || name.chars().any(|c| c.is_ascii_control() || c == ':' || c == '/')
-            || digits.bytes().all(|b| b.is_ascii_digit())
-        {
+            || digits.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// Checks `name`, the value of `field`, as the name of a user or of a
+    /// group, see [`FileObject::is_owner_name`].
+    pub(crate) fn check_owner_name(field: Field, name: &str, subject: Subject<'_>) -> Result<(), Error> {
+        if !FileObject::is_owner_name(name) {
             return Err(Error::manifest(
                 Problem::WrongFieldType,
                 format!("{}: {} '{}' is not a valid name", subject, field, name.escape_debug()),
@@ -735,10 +767,16 @@ impl FileObject {
         Ok(())
     }
 
-    /// Checks `name` as the name of an extended attribute: it is not empty
-    /// and has no control character.
+    /// Whether `name` can be the name of an extended attribute: it is not
+    /// empty and has no control character.
+    pub(crate) fn is_xattr_name(name: &str) -> bool {
+        !name.is_empty() && !name.chars().any(|c| c.is_ascii_control())
+    }
+
+    /// Checks `name` as the name of an extended attribute, see
+    /// [`FileObject::is_xattr_name`].
     pub(crate) fn check_xattr_name(name: &str, subject: Subject<'_>) -> Result<(), Error> {
-        if name.is_empty() || name.chars().any(|c| c.is_ascii_control()) {
+        if !FileObject::is_xattr_name(name) {
             return Err(Error::manifest(
                 Problem::InvalidExtendedAttributes,
                 format!("{}: invalid extended attribute name '{}'", subject, name.escape_debug()),
@@ -1304,12 +1342,17 @@ impl<'a> RecordDecoder<'a> {
         })
     }
 
+    /// Notes the error `error` makes, unless an error was noted before.
+    fn note(&mut self, error: impl FnOnce() -> Error) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error());
+        }
+    }
+
     /// Notes the error `problem` in `field`, which `message` describes,
     /// unless an error was noted before.
     fn note_error(&mut self, problem: Problem, field: Field, message: impl FnOnce() -> String) {
-        if self.first_error.is_none() {
-            self.first_error = Some(Error::manifest(problem, message()).at(field));
-        }
+        self.note(|| Error::manifest(problem, message()).at(field));
     }
 
     /// The value `checked` holds, or None after noting its error, unless an
@@ -1328,10 +1371,7 @@ impl<'a> RecordDecoder<'a> {
         if self.record_number == ROOT_RECORD {
             return Subject::root();
         }
-        Subject {
-            record_number: self.record_number,
-            name: None,
-        }
+        Subject::unnamed(self.record_number)
     }
 
     /// What the part made of `value`, which is none for null. A value of
@@ -1492,8 +1532,9 @@ impl<'a> RecordDecoder<'a> {
                         Ok(name) => draft.name = Some(name.to_owned()),
                         Err(reason) => {
                             let subject = self.subject();
-                            self.note_error(Problem::InvalidName, field, || {
-                                format!("{}: {}: '{}'", subject, reason, name.escape_debug())
+                            self.note(|| {
+                                let message = format!("{}: {}: '{}'", subject, reason, name.escape_debug());
+                                Error::manifest(Problem::InvalidName, message).at(field).because(reason)
                             });
                             draft.invalid_name = Some(name.into_owned());
                         }
@@ -2077,6 +2118,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::testing::{read_whole, sequence, EMPTY, HELLO, MAX_NESTING, ROOT, SIGNATURE, TRAILER, WORLD};
+    use crate::NameProblem;
 
     /// The file object of `record`, the record after the root file object.
     fn object(record: &str) -> FileObject {
@@ -2439,6 +2481,7 @@ mod tests {
         assert_eq!(object(&format!(r#"{{"name":"{}"}}"#, name)).name, name.as_str());
         let e = refused(&format!(r#"{{"name":"{}x"}}"#, name));
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(e.name_problem(), Some(NameProblem::TooLong));
         assert_eq!(
             e.to_string(),
             format!("manifest object 1: name is longer than 4095 bytes: '{}x'", name)
@@ -2448,10 +2491,27 @@ mod tests {
         // of place.
         let e = refused(r#"{"name":"Uapi16Manifest/x"}"#);
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidName));
+        assert_eq!(e.name_problem(), Some(NameProblem::Reserved));
         assert_eq!(
             e.to_string(),
             "manifest object 1: name is reserved for the manifest: 'Uapi16Manifest/x'"
         );
+        // A contents object that refers to its file by what is not a name
+        // says why it is not one.
+        for (file, reason) in [
+            ("../x", NameProblem::ContainsDotComponent),
+            ("a//b", NameProblem::EmptyComponent),
+            ("Uapi16Manifest.sig", NameProblem::Reserved),
+        ] {
+            let e = refused(&format!(r#"{{"name":"x","contents":[{{"file":"{}"}}]}}"#, file));
+            assert_eq!(e.kind(), ErrorKind::Manifest(Problem::InvalidContents), "{}", file);
+            assert_eq!(
+                (e.field(), e.name_problem()),
+                (Some(Field::File), Some(reason)),
+                "{}",
+                file
+            );
+        }
     }
 
     /// A `readOnly` the reader filled in is not one the object has: the
@@ -3612,6 +3672,17 @@ mod tests {
             assert_eq!(e.name(), name.as_str(), "{}", line);
             assert_eq!(e.field().map(Field::as_str), field.as_str(), "{}", line);
             assert_eq!(Some(e.to_string().as_str()), message.as_str(), "{}", line);
+            // An invalid name breaks the rule that Name::new() gives, and
+            // so does an invalid contents file reference. Nothing else is
+            // about a name.
+            if found == Problem::InvalidName {
+                assert_eq!(e.name_problem(), Name::new(e.name().unwrap()).err(), "{}", line);
+            } else {
+                let file_reference = found == Problem::InvalidContents && e.field() == Some(Field::File);
+                assert_eq!(e.name_problem().is_some(), file_reference, "{}", line);
+            }
+            let others = (e.hardlink_name(), e.raw_name(), e.feature());
+            assert_eq!(others, (None, None, None), "{}", line);
             problems.insert(found);
         }
         // Every problem a manifest can have is among them, but those of

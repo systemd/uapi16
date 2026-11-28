@@ -2,17 +2,13 @@
 //! The data of the files a manifest describes: where it is, and copying
 //! it from there with the sizes and hashes of the manifest checked.
 
-#[cfg(target_os = "linux")]
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Read, Write};
-#[cfg(target_os = "linux")]
-use std::io::{Seek, SeekFrom};
-#[cfg(target_os = "linux")]
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
 use crate::digest::Sha256Context;
-#[cfg(target_os = "linux")]
 use crate::directory::PinnedDirectory;
 use crate::error::{DataProblem, Error, ErrorKind, Field, SourceProblem, UnsupportedData};
 use crate::object::{ContentsObject, ContentsSource, FileObject, InodeType};
@@ -26,16 +22,13 @@ const COPY_SIZE: usize = 1024 * 1024;
 /// file takes besides, see [`PieceHashes::stored_bytes`]. The map that
 /// holds them adds up to about half a MiB, with many small files, which
 /// does not grow with the manifest either.
-#[cfg(target_os = "linux")]
 const PIECE_HASH_BYTES: usize = 1024 * 1024;
 /// What a file takes in [`PieceHashes`] besides the hashes of its pieces:
 /// its hash and its length, which it is known by, and the pointer to the
 /// hashes of its pieces.
-#[cfg(target_os = "linux")]
 const FILE_ENTRY_BYTES: usize = size_of::<(Sha256, u64)>() + size_of::<Box<[Sha256]>>();
 /// The most pieces a file is hashed in, so that the hashes of a file of
 /// any length fit into [`PIECE_HASH_BYTES`].
-#[cfg(target_os = "linux")]
 const MAX_PIECES: u64 = ((PIECE_HASH_BYTES - FILE_ENTRY_BYTES) / size_of::<Sha256>()) as u64;
 
 /// Where the data of a file object is, as [`FileObject::data_location`]
@@ -114,8 +107,7 @@ impl<'a> ExternalFile<'a> {
     /// as long as the object says, whatever else the file holds. So the
     /// file has to be long enough for it, and as long as `originalSize`
     /// where the manifest gives that.
-    #[cfg(target_os = "linux")]
-    fn check_len(&self, object: &FileObject, len: u64) -> Result<u64, Error> {
+    pub(crate) fn check_len(&self, object: &FileObject, len: u64) -> Result<u64, Error> {
         let name = &object.name;
         let mismatch =
             |message: String| Error::new(ErrorKind::Data(DataProblem::SizeMismatch), message).named(name.as_str());
@@ -146,8 +138,7 @@ impl<'a> ExternalFile<'a> {
 
     /// The error for the file that the data of `object` cannot be taken
     /// from.
-    #[cfg(target_os = "linux")]
-    fn unavailable(&self, object: &FileObject, error: OpenError) -> Error {
+    pub(crate) fn unavailable(&self, object: &FileObject, error: OpenError) -> Error {
         let name = &object.name;
         let error = match error {
             OpenError::NotRegular => {
@@ -366,8 +357,7 @@ impl ContentsObject {
 /// It checks what the object says of its data, the check the
 /// specification has for the data of every file. What its contents
 /// objects say of the files the data is in, their sizes and hashes, is
-/// for whoever reads those files to check.
-#[cfg_attr(target_os = "linux", doc = "A [`DirectoryProvider`] does.")]
+/// for whoever reads those files to check. A [`DirectoryProvider`] does.
 ///
 /// [`FileObject::copy_data`] checks what it copies with one. A caller
 /// that moves the data itself, such as a copy in an async runtime, hands
@@ -393,7 +383,7 @@ impl ContentsObject {
 #[derive(Debug)]
 pub struct DataCheck<'a> {
     /// The name of the object, which an error carries.
-    name: &'a Name,
+    name: Cow<'a, Name>,
     /// The size the object gives.
     size: Option<u64>,
     /// The hash the object gives.
@@ -408,7 +398,7 @@ impl<'a> DataCheck<'a> {
     /// A check of the data of `object`, of which nothing has passed yet.
     pub fn new(object: &'a FileObject) -> DataCheck<'a> {
         DataCheck {
-            name: &object.name,
+            name: Cow::Borrowed(&object.name),
             size: object.size,
             sha256: object.sha256,
             context: object.sha256.map(|_| Sha256Context::default()),
@@ -416,11 +406,47 @@ impl<'a> DataCheck<'a> {
         }
     }
 
+    /// The check with a name of its own instead of the one it borrows from
+    /// its object, with what passed so far. The C API keeps such a check:
+    /// its caller can change or free the object while the check is there.
+    #[cfg(feature = "capi")]
+    pub(crate) fn into_owned(self) -> DataCheck<'static> {
+        DataCheck {
+            name: Cow::Owned(self.name.into_owned()),
+            size: self.size,
+            sha256: self.sha256,
+            context: self.context,
+            len: self.len,
+        }
+    }
+
     /// Takes `data`, the next bytes of the data. Fails, and takes none of
     /// them, when they would make the data larger than the size the object
     /// gives.
     pub fn update(&mut self, data: &[u8]) -> Result<(), Error> {
-        let added = data.len() as u64;
+        self.count(data.len() as u64)?;
+        if let Some(context) = &mut self.context {
+            context.update(data);
+        }
+        Ok(())
+    }
+
+    /// Takes `size` zero bytes as the next bytes of the data, such as a
+    /// hole of a sparse file that the caller did not read. Fails, and takes
+    /// none of them, when they would make the data larger than the size the
+    /// object gives.
+    pub fn update_zeros(&mut self, size: u64) -> Result<(), Error> {
+        self.count(size)?;
+        if let Some(context) = &mut self.context {
+            context.update_zeros(size);
+        }
+        Ok(())
+    }
+
+    /// Counts `added` more bytes of the data. Fails, and counts none of
+    /// them, when they would make the data larger than the size the object
+    /// gives.
+    fn count(&mut self, added: u64) -> Result<(), Error> {
         if let Some(size) = self.size.filter(|&size| added > size.saturating_sub(self.len)) {
             let message = format!(
                 "'{}' has more than the {} bytes the manifest says",
@@ -430,9 +456,6 @@ impl<'a> DataCheck<'a> {
             return Err(Error::new(ErrorKind::Data(DataProblem::SizeMismatch), message)
                 .named(self.name.as_str())
                 .sizes(None, Some(size)));
-        }
-        if let Some(context) = &mut self.context {
-            context.update(data);
         }
         self.len = self.len.saturating_add(added);
         Ok(())
@@ -508,15 +531,11 @@ pub(crate) mod sealed {
 /// manifest.
 ///
 /// [`StreamProvider`] takes it from one stream that carries it all, in the
-/// order of the manifest.
-#[cfg_attr(
-    target_os = "linux",
-    doc = "[`DirectoryProvider`] takes it from the files next to the manifest."
-)]
-/// A consumer hands a provider every file object, in the order of the
-/// manifest: those whose data it takes to [`FileObject::copy_data`],
-/// which calls [`DataProvider::copy`], and the others to
-/// [`DataProvider::skip`]. After the last one it calls
+/// order of the manifest. [`DirectoryProvider`] takes it from the files
+/// next to the manifest. A consumer hands a provider every file object, in
+/// the order of the manifest: those whose data it takes to
+/// [`FileObject::copy_data`], which calls [`DataProvider::copy`], and the
+/// others to [`DataProvider::skip`]. After the last one it calls
 /// [`DataProvider::end`].
 ///
 /// The trait is sealed: the providers of this crate implement it, and it
@@ -544,7 +563,6 @@ pub trait DataProvider: sealed::Sealed {
 }
 
 /// Why a [`Directory`] does not hand out a file.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) enum OpenError {
     /// What the name names is not a regular file.
@@ -554,7 +572,6 @@ pub(crate) enum OpenError {
     Io(io::Error),
 }
 
-#[cfg(target_os = "linux")]
 impl From<io::Error> for OpenError {
     fn from(e: io::Error) -> OpenError {
         OpenError::Io(e)
@@ -572,7 +589,6 @@ impl From<io::Error> for OpenError {
 ///
 /// The trait is the crate's own: [`PinnedDirectory`] is the one directory
 /// a caller has, and the tests have one in memory.
-#[cfg(target_os = "linux")]
 pub(crate) trait Directory {
     /// A file of the directory, open for reading.
     type File: Read + Seek;
@@ -609,18 +625,13 @@ pub(crate) trait Directory {
 /// specification allows. So the memory the provider takes does not grow
 /// with the manifest, and while copies succeed, a file of more than one
 /// piece is read whole once at most for its parts.
-///
-/// It exists on Linux only, not on Android.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DirectoryProvider {
     inner: Provider<PinnedDirectory>,
 }
 
-#[cfg(target_os = "linux")]
 impl sealed::Sealed for DirectoryProvider {}
 
-#[cfg(target_os = "linux")]
 impl DirectoryProvider {
     /// A provider that takes the files from `directory`.
     pub fn new(directory: PinnedDirectory) -> DirectoryProvider {
@@ -630,7 +641,6 @@ impl DirectoryProvider {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl DataProvider for DirectoryProvider {
     fn copy(&mut self, object: &FileObject, file: &ExternalFile<'_>, sink: &mut dyn Write) -> Result<(), Error> {
         self.inner.copy(object, file, sink)
@@ -639,7 +649,6 @@ impl DataProvider for DirectoryProvider {
 
 /// What a [`DirectoryProvider`] is, over any [`Directory`], so that the
 /// tests can give it one in memory.
-#[cfg(target_os = "linux")]
 struct Provider<D> {
     directory: D,
     /// What a copy goes through, made when the first file is copied.
@@ -648,7 +657,6 @@ struct Provider<D> {
     hashes: PieceHashes,
 }
 
-#[cfg(target_os = "linux")]
 impl<D: Directory> Provider<D> {
     /// A provider that takes the files from `directory`.
     fn new(directory: D) -> Provider<D> {
@@ -660,7 +668,6 @@ impl<D: Directory> Provider<D> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl<D: fmt::Debug> fmt::Debug for Provider<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provider")
@@ -686,7 +693,6 @@ impl<D: fmt::Debug> fmt::Debug for Provider<D> {
 /// fit are not checked against the hash of the whole file, which the
 /// specification allows for a file that is taken only in part. A part that
 /// gives a hash of its own is checked against that one in any case.
-#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct PieceHashes {
     /// The hashes of the pieces of each file, by its hash and its length.
@@ -695,7 +701,6 @@ struct PieceHashes {
     bytes: usize,
 }
 
-#[cfg(target_os = "linux")]
 impl PieceHashes {
     /// The size of the pieces a file of the length `len` is hashed in:
     /// [`COPY_SIZE`], or more for a file that would have more than
@@ -745,7 +750,6 @@ impl PieceHashes {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl fmt::Debug for PieceHashes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PieceHashes")
@@ -756,8 +760,7 @@ impl fmt::Debug for PieceHashes {
 }
 
 /// Why a copy from a file or a stream did not go through. A copy from a
-/// stream fails the first two ways only, and the files of a directory are
-/// read on Linux only.
+/// stream fails the first two ways only.
 #[derive(Debug)]
 enum CopyFailure {
     /// Reading the file or the stream failed.
@@ -765,11 +768,9 @@ enum CopyFailure {
     /// The sink did not take what was read.
     WriteFailed(io::Error),
     /// The file does not have the hash it is checked against.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     HashMismatch,
     /// The file is not as long as it was when it was opened, or longer:
     /// it changed while it was read.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     SourceChanged,
 }
 
@@ -843,7 +844,6 @@ impl<R: Read + ?Sized> ReadSome for R {}
 
 /// A file a [`DirectoryProvider`] copies the data of an object from, in
 /// pieces where it checks them.
-#[cfg(target_os = "linux")]
 struct Pieces<'a, F> {
     file: F,
     /// What the file is read into: [`COPY_SIZE`] bytes.
@@ -858,7 +858,6 @@ struct Pieces<'a, F> {
     data: Range<u64>,
 }
 
-#[cfg(target_os = "linux")]
 impl<F: Read + Seek> Pieces<'_, F> {
     /// Copies the data without a look at the rest of the file. A file that
     /// ends before the data does changed since it was opened.
@@ -979,7 +978,6 @@ impl<F: Read + Seek> Pieces<'_, F> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl<D: Directory> Provider<D> {
     /// Copies the data of `object`, which is in `file`, to `sink`, see
     /// [`DataProvider::copy`].
@@ -1183,9 +1181,7 @@ impl<R: Read> DataProvider for StreamProvider<R> {
     }
 }
 
-// The tests build their directories in memory, and DirectoryProvider is
-// for Linux only.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Problem;
@@ -2630,6 +2626,151 @@ mod tests {
             assert_eq!((e.found_size(), e.expected_size()), (None, Some(5)));
             assert!(out.is_empty());
         }
+    }
+
+    /// A run of zero bytes passes a check as the same bytes do that are
+    /// handed to it as data: they are counted and hashed. A run that would
+    /// make the data larger than the object says is refused, and none of
+    /// it is taken.
+    #[test]
+    fn checks_runs_of_zeros() {
+        // A sparse file: a hole, data, and a hole at its end.
+        let data = [&[0u8; 5000][..], b"hello", &[0; 3]].concat();
+        let size = data.len() as u64;
+        let o = object(&format!(
+            r#"{{"name":"x","size":{},"sha256":"{}"}}"#,
+            size,
+            Sha256::digest(&data)
+        ));
+        let mut check = DataCheck::new(&o);
+        check.update(&data).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        check.update_zeros(0).unwrap();
+        check.update_zeros(3).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // A hole in two runs, and holes of which a part is read as data.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(1).unwrap();
+        check.update_zeros(4096).unwrap();
+        check.update(&[0; 903]).unwrap();
+        check.update(b"hello\0").unwrap();
+        check.update_zeros(2).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // Zero bytes where the data has others, and too few of them.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(size).unwrap();
+        let e = check.finish().unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::HashMismatch),
+                Some("x"),
+                None,
+                None,
+                "'x' does not match the hash in the manifest".to_string()
+            )
+        );
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        check.update_zeros(2).unwrap();
+        let e = check.finish().unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::SizeMismatch),
+                Some("x"),
+                Some(5007),
+                Some(5008),
+                "'x' is 5007 bytes, the manifest says 5008".to_string()
+            )
+        );
+        // Too many of them, after data and as the first bytes.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(5000).unwrap();
+        check.update(b"hello").unwrap();
+        let e = check.update_zeros(4).unwrap_err();
+        assert_eq!(
+            facts(&e),
+            (
+                ErrorKind::Data(DataProblem::SizeMismatch),
+                Some("x"),
+                None,
+                Some(5008),
+                "'x' has more than the 5008 bytes the manifest says".to_string()
+            )
+        );
+        // What it refused it did not take.
+        check.update_zeros(3).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        let mut check = DataCheck::new(&o);
+        let e = check.update_zeros(size + 1).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Data(DataProblem::SizeMismatch));
+        check.update(&data).unwrap();
+        assert_eq!(check.finish().unwrap(), size);
+        // An object of the size 0 takes a run of no bytes and no other.
+        let o = object(r#"{"name":"x","size":0}"#);
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(0).unwrap();
+        let e = check.update_zeros(1).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.found_size(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), None, Some(0))
+        );
+        assert_eq!(check.finish().unwrap(), 0);
+        /// A hole of 1 TiB, which no test could hash.
+        const HOLE: u64 = 1 << 40;
+        // Without a hash the zero bytes are counted and not hashed, so a
+        // run of any size takes no time. The size holds for it too.
+        let o = object(&format!(r#"{{"name":"x","size":{}}}"#, HOLE + 5));
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(HOLE).unwrap();
+        let e = check.update_zeros(u64::MAX).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.found_size(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), None, Some(HOLE + 5))
+        );
+        assert_eq!(
+            check.update_zeros(6).unwrap_err().kind(),
+            ErrorKind::Data(DataProblem::SizeMismatch)
+        );
+        check.update(b"hello").unwrap();
+        assert_eq!(check.finish().unwrap(), HOLE + 5);
+        // Without a size and a hash it counts.
+        let o = object(r#"{"name":"x","contents":[{"url":"https://example.com/x"}]}"#);
+        let mut check = DataCheck::new(&o);
+        check.update(b"any").unwrap();
+        check.update_zeros(HOLE).unwrap();
+        check.update_zeros(2).unwrap();
+        assert_eq!(check.finish().unwrap(), HOLE + 5);
+        // More zero bytes than a number counts are the largest number.
+        let mut check = DataCheck::new(&o);
+        check.update_zeros(u64::MAX).unwrap();
+        check.update_zeros(u64::MAX).unwrap();
+        assert_eq!(check.finish().unwrap(), u64::MAX);
+    }
+
+    /// A check that has the name of its object as its own goes on where it
+    /// was, without the object: with what passed so far, and with the name,
+    /// the size and the hash it holds the data against.
+    #[cfg(feature = "capi")]
+    #[test]
+    fn owned_checks_go_on() {
+        let o = object(&format!(r#"{{"name":"x","size":5,"sha256":"{}"}}"#, HELLO));
+        let mut borrowed = DataCheck::new(&o);
+        borrowed.update(b"hel").unwrap();
+        let mut check = borrowed.into_owned();
+        drop(o);
+        let e = check.update(b"lo!").unwrap_err();
+        assert_eq!(
+            (e.kind(), e.name(), e.expected_size()),
+            (ErrorKind::Data(DataProblem::SizeMismatch), Some("x"), Some(5))
+        );
+        check.update(b"lo").unwrap();
+        assert_eq!(check.finish().unwrap(), 5);
     }
 
     /// Takes a few bytes and then fails.

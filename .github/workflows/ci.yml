@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64,
-# the same with musl, the build and the tests on i686, the lints for
-# fourteen targets, the formatting, the documentation for Linux and
-# Android, the package cargo publish uploads, the dependency check and
-# the sign-offs.
+# the same with musl, the build and the tests on i686, the tests on FAT,
+# the lints for twelve targets, the formatting, the documentation, the C
+# library with its header and its tests, the package cargo publish
+# uploads, the dependency check and the sign-offs.
+#
+# The tests and the lints run without and with the feature capi, the C
+# API.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS,
 # clippy's -D warnings and RUSTDOCFLAGS.
@@ -58,11 +61,43 @@ jobs:
           host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
 
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
+
       - name: Build
         run: cargo build --locked --workspace --all-targets
 
       - name: Test
         run: cargo test --locked
+
+      - name: Test with the C API
+        run: cargo test --locked --features capi
 
   musl:
     name: Build and test (x86_64-unknown-linux-musl, rustc ${{ matrix.rust }})
@@ -90,6 +125,35 @@ jobs:
           t=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
 
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
+
       # rustc links a musl binary with the C library and the startup
       # files that come with the target, so no musl toolchain is needed.
       - name: Build
@@ -97,6 +161,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target "$TARGET"
+
+      - name: Test with the C API
+        run: cargo test --locked --target "$TARGET" --features capi
 
   i686:
     name: Build and test (i686-unknown-linux-gnu)
@@ -111,11 +178,15 @@ jobs:
 
       - name: Install dependencies
         # The tests run on the x86_64 kernel with the i386 libraries of
-        # the runner.
+        # the runner. Tests mount fuse-overlayfs in their namespaces, a
+        # FUSE file system that takes no privileges, for what the
+        # kernel's own don't do. It is the runner's own program here as
+        # well.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386-cross libc6-i386 lib32gcc-s1
+            gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386-cross libc6-i386 lib32gcc-s1 \
+            fuse-overlayfs
 
       - name: Install rustc
         run: |
@@ -129,11 +200,90 @@ jobs:
             echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings"
           } >> "$GITHUB_ENV"
 
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
+
       - name: Build
         run: cargo build --locked --target "$TARGET" --workspace --all-targets
 
       - name: Test
         run: cargo test --locked --target "$TARGET"
+
+      - name: Test with the C API
+        run: cargo test --locked --target "$TARGET" --features capi
+
+  fat:
+    name: Tests on FAT
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dosfstools
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Make a FAT file system
+        # One the user owns, with a regular file, a read-only one and a
+        # directory on it, which the tests of the DOS attributes look at.
+        run: |
+          fat=$RUNNER_TEMP/fat
+          truncate -s 1G "$fat.img"
+          /usr/sbin/mkfs.vfat -F 32 "$fat.img"
+          mkdir "$fat"
+          sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$fat.img" "$fat"
+          echo file > "$fat/file"
+          echo read-only > "$fat/read-only"
+          chmod a-w "$fat/read-only"
+          mkdir "$fat/dir"
+          echo "UAPI16_TEST_FAT_DIR=$fat" >> "$GITHUB_ENV"
+
+      - name: Test the DOS attributes and the volume serial number
+        run: cargo test --locked --lib -- --exact ioctl::tests::fat optional::tests::fat
+
+      - name: Sort on FAT
+        # The scratch file of a sort on a file system that has no O_TMPFILE
+        # and can't punch holes, in a directory of its own, which the tests
+        # of the DOS attributes don't look at.
+        run: |
+          mkdir "$UAPI16_TEST_FAT_DIR/tmp"
+          TMPDIR=$UAPI16_TEST_FAT_DIR/tmp cargo test --locked --lib -- --exact sort::tests::gives_room_back
+
+      - name: Build a manifest on FAT
+        # The manifest and its scratch files on FAT: the scratch files get
+        # names they lose right away, and the manifest gets its name with
+        # RENAME_NOREPLACE.
+        run: TMPDIR=$UAPI16_TEST_FAT_DIR/tmp cargo test --locked --lib -- --exact manifest::tests::on_fat
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})
@@ -157,8 +307,6 @@ jobs:
         s390x-unknown-linux-gnu
         sparc64-unknown-linux-gnu
         x86_64-unknown-linux-musl
-        aarch64-linux-android
-        armv7-linux-androideabi
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -180,10 +328,13 @@ jobs:
         run: |
           rc=0
           for t in $TARGETS; do
-            echo "::group::$t"
-            cargo clippy --locked --target "$t" --workspace --all-targets -- -D warnings ||
-              { echo "::error::clippy failed for $t"; rc=1; }
-            echo "::endgroup::"
+            for features in "" "--features capi"; do
+              echo "::group::$t $features"
+              # shellcheck disable=SC2086
+              cargo clippy --locked --target "$t" --workspace --all-targets $features -- -D warnings ||
+                { echo "::error::clippy $features failed for $t"; rc=1; }
+              echo "::endgroup::"
+            done
           done
           exit $rc
 
@@ -218,7 +369,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add aarch64-linux-android
           rustc --version
 
       - name: rustdoc
@@ -226,12 +376,154 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps
 
-      # What is there on Linux only is missing on Android, and no link may
-      # lead to it there. The documentation needs no NDK.
-      - name: rustdoc for Android
+  header:
+    name: uapi16.h
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      # The cbindgen that writes uapi16.h.
+      CBINDGEN: 0.29.4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Install cbindgen
+        run: cargo install --locked cbindgen --version "$CBINDGEN"
+
+      - name: Check that uapi16.h is what cbindgen writes
+        working-directory: src/uapi16
+        run: |
+          cbindgen --quiet --config cbindgen.toml --output "$RUNNER_TEMP/uapi16.h" capi.rs
+          diff -u uapi16.h "$RUNNER_TEMP/uapi16.h" ||
+            { echo "::error::uapi16.h is out of date, see cbindgen.toml"; exit 1; }
+
+      - name: Install the compilers
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang g++ gcc-multilib
+
+      - name: Compile uapi16.h on its own
+        # A program includes the header and nothing before it: as C99 to
+        # C23 with and without the extensions of GNU, for 64 and for 32
+        # bits, and from C++11 to C++23.
+        working-directory: src/uapi16
+        run: |
+          for cc in gcc clang; do
+            for std in c99 c11 c17 c23 gnu99 gnu11 gnu17 gnu23; do
+              for bits in -m64 -m32; do
+                echo '#include "uapi16.h"' |
+                  $cc -std=$std $bits -Wall -Wextra -Werror -I. -x c -fsyntax-only -
+              done
+            done
+          done
+          for cxx in g++ clang++; do
+            for std in c++11 c++14 c++17 c++20 c++23; do
+              echo '#include "uapi16.h"' |
+                $cxx -std=$std -Wall -Wextra -Werror -I. -x c++ -fsyntax-only -
+            done
+          done
+
+  capi:
+    name: C library (rustc ${{ matrix.rust }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        # The test takes what it is built with from uapi16.pc, and
+        # mkfs.vfat makes the FAT file system it looks at.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends pkgconf dosfstools
+
+      - name: Install rustc ${{ matrix.rust }}
         env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --workspace --no-deps --target aarch64-linux-android
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustc --version
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Enable unprivileged user namespaces
+        # Four tests make a user namespace for themselves, and skip where
+        # they can't: the one of a loop through a bind mount, the one of a
+        # file system without a UUID and the one of a file system that is
+        # full with a mount namespace, and the one of a child with the PID
+        # of its parent with a PID namespace.
+        # AppArmor keeps a program without a profile from using a user
+        # namespace on the runner, so this turns that off, as the jobs
+        # that run the tests of the crate do. Where unshare still fails
+        # the job fails here, so that these tests don't skip unseen.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+
+      - name: Build the static and the shared library
+        # cargo builds the static library, and the C compiler links the
+        # shared one from it.
+        run: src/uapi16/build.sh -- --locked
+
+      - name: Install
+        run: src/uapi16/install.sh --prefix="$RUNNER_TEMP/usr"
+
+      - name: Make a FAT file system
+        # One the user owns, with a regular file, a read-only one and a
+        # directory on it, as the job for FAT makes one. The test walks it
+        # and makes a manifest in it.
+        run: |
+          fat=$RUNNER_TEMP/fat
+          truncate -s 1G "$fat.img"
+          /usr/sbin/mkfs.vfat -F 32 "$fat.img"
+          mkdir "$fat"
+          sudo mount -o "loop,uid=$(id -u),gid=$(id -g)" "$fat.img" "$fat"
+          echo file > "$fat/file"
+          echo read-only > "$fat/read-only"
+          chmod a-w "$fat/read-only"
+          mkdir "$fat/dir"
+          echo "UAPI16_TEST_FAT_DIR=$fat" >> "$GITHUB_ENV"
+
+      - name: Test
+        # What the shared library exports, tests/capi.c against both
+        # libraries and the programs of examples/, with the address and the
+        # undefined behavior sanitizer. The test on FAT skips where it has
+        # no FAT directory, so the job fails unless it ran for both
+        # libraries. The parts that run under a seccomp filter skip where
+        # a process can't have one, and "forks", which has two of them,
+        # skips as a whole where no memory is wiped in a child. The job
+        # fails for a line that starts as one of those skip lines does,
+        # whatever the line says after that.
+        run: |
+          out=$RUNNER_TEMP/capi.out
+          src/uapi16/tests/capi.sh "$RUNNER_TEMP/usr" > "$out" 2>&1 || { cat "$out"; exit 1; }
+          cat "$out"
+          if [ "$(grep -c '^ok fat$' "$out")" != 2 ] || grep -q '^skipping a .* on FAT' "$out"; then
+            echo "::error::the test on FAT did not run for both libraries"
+            exit 1
+          fi
+          if grep -q \
+            -e '^skipping a new file' \
+            -e '^skipping a fork that nothing tells' \
+            -e '^skipping forks:' \
+            "$out"; then
+            echo "::error::a part of the tests under a seccomp filter did not run"
+            exit 1
+          fi
 
   package:
     name: Package
@@ -249,6 +541,35 @@ jobs:
           rustc --version
           host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
           echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      - name: Install fuse-overlayfs
+        # Tests mount it in their namespaces: a FUSE file system that
+        # takes no privileges, for what the kernel's own don't do.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends fuse-overlayfs
+
+      - name: Enable unprivileged user namespaces
+        # Tests that need mounts of their own run again in a user and a
+        # mount namespace from unshare(1), and skip where it can't make
+        # them. AppArmor keeps a program without a profile from using a
+        # user namespace on the runner, so this turns that off, as
+        # mkosi's action does. Where unshare still fails the job fails
+        # here, so that these tests don't skip for that. Those that
+        # mount fuse-overlayfs there skip where that can't be mounted. So
+        # this mounts one as well, and the job fails here where it can't.
+        # The tests that take an automount point skip in every job: only
+        # root can make one. So does the test that takes a file system
+        # that keeps a file that was unlinked while it is open, as NFS
+        # does: no job mounts one.
+        run: |
+          sudo sysctl --ignore --write kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -Urm true
+          d=$(mktemp -d)
+          mkdir "$d/lower" "$d/upper" "$d/work" "$d/merged"
+          unshare -Urm sh -c 'fuse-overlayfs -o "$1" "$2" && umount "$2"' sh \
+            "lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work" "$d/merged"
+          rm -r "$d"
 
       - name: cargo publish --dry-run
         # Builds the package that would be uploaded, from its unpacked

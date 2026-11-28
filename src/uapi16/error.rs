@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The error of this crate.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 
 use crate::decode::Subject;
 use crate::object::FileObject;
 use crate::strict::{ParseError, ParseErrorKind};
-use crate::{NameProblem, MAX_CONTENTS, MAX_RECORD_SIZE};
+use crate::{Features, NameBuf, NameProblem, MAX_CONTENTS, MAX_RECORD_SIZE};
 
 /// What is wrong with a manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -236,6 +237,71 @@ pub enum ValidityProblem {
     Expired,
 }
 
+/// How the files being added to a manifest cannot be described as asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TreeProblem {
+    /// The same name was added twice, for two different files that are not
+    /// both directories.
+    Duplicate,
+    /// A file changed while it was read. Its size, its modification time,
+    /// its change time and how many names it has are compared before and
+    /// after. The data of a regular file has to end at its size as well,
+    /// which that of a file of procfs or sysfs does not.
+    Changed,
+    /// Two names of one inode do not show the same file: its type, mode,
+    /// owner, device numbers, size, modification time, birth time or data
+    /// differ, or one of the other fields the specification wants the names
+    /// of one inode to share: the names of the owners, the extended
+    /// attributes and the inode flags. [`Error::hardlink_name`] gives the
+    /// name that [`Error::name`] was compared with.
+    HardlinkMismatch,
+    /// A file has a name that a manifest cannot hold: one that is not UTF-8,
+    /// that is too long, or that has a control character or a
+    /// noncharacter. [`Error::name_problem`] says which, and
+    /// [`Error::raw_name`] gives the name as its directory has it.
+    UnwritableName,
+    /// A file that is not a directory is where a directory is needed.
+    NotDirectory,
+    /// A feature that was asked for cannot be read here.
+    /// [`Error::feature`] gives the feature. Without a feature, the kernel
+    /// is too old to tell mount points apart: statx() reports no mount ID.
+    FeatureUnavailable,
+    /// A feature of a partition, such as [`Features::GPT_LABEL`], was asked
+    /// for. It does not apply to a tree of files. [`Error::feature`] gives
+    /// the feature.
+    FeatureNotForTrees,
+    /// A directory is its own ancestor: a mount point below it shows it
+    /// again. That can only happen when the walk crosses mount points.
+    /// [`Error::name`] gives the directory below.
+    Loop,
+    /// A directory that files were added below was not added itself, and
+    /// the features asked for give a missing field a meaning, as
+    /// [`Features::READ_ONLY`] and [`Features::USER_XATTR`] do. A plain
+    /// directory has none of those fields and would claim that they are
+    /// cleared. [`Error::name`] gives the directory.
+    MissingParent,
+}
+
+impl TreeProblem {
+    /// The name of the problem, such as `hardlinkMismatch`, for a caller
+    /// that passes it on, in the errors of an interface for example. The
+    /// names are stable.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TreeProblem::Duplicate => "duplicate",
+            TreeProblem::Changed => "changed",
+            TreeProblem::HardlinkMismatch => "hardlinkMismatch",
+            TreeProblem::UnwritableName => "unwritableName",
+            TreeProblem::NotDirectory => "notDirectory",
+            TreeProblem::FeatureUnavailable => "featureUnavailable",
+            TreeProblem::FeatureNotForTrees => "featureNotForTrees",
+            TreeProblem::Loop => "loop",
+            TreeProblem::MissingParent => "missingParent",
+        }
+    }
+}
+
 /// What kind of error an [`Error`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -251,6 +317,8 @@ pub enum ErrorKind {
     Unsupported(UnsupportedData),
     /// A file object is revoked or outside its validity window.
     NotValid(ValidityProblem),
+    /// The files being added to a manifest cannot be described as asked.
+    Tree(TreeProblem),
     /// Reading or writing failed.
     Io,
 }
@@ -465,7 +533,11 @@ struct Inner {
     message: String,
     record_number: Option<u64>,
     name: Option<String>,
+    hardlink_name: Option<String>,
+    raw_name: Option<OsString>,
+    name_problem: Option<NameProblem>,
     field: Option<Field>,
+    feature: Option<Features>,
     found_size: Option<u64>,
     expected_size: Option<u64>,
     value: Option<String>,
@@ -479,7 +551,11 @@ impl Error {
             message,
             record_number: None,
             name: None,
+            hardlink_name: None,
+            raw_name: None,
+            name_problem: None,
             field: None,
+            feature: None,
             found_size: None,
             expected_size: None,
             value: None,
@@ -503,6 +579,35 @@ impl Error {
     #[must_use]
     pub(crate) fn named(mut self, name: impl Into<String>) -> Error {
         self.0.name = Some(name.into());
+        self
+    }
+
+    /// Names the other name of the inode the error is about.
+    #[must_use]
+    pub(crate) fn linked(mut self, name: NameBuf) -> Error {
+        self.0.hardlink_name = Some(name.into());
+        self
+    }
+
+    /// Notes the name of the file the error is about as its directory has
+    /// it.
+    #[must_use]
+    pub(crate) fn raw(mut self, name: impl Into<OsString>) -> Error {
+        self.0.raw_name = Some(name.into());
+        self
+    }
+
+    /// Notes the rule of a name that the name of the error breaks.
+    #[must_use]
+    pub(crate) fn because(mut self, problem: NameProblem) -> Error {
+        self.0.name_problem = Some(problem);
+        self
+    }
+
+    /// Names the feature the error is about, a single one.
+    #[must_use]
+    pub(crate) fn about(mut self, feature: Features) -> Error {
+        self.0.feature = Some(feature);
         self
     }
 
@@ -533,6 +638,17 @@ impl Error {
     pub(crate) fn caused_by(mut self, error: io::Error) -> Error {
         self.0.cause = Some(Cause::Io(error));
         self
+    }
+
+    /// The I/O error `error`, which `about` says what it was about, as an
+    /// I/O error of its kind for code that hands I/O errors on. Where it
+    /// becomes an error of this crate, it is one of the kind Io that says
+    /// both, "about: error", and whose cause is `error`, so that the errno
+    /// of the system call stays.
+    pub(crate) fn io_about(about: String, error: io::Error) -> io::Error {
+        let kind = error.kind();
+        let message = format!("{}: {}", about, error);
+        io::Error::new(kind, IoAbout(Error::new(ErrorKind::Io, message).caused_by(error)))
     }
 
     /// A record that is not JSON, that has a key twice in an object, or
@@ -574,15 +690,10 @@ impl Error {
         .at(Field::Type)
     }
 
-    /// A file object after the root file object, in the record with the
-    /// number `record_number`, that has no name.
-    pub(crate) fn no_name(record_number: u64) -> Error {
-        Error::manifest(
-            Problem::NoName,
-            format!("manifest object {} has no name", record_number),
-        )
-        .at(Field::Name)
-        .in_record(record_number)
+    /// A file object after the root file object, which `subject` names,
+    /// that has no name.
+    pub(crate) fn no_name(subject: Subject<'_>) -> Error {
+        Error::manifest(Problem::NoName, format!("{} has no name", subject)).at(Field::Name)
     }
 
     /// A file object in the record with the number `record_number`, behind
@@ -616,7 +727,7 @@ impl Error {
 
     /// A file object, which `subject` names, with more than
     /// [`MAX_CONTENTS`] contents objects.
-    pub(crate) fn too_many_contents(subject: Subject<'_>) -> Error {
+    pub(crate) fn too_many_contents(subject: impl fmt::Display) -> Error {
         Error::manifest(
             Problem::InvalidContents,
             format!("{}: more than {} contents entries", subject, MAX_CONTENTS),
@@ -650,6 +761,7 @@ impl Error {
             ),
         )
         .at(Field::File)
+        .because(reason)
     }
 
     /// `object`, which `subject` names, states the flag of the field
@@ -676,13 +788,47 @@ impl Error {
 
     /// The name of the file object the error is about, as its record has
     /// it. The name can be the very thing that is wrong.
+    ///
+    /// For the files being added to a manifest, it is the name of the file
+    /// in the manifest, and for [`TreeProblem::UnwritableName`] the name of
+    /// the directory the file is in.
     pub fn name(&self) -> Option<&str> {
         self.0.name.as_deref()
+    }
+
+    /// The other name of the file, for [`TreeProblem::HardlinkMismatch`]:
+    /// the name of the same inode that [`Error::name`] was compared with.
+    pub fn hardlink_name(&self) -> Option<&str> {
+        self.0.hardlink_name.as_deref()
+    }
+
+    /// The name of the file as its directory has it, for
+    /// [`TreeProblem::UnwritableName`]: one component, which need not be
+    /// UTF-8.
+    pub fn raw_name(&self) -> Option<&OsStr> {
+        self.0.raw_name.as_deref()
+    }
+
+    /// Which rule of a name the name breaks: for
+    /// [`TreeProblem::UnwritableName`] the name [`Error::raw_name`] gives,
+    /// for [`Problem::InvalidName`] the name of the record, and for
+    /// [`Problem::InvalidContents`] in [`Field::File`] the file a contents
+    /// object refers to.
+    pub fn name_problem(&self) -> Option<NameProblem> {
+        self.0.name_problem
     }
 
     /// The field the error is about.
     pub fn field(&self) -> Option<Field> {
         self.0.field
+    }
+
+    /// The feature the error is about, for
+    /// [`TreeProblem::FeatureUnavailable`] and
+    /// [`TreeProblem::FeatureNotForTrees`]: a single one, such as
+    /// [`Features::MTIME`].
+    pub fn feature(&self) -> Option<Features> {
+        self.0.feature
     }
 
     /// The size that was found, when the error is about a size and it is
@@ -717,7 +863,10 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.0.kind, &self.0.cause) {
-            (ErrorKind::Io, Some(Cause::Io(e))) => e.fmt(f),
+            // An I/O error shows as its cause, but for one that says what
+            // it was about, such as one of a Writer after a write that
+            // failed, one of a file of a tree or one of Error::io_about().
+            (ErrorKind::Io, Some(Cause::Io(e))) if self.0.message.is_empty() => e.fmt(f),
             _ => f.write_str(&self.0.message),
         }
     }
@@ -735,7 +884,30 @@ impl std::error::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
-        Error::new(ErrorKind::Io, String::new()).caused_by(e)
+        // An error of this crate that says what an I/O error was about,
+        // which the I/O error carried on its way up, see Error::io_about(),
+        // is that error again.
+        match e.downcast::<IoAbout>() {
+            Ok(about) => about.0,
+            Err(e) => Error::new(ErrorKind::Io, String::new()).caused_by(e),
+        }
+    }
+}
+
+/// An error of the kind Io that says what it was about, which an I/O error
+/// carries on its way up, see [`Error::io_about`].
+#[derive(Debug)]
+struct IoAbout(Error);
+
+impl fmt::Display for IoAbout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for IoAbout {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.0)
     }
 }
 
@@ -766,6 +938,10 @@ mod tests {
         assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOSPC));
         assert_eq!(e.to_string(), io::Error::from_raw_os_error(libc::ENOSPC).to_string());
         assert!(std::error::Error::source(&e).is_some());
+        assert_eq!(
+            (e.name(), e.hardlink_name(), e.raw_name(), e.name_problem(), e.feature()),
+            (None, None, None, None, None)
+        );
         assert_eq!(io::Error::from(e).raw_os_error(), Some(libc::ENOSPC));
         // Any other error is carried by an I/O error.
         let e = Error::manifest(Problem::NoTrailer, "incomplete".to_string());
@@ -774,6 +950,31 @@ mod tests {
         let inner = io.get_ref().and_then(|e| e.downcast_ref::<Error>()).unwrap();
         assert_eq!(inner.kind(), ErrorKind::Manifest(Problem::NoTrailer));
         assert_eq!(io.to_string(), "incomplete");
+    }
+
+    /// An I/O error that says what it was about is an I/O error of its kind
+    /// on the way up, and an error of the kind Io here that says both, with
+    /// the I/O error as its cause. As an I/O error again it is that of the
+    /// system call.
+    #[test]
+    fn io_errors_that_say_what_they_were_about() {
+        let enoent = || io::Error::from_raw_os_error(libc::ENOENT);
+        let io = Error::io_about("the directory".to_string(), enoent());
+        assert_eq!(io.kind(), io::ErrorKind::NotFound);
+        let e = Error::from(io);
+        assert_eq!(e.kind(), ErrorKind::Io);
+        assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOENT));
+        assert_eq!(e.to_string(), format!("the directory: {}", enoent()));
+        assert!(std::error::Error::source(&e).is_some());
+        assert_eq!(io::Error::from(e).raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// An error can be sent to another thread, shared between threads and
+    /// kept for as long as needed, as an I/O error can.
+    #[test]
+    fn errors_are_send_and_sync() {
+        fn send_sync_static<T: Send + Sync + 'static>() {}
+        send_sync_static::<Error>();
     }
 
     #[test]
@@ -792,6 +993,13 @@ mod tests {
         assert_eq!(e.to_string(), "message");
         assert_eq!((e.found_size(), e.expected_size(), e.value()), (None, None, None));
         assert!(e.io_error().is_none() && std::error::Error::source(&e).is_none());
+        // What only some errors are about.
+        assert_eq!(
+            (e.hardlink_name(), e.raw_name(), e.name_problem(), e.feature()),
+            (None, None, None, None)
+        );
+        let e = Error::manifest(Problem::InvalidName, String::new()).because(NameProblem::TooLong);
+        assert_eq!(e.name_problem(), Some(NameProblem::TooLong));
         let e = Error::new(ErrorKind::Data(DataProblem::SizeMismatch), String::new())
             .sizes(Some(1), Some(2))
             .valued("gzip");
@@ -884,5 +1092,71 @@ mod tests {
         }
         let names: std::collections::HashSet<&str> = Problem::ALL.iter().map(|problem| problem.as_str()).collect();
         assert_eq!(names.len(), Problem::ALL.len());
+    }
+
+    /// Every problem of the files being added, in the order of the
+    /// variants.
+    const TREE_PROBLEMS: [TreeProblem; 9] = [
+        TreeProblem::Duplicate,
+        TreeProblem::Changed,
+        TreeProblem::HardlinkMismatch,
+        TreeProblem::UnwritableName,
+        TreeProblem::NotDirectory,
+        TreeProblem::FeatureUnavailable,
+        TreeProblem::FeatureNotForTrees,
+        TreeProblem::Loop,
+        TreeProblem::MissingParent,
+    ];
+
+    /// Where `problem` is in [`TREE_PROBLEMS`]. As a constant it does not
+    /// build for a problem that the list lacks.
+    const fn position_in_tree_problems(problem: TreeProblem) -> usize {
+        let mut position = 0;
+        while position < TREE_PROBLEMS.len() {
+            if TREE_PROBLEMS[position] as usize == problem as usize {
+                return position;
+            }
+            position += 1;
+        }
+        panic!("TREE_PROBLEMS lacks a problem");
+    }
+
+    /// TREE_PROBLEMS holds every problem once, in the order of the variants,
+    /// and each has its stable name, which no other one has. The match names
+    /// every problem, so a problem added to the enum does not build without
+    /// an arm here, and its arm, a constant, does not build until the list
+    /// has the problem.
+    #[test]
+    fn all_tree_problems() {
+        let position = |problem: TreeProblem| match problem {
+            TreeProblem::Duplicate => const { position_in_tree_problems(TreeProblem::Duplicate) },
+            TreeProblem::Changed => const { position_in_tree_problems(TreeProblem::Changed) },
+            TreeProblem::HardlinkMismatch => const { position_in_tree_problems(TreeProblem::HardlinkMismatch) },
+            TreeProblem::UnwritableName => const { position_in_tree_problems(TreeProblem::UnwritableName) },
+            TreeProblem::NotDirectory => const { position_in_tree_problems(TreeProblem::NotDirectory) },
+            TreeProblem::FeatureUnavailable => const { position_in_tree_problems(TreeProblem::FeatureUnavailable) },
+            TreeProblem::FeatureNotForTrees => const { position_in_tree_problems(TreeProblem::FeatureNotForTrees) },
+            TreeProblem::Loop => const { position_in_tree_problems(TreeProblem::Loop) },
+            TreeProblem::MissingParent => const { position_in_tree_problems(TreeProblem::MissingParent) },
+        };
+        for (i, &problem) in TREE_PROBLEMS.iter().enumerate() {
+            assert_eq!((position(problem), problem as usize), (i, i), "{:?}", problem);
+        }
+        assert_eq!(
+            TREE_PROBLEMS.map(TreeProblem::as_str),
+            [
+                "duplicate",
+                "changed",
+                "hardlinkMismatch",
+                "unwritableName",
+                "notDirectory",
+                "featureUnavailable",
+                "featureNotForTrees",
+                "loop",
+                "missingParent",
+            ]
+        );
+        let names: std::collections::HashSet<&str> = TREE_PROBLEMS.iter().map(|problem| problem.as_str()).collect();
+        assert_eq!(names.len(), TREE_PROBLEMS.len());
     }
 }

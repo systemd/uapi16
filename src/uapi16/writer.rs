@@ -43,11 +43,11 @@ enum Stage {
 /// Puts a manifest together record by record, and does no I/O.
 ///
 /// [`Encoder::begin`] appends the record of the root file object to a
-/// string, [`Encoder::file`] the record of a file object,
-/// [`Encoder::signature`] that of a signature object and
+/// string, [`Encoder::file`] the record of a file object and
 /// [`Encoder::finish`] that of the trailer object. Whoever calls them sends
 /// the records on, each one as it comes or many at once. A [`Writer`] is
-/// an encoder whose records go to a [`Write`] one at a time.
+/// an encoder whose records go to a [`Write`] one at a time, and writes
+/// signature objects as well.
 ///
 /// An encoder checks every object the way a [`Reader`](crate::Reader)
 /// does, see [`Writer`], and keeps the name of the last file object for
@@ -57,31 +57,10 @@ enum Stage {
 /// encoder goes on as if it had not been called. Nothing can follow the
 /// trailer object, so after [`Encoder::finish`] every method fails.
 ///
-/// ```
-/// use uapi16::{Encoder, FileObject, NameBuf, RootObject};
-///
-/// let mut text = String::new();
-/// let mut encoder = Encoder::begin(&RootObject::default(), &mut text)?;
-/// for name in ["a", "b"] {
-///     encoder.file(&FileObject::new(NameBuf::new(name)?), &mut text)?;
-/// }
-/// encoder.finish(&mut text)?;
-/// assert_eq!(
-///     text,
-///     concat!(
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
-///         "\x1e{\"name\":\"a\"}\n",
-///         "\x1e{\"name\":\"b\"}\n",
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
-///     )
-/// );
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-///
 /// [`Write`]: std::io::Write
 /// [`Writer`]: crate::Writer
 #[derive(Debug)]
-pub struct Encoder {
+pub(crate) struct Encoder {
     /// The number of the record that is appended next.
     pub(crate) next_record: u64,
     stage: Stage,
@@ -97,36 +76,35 @@ pub struct Encoder {
 impl Encoder {
     /// Starts a manifest with the root file object `root`: appends its
     /// record to `text`.
-    pub fn begin(root: &RootObject, text: &mut String) -> Result<Encoder, Error> {
+    pub(crate) fn begin(root: &RootObject, text: &mut String) -> Result<Encoder, Error> {
         let mut encoder = Encoder::start(root)?;
         encoder.append_to(text);
         Ok(encoder)
     }
 
     /// Appends the record of the file object `file` to `text`.
-    pub fn file(&mut self, file: &FileObject, text: &mut String) -> Result<(), Error> {
+    pub(crate) fn file(&mut self, file: &FileObject, text: &mut String) -> Result<(), Error> {
         self.encode_file(file)?;
-        self.append_to(text);
-        Ok(())
-    }
-
-    /// Appends the record of the signature object `signature` to `text`.
-    /// No file object can follow it: it would be one the signature does
-    /// not cover.
-    pub fn signature(&mut self, signature: &SignatureObject, text: &mut String) -> Result<(), Error> {
-        self.encode_signature(signature)?;
         self.append_to(text);
         Ok(())
     }
 
     /// Ends the manifest: appends the record of the trailer object to
     /// `text`.
-    pub fn finish(&mut self, text: &mut String) -> Result<(), Error> {
+    pub(crate) fn finish(&mut self, text: &mut String) -> Result<(), Error> {
         self.encode_trailer()?;
         self.append_to(text);
         Ok(())
     }
 
+    /// Appends the record that was put together to `text`.
+    fn append_to(&mut self, text: &mut String) {
+        text.push_str(std::str::from_utf8(&self.record).expect("serde_json writes UTF-8"));
+        self.clear_record();
+    }
+}
+
+impl Encoder {
     /// An encoder that puts together the record of the root file object
     /// `root` first.
     pub(crate) fn start(root: &RootObject) -> Result<Encoder, Error> {
@@ -164,16 +142,18 @@ impl Encoder {
         // symbolic link without its target, gptFlags against the fields of
         // its flags, and where it comes. So the record is put together
         // first. Admitting the object makes it the one the next one is
-        // checked against, which comes last.
+        // checked against, which comes last. FileObject::check_alone() is
+        // the same but for the stage and the admission.
+        let subject = Subject::new(file, record_number);
         let encoded = self
             .write_record(file)
-            .and_then(|()| file.check_strings(record_number))
+            .and_then(|()| file.check_strings(subject))
             .and_then(|()| match self.stage {
                 Stage::Signatures => Err(Error::file_after_signature(record_number)),
                 _ => Ok(()),
             })
-            .and_then(|()| file.check(record_number))
-            .and_then(|()| self.sequence_check.check_fields(file, record_number))
+            .and_then(|()| file.check(subject))
+            .and_then(|()| self.sequence_check.check_fields(file, subject))
             .and_then(|()| self.sequence_check.admit(file, record_number));
         if let Err(e) = encoded {
             self.clear_record();
@@ -226,21 +206,25 @@ impl Encoder {
     /// A record larger than [`MAX_RECORD_SIZE`], its record separator
     /// included, is refused.
     fn write_record(&mut self, object: &impl Fields) -> Result<(), Error> {
-        self.record.clear();
-        self.record.push(RECORD_SEPARATOR);
-        serde_json::to_writer(&mut self.record, &Json(object)).expect("a record serializes into a Vec");
-        self.record.push(RECORD_END);
-        if self.record.len() > MAX_RECORD_SIZE {
+        let written = Encoder::put_together(&mut self.record, object);
+        if written.is_err() {
             self.clear_record();
+        }
+        written
+    }
+
+    /// Puts together the record of `object` in `record`, in place of what
+    /// it held. A record larger than [`MAX_RECORD_SIZE`], its record
+    /// separator included, is refused.
+    fn put_together(record: &mut Vec<u8>, object: &impl Fields) -> Result<(), Error> {
+        record.clear();
+        record.push(RECORD_SEPARATOR);
+        serde_json::to_writer(&mut *record, &Json(object)).expect("a record serializes into a Vec");
+        record.push(RECORD_END);
+        if record.len() > MAX_RECORD_SIZE {
             return Err(Error::record_too_large());
         }
         Ok(())
-    }
-
-    /// Appends the record that was put together to `text`.
-    fn append_to(&mut self, text: &mut String) {
-        text.push_str(std::str::from_utf8(&self.record).expect("serde_json writes UTF-8"));
-        self.clear_record();
     }
 
     /// Forgets the record that was put together. A record larger than
@@ -364,6 +348,18 @@ impl Field {
 // attributes. So these go out only where they say more.
 
 impl RootObject {
+    /// Checks the root file object as a writer does that begins a manifest
+    /// with it, on its own: the size of its record, its strings, its
+    /// fields and their features, in the order a reader finds what is
+    /// wrong with a record, see [`Encoder::start`]. The error names no
+    /// record, since the object is in none yet.
+    pub(crate) fn check_alone(&self) -> Result<(), Error> {
+        Encoder::put_together(&mut Vec::new(), self)
+            .and_then(|()| self.check_strings())
+            .and_then(|()| self.check())
+            .and_then(|()| SequenceCheck::new(self.recorded_features(), self.order).check_root_fields(self))
+    }
+
     /// Checks every string the record of the root file object has, in the
     /// order of the keys, for what the strings of a manifest may not hold.
     fn check_strings(&self) -> Result<(), Error> {
@@ -443,11 +439,28 @@ impl Serialize for FeatureNames {
 }
 
 impl FileObject {
-    /// Checks every string the record of the object, the one with the
-    /// number `record_number`, has, in the order of the keys, for what the
-    /// strings of a manifest may not hold.
-    fn check_strings(&self, record_number: u64) -> Result<(), Error> {
-        let subject = Subject::new(self, record_number);
+    /// Checks the object as a writer of a manifest that records `features`
+    /// in the order `order` does, on its own: all but where it comes, which
+    /// depends on the objects before it. That is the size of its record,
+    /// its strings, its fields and their features, in the order a reader
+    /// finds what is wrong with a record, see [`Encoder::encode_file`]. The
+    /// error names the object, which is in no record yet.
+    pub(crate) fn check_alone(&self, features: Features, order: Order) -> Result<(), Error> {
+        let subject = Subject::unwritten(self);
+        Encoder::put_together(&mut Vec::new(), self)
+            .and_then(|()| self.check_strings(subject))
+            .and_then(|()| self.check(subject))
+            .and_then(|()| SequenceCheck::new(features, Some(order)).check_fields(self, subject))
+            .map_err(|e| match self.name.is_root() {
+                true => e,
+                false => e.named(self.name.as_str()),
+            })
+    }
+
+    /// Checks every string the record of the object, which `subject`
+    /// names, has, in the order of the keys, for what the strings of a
+    /// manifest may not hold.
+    fn check_strings(&self, subject: Subject<'_>) -> Result<(), Error> {
         for contents in &self.contents {
             contents.check_strings(subject)?;
         }
@@ -458,14 +471,12 @@ impl FileObject {
         self.inode.check_owner_strings(subject)
     }
 
-    /// Checks the object, the one of the record with the number
-    /// `record_number`, as a reader does: the value of every field in the
-    /// order of the keys, each contents object's fields against each other
-    /// right after its values, the name, the fields its inode type permits
-    /// and the fields against each other. Unlike a reader it fills nothing
-    /// in.
-    fn check(&self, record_number: u64) -> Result<(), Error> {
-        let subject = Subject::new(self, record_number);
+    /// Checks the object, which `subject` names, as a reader does: the
+    /// value of every field in the order of the keys, each contents
+    /// object's fields against each other right after its values, the
+    /// name, the fields its inode type permits and the fields against each
+    /// other. Unlike a reader it fills nothing in.
+    fn check(&self, subject: Subject<'_>) -> Result<(), Error> {
         if self.contents.len() > MAX_CONTENTS {
             return Err(Error::too_many_contents(subject));
         }
@@ -495,7 +506,7 @@ impl FileObject {
             FileObject::check_owner_name(Field::UserName, name, subject)?;
         }
         if self.name.is_root() {
-            return Err(Error::no_name(record_number));
+            return Err(Error::no_name(subject));
         }
         self.check_permitted_fields(subject)?;
         // The contents objects were checked above. This is for what
@@ -2229,7 +2240,7 @@ mod tests {
         let whole = Whole {
             root: root.clone(),
             objects: vec![directory("a"), everything()],
-            signatures: vec![SignatureObject::new("pkcs7")],
+            signatures: Vec::new(),
         };
         let mut text = String::new();
         let mut encoder = Encoder::begin(&root, &mut text).unwrap();
@@ -2245,9 +2256,6 @@ mod tests {
             (ErrorKind::Manifest(Problem::DuplicateName), Some(3))
         );
         assert_eq!(text, appended);
-        for signature in &whole.signatures {
-            encoder.signature(signature, &mut text).unwrap();
-        }
         encoder.finish(&mut text).unwrap();
         assert_eq!(text.as_bytes(), write_whole(&whole).unwrap());
         // Nothing follows the trailer.
@@ -2257,14 +2265,11 @@ mod tests {
             encoder
                 .file(&FileObject::new(NameBuf::default()), &mut text)
                 .unwrap_err(),
-            encoder
-                .signature(&SignatureObject::new("pkcs7"), &mut text)
-                .unwrap_err(),
             encoder.finish(&mut text).unwrap_err(),
         ] {
             assert_eq!(
                 (e.kind(), e.record_number()),
-                (ErrorKind::Manifest(Problem::DataAfterTrailer), Some(5))
+                (ErrorKind::Manifest(Problem::DataAfterTrailer), Some(4))
             );
         }
         assert_eq!(text.len(), appended);

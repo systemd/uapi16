@@ -11,32 +11,57 @@ repository = "https://github.com/systemd/uapi16"
 keywords = ["uapi", "manifest", "filesystem", "systemd", "json-seq"]
 categories = ["filesystem", "parser-implementations", "encoding"]
 # What the package cargo publish uploads holds next to Cargo.toml and
-# Cargo.lock.
-include = ["/*.rs", "/refused.jsonl", "/tests/", "/README.md", "/LICENSE"]
+# Cargo.lock. The header, the configuration of cbindgen, the version script
+# and the two scripts are what the C library is built and installed with.
+include = [
+    "/*.rs",
+    "/refused.jsonl",
+    "/tests/",
+    "/examples/",
+    "/README.md",
+    "/LICENSE",
+    "/build.sh",
+    "/cbindgen.toml",
+    "/install.sh",
+    "/libuapi16.sym",
+    "/uapi16.h",
+]
 
 [lib]
 path = "lib.rs"
 
+[features]
+# The C API of the crate, which uapi16.h declares. build.sh builds the
+# static and the shared library of it, and install.sh installs them.
+capi = []
+
 [dependencies]
+# getpwuid_r() and getgrgid_r(), which give the names of the owners of the
+# files a manifest is built from. The tests take errno values from it.
+libc.workspace = true
 serde_core.workspace = true
 # Without float_roundtrip serde_json refuses some spellings of the largest
 # doubles as out of range, such as 1.7976931348623158e308.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 
-# PinnedDirectory, which only Linux has.
+# uapi16 supports Linux only. A build for another system fails with the
+# error of lib.rs, and builds neither of the two for it.
 [target.'cfg(target_os = "linux")'.dependencies]
+# PinnedDirectory.
 pathrs.workspace = true
-
 # PinnedDirectory, and the device numbers of FileObject::from_metadata().
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { workspace = true, features = ["fs"] }
+# open_tree(), which takes the handle of a file of a tree, is in the mount
+# module.
+rustix = { workspace = true, features = ["fs", "mount"] }
 
 [dev-dependencies]
-# The errno values of the errors the tests make.
-libc.workspace = true
 # The tests look at the order of the keys the writer writes.
 serde_json = { workspace = true, features = ["preserve_order"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The tests of the Writer write to a pipe.
+rustix = { workspace = true, features = ["pipe"] }
 
 [lints]
 workspace = true

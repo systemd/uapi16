@@ -529,6 +529,20 @@ impl GptPartition {
             || self.no_auto.is_some()
             || self.grow_file_system.is_some()
     }
+
+    /// Takes away `field`, one of the fields of a partition among
+    /// [`FileObject::FEATURE_FIELDS`], as its setter does with None.
+    fn take_feature_field(&mut self, field: Field) {
+        match field {
+            Field::GptFlagGrowFileSystem => self.set_grow_file_system(None),
+            Field::GptFlagNoAuto => self.set_no_auto(None),
+            Field::GptFlags => self.set_flags(None),
+            Field::GptLabel => self.set_label(None),
+            Field::GptTypeUuid => self.set_type_uuid(None),
+            Field::GptUuid => self.set_uuid(None),
+            _ => {}
+        }
+    }
 }
 
 /// A set of flags of one kind that the specification has a field for each:
@@ -584,6 +598,22 @@ macro_rules! flag_set {
             #[must_use]
             pub(crate) const fn without(self, flags: $flags) -> $flags {
                 $flags(self.0 & !flags.0)
+            }
+
+            /// The flags as bits, as the manifest builder keeps them while
+            /// it sorts.
+            pub(crate) const fn bits(self) -> u8 {
+                self.0
+            }
+
+            /// The flags the bits `bits` are, if each is the bit of a
+            /// flag.
+            pub(crate) const fn from_bits(bits: u8) -> Option<$flags> {
+                if bits & !$flags::ALL.0 == 0 {
+                    Some($flags(bits))
+                } else {
+                    None
+                }
             }
         }
 
@@ -744,6 +774,15 @@ impl<F: FlagSet> FlagStates<F> {
         }
     }
 
+    /// Keeps what the object says about `flags` and takes away what it
+    /// says about every other flag, also where a reader filled it in:
+    /// nothing is known about those then.
+    fn retain(&mut self, flags: F) {
+        self.stated = self.stated & flags;
+        self.set = self.set & flags;
+        self.filled = self.filled & flags;
+    }
+
     /// The flags the record of the object gives: those it states but a
     /// reader did not fill in.
     fn given(&self) -> F {
@@ -896,6 +935,17 @@ impl FilledIn {
     /// object and those of its inode attributes.
     pub(crate) const fn union(self, other: FilledIn) -> FilledIn {
         FilledIn(self.0 | other.0)
+    }
+
+    /// The marks as bits, one for each field that can be filled in, as the
+    /// manifest builder keeps them while it sorts.
+    pub(crate) const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// The marks the bits `bits` are.
+    pub(crate) const fn from_bits(bits: u16) -> FilledIn {
+        FilledIn(bits)
     }
 }
 
@@ -1389,6 +1439,34 @@ impl InodeAttributes {
             .into_iter()
             .filter(|(field, _)| self.has_feature_field(*field))
             .chain(self.flags.feature_fields())
+    }
+
+    /// Takes away `field`, one of [`InodeAttributes::FEATURE_FIELDS`], as
+    /// its setter does with None, also where a reader filled it in.
+    fn take_feature_field(&mut self, field: Field) {
+        match field {
+            Field::ExtendedAttributes => self.set_user_xattrs(None),
+            Field::Gid => self.set_gid(None),
+            Field::GroupName => self.set_group_name(None),
+            Field::MTimeNSec => self.set_mtime_nsec(None),
+            Field::Mode => self.set_mode(None),
+            Field::ReadOnly => self.set_read_only(None),
+            Field::Uid => self.set_uid(None),
+            Field::UserName => self.set_user_name(None),
+            _ => {}
+        }
+    }
+
+    /// Takes away the fields of every feature that is not in `features`,
+    /// those of the inode flags among them, see
+    /// [`FileObject::retain_features`].
+    fn retain_features(&mut self, features: Features) {
+        for (field, feature) in InodeAttributes::FEATURE_FIELDS {
+            if !features.contains(feature) {
+                self.take_feature_field(field);
+            }
+        }
+        self.flags.retain(InodeFlags::recorded_by(features));
     }
 
     /// `readOnly` as the record of the object has it: None where a reader
@@ -2021,6 +2099,48 @@ impl FileObject {
         }
     }
 
+    /// Takes away `field`, one of [`FileObject::FEATURE_FIELDS`], as its
+    /// setter does with None, also where a reader filled it in. Taking
+    /// away the size, the hash or the contents objects drops the size and
+    /// the hash a reader filled in, which follow from them. So each of the
+    /// three is taken only where the object has it, and what a reader
+    /// filled in stays where there is nothing to take.
+    fn take_feature_field(&mut self, field: Field) {
+        match field {
+            // The contents objects belong to a feature on a symbolic link
+            // only.
+            Field::Contents => {
+                if self.has_feature_field(field) {
+                    self.take_contents();
+                }
+            }
+            Field::InodeToken => self.set_inode_token(None),
+            Field::Major => self.set_major(None),
+            Field::Minor => self.set_minor(None),
+            Field::Sha256 => {
+                if self.sha256.is_some() {
+                    self.set_sha256(None);
+                }
+            }
+            Field::Size => {
+                if self.size.is_some() {
+                    self.set_size(None);
+                }
+            }
+            // The other fields are those of a partition, which goes with
+            // the last of its fields: a reader has none for a file without
+            // any of them.
+            _ => {
+                if let Some(gpt) = self.gpt.as_deref_mut().filter(|gpt| gpt.describes_partition()) {
+                    gpt.take_feature_field(field);
+                    if !gpt.describes_partition() {
+                        self.gpt = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// The fields the object has that belong to a feature, each with its
     /// feature: the fields a manifest that does not record the feature
     /// cannot have. Its own come first, then those of its inode
@@ -2039,6 +2159,22 @@ impl FileObject {
     pub fn stated_features(&self) -> Features {
         self.feature_fields()
             .fold(Features::NONE, |features, (_, feature)| features | feature)
+    }
+
+    /// Takes away the fields of every feature that is not in `features`,
+    /// those of the inode attributes among them. So a caller sets all it
+    /// knows of a file and keeps what its manifest records. The name, the
+    /// type and the fields that belong to no feature stay. An object whose
+    /// data starts at an offset in a file reaches to the end of it once its
+    /// size goes, and a hash that stays no longer fits.
+    pub fn retain_features(&mut self, features: Features) {
+        for (field, feature) in FileObject::FEATURE_FIELDS {
+            if !features.contains(feature) {
+                self.take_feature_field(field);
+            }
+        }
+        self.dos_flags.retain(DosFlags::recorded_by(features));
+        self.inode.retain_features(features);
     }
 
     /// Fills in what `features`, which its manifest records, say about the
@@ -2269,6 +2405,33 @@ impl RootObject {
     pub fn stated_features(&self) -> Features {
         self.feature_fields()
             .fold(Features::NONE, |features, (_, feature)| features | feature)
+    }
+
+    /// Takes away `field`, one of [`RootObject::FEATURE_FIELDS`], as its
+    /// setter does with None.
+    #[cfg(feature = "capi")]
+    fn take_feature_field(&mut self, field: Field) {
+        match field {
+            Field::FatSerial => self.file_system.fat_serial = None,
+            Field::FsLabel => self.file_system.label = None,
+            Field::FsUuid => self.file_system.uuid = None,
+            Field::GptDiskUuid => self.gpt_disk_uuid = None,
+            _ => {}
+        }
+    }
+
+    /// Takes away the fields of every feature that is not in `features`,
+    /// those of the inode attributes among them, as
+    /// [`FileObject::retain_features`] does for a file object. The C API
+    /// has one function for the two.
+    #[cfg(feature = "capi")]
+    pub(crate) fn retain_features(&mut self, features: Features) {
+        for (field, feature) in RootObject::FEATURE_FIELDS {
+            if !features.contains(feature) {
+                self.take_feature_field(field);
+            }
+        }
+        self.inode.retain_features(features);
     }
 
     /// What the manifest records: the features the root file object lists
@@ -2835,6 +2998,330 @@ mod tests {
         let mut root = RootObject::default();
         (root.order, root.features) = (Some(Order::CodePoint), Some(Features::ALL));
         assert_eq!(root.stated_features(), Features::NONE);
+    }
+
+    /// retain_features() leaves an object that has every field with the
+    /// fields of the features it is given: the object of a caller that set
+    /// those fields alone. Every feature is dropped on its own and kept on
+    /// its own.
+    #[test]
+    fn retains_the_fields_of_the_features() {
+        const UUID: Uuid = Uuid::new([1; Uuid::SIZE]);
+        /// Gives the partition of `object` a field.
+        fn partition(object: &mut FileObject, give: Give<GptPartition>) {
+            let mut gpt = object.take_gpt().unwrap_or_default();
+            give(&mut gpt);
+            object.set_gpt(Some(gpt));
+        }
+        // Every field of a file object that belongs to a feature, set the
+        // way a caller sets it.
+        let fields: [(Features, Give<FileObject>); 27] = [
+            (Features::SIZE, |o| o.set_size(Some(5))),
+            (Features::SHA256, |o| o.set_sha256(Some(Sha256::digest(b"hello")))),
+            (Features::HARDLINK, |o| o.set_inode_token(NonZeroU64::new(1))),
+            (Features::DEVICE, |o| o.set_major(Some(8))),
+            (Features::DEVICE, |o| o.set_minor(Some(1))),
+            (Features::GPT_LABEL, |o| {
+                partition(o, |gpt| gpt.set_label(Some("esp".into())))
+            }),
+            (Features::GPT_UUID, |o| partition(o, |gpt| gpt.set_uuid(Some(UUID)))),
+            (Features::GPT_TYPE_UUID, |o| {
+                partition(o, |gpt| gpt.set_type_uuid(Some(UUID)))
+            }),
+            (Features::GPT_FLAGS, |o| partition(o, |gpt| gpt.set_flags(Some(0)))),
+            (Features::GPT_FLAG_NO_AUTO, |o| {
+                partition(o, |gpt| gpt.set_no_auto(Some(false)))
+            }),
+            (Features::GPT_FLAG_GROW_FILE_SYSTEM, |o| {
+                partition(o, |gpt| gpt.set_grow_file_system(Some(true)))
+            }),
+            (Features::FLAG_ARCHIVE, |o| o.set_flag_archive(Some(true))),
+            (Features::FLAG_HIDDEN, |o| o.set_flag_hidden(Some(false))),
+            (Features::FLAG_SYSTEM, |o| o.set_flag_system(Some(true))),
+            (Features::MODE, |o| o.inode_mut().set_mode(Mode::new(0o644).ok())),
+            (Features::UID, |o| o.inode_mut().set_uid(Some(1))),
+            (Features::GID, |o| o.inode_mut().set_gid(Some(2))),
+            (Features::USER_NAME, |o| o.inode_mut().set_user_name(Some("u".into()))),
+            (Features::GROUP_NAME, |o| o.inode_mut().set_group_name(Some("g".into()))),
+            (Features::MTIME, |o| o.inode_mut().set_mtime_nsec(Some(3))),
+            (Features::USER_XATTR, |o| {
+                o.inode_mut().insert_user_xattr("a", b"b");
+            }),
+            (Features::READ_ONLY, |o| o.inode_mut().set_read_only(Some(false))),
+            (Features::FLAG_APPEND_ONLY, |o| {
+                o.inode_mut().set_flag_append_only(Some(true))
+            }),
+            (Features::FLAG_IMMUTABLE, |o| {
+                o.inode_mut().set_flag_immutable(Some(false))
+            }),
+            (Features::FLAG_NO_ATIME, |o| o.inode_mut().set_flag_no_atime(Some(true))),
+            (Features::FLAG_NO_COW, |o| o.inode_mut().set_flag_no_cow(Some(false))),
+            (Features::FLAG_NO_DUMP, |o| o.inode_mut().set_flag_no_dump(Some(true))),
+        ];
+        // The object of a caller that set the fields of `features` alone.
+        let with = |features: Features| {
+            let mut object = FileObject::new(NameBuf::new("f").unwrap());
+            for (feature, give) in fields {
+                if features.contains(feature) {
+                    give(&mut object);
+                }
+            }
+            object
+        };
+        // With every feature it has every field of the tables but the
+        // target, which only a symbolic link has, and it states every flag.
+        let full = with(Features::ALL);
+        for (field, _) in FileObject::FEATURE_FIELDS {
+            assert_eq!(full.has_feature_field(field), field != Field::Contents, "{}", field);
+        }
+        for (field, _) in InodeAttributes::FEATURE_FIELDS {
+            assert!(full.inode.has_feature_field(field), "{}", field);
+        }
+        assert_eq!(
+            (full.dos_flags.stated, full.inode.flags.stated),
+            (DosFlags::ALL, InodeFlags::ALL)
+        );
+        let single = Features::ALL.names().map(|name| name.parse::<Features>().unwrap());
+        for feature in single {
+            let others = Features::ALL.without(feature);
+            let mut dropped = full.clone();
+            dropped.retain_features(others);
+            assert_eq!(dropped, with(others), "{:?}", feature);
+            let mut kept = full.clone();
+            kept.retain_features(feature);
+            assert_eq!(kept, with(feature), "{:?}", feature);
+        }
+        // Several features, all of them and none of them.
+        let mut default = full.clone();
+        default.retain_features(Features::DEFAULT);
+        assert_eq!(default, with(Features::DEFAULT));
+        assert_eq!(default.stated_features(), Features::DEFAULT.without(Features::SYMLINK));
+        let mut all = full.clone();
+        all.retain_features(Features::ALL);
+        assert_eq!(all, full);
+        let mut none = full.clone();
+        none.retain_features(Features::NONE);
+        assert_eq!(none, FileObject::new(NameBuf::new("f").unwrap()));
+    }
+
+    /// The name, the type, the validity window and the contents objects of
+    /// a file that is no symbolic link belong to no feature, and
+    /// retain_features() leaves them. The contents objects of a symbolic
+    /// link are its target, which goes without the feature `symlink`.
+    #[test]
+    fn retains_what_belongs_to_no_feature() {
+        use crate::testing::everything;
+
+        let full = everything();
+        let mut object = full.clone();
+        object.retain_features(Features::NONE);
+        let mut bare = FileObject::new(full.name().to_owned());
+        bare.validity = full.validity;
+        bare.contents = full.contents.clone();
+        assert_eq!(object, bare);
+        assert_eq!(
+            (object.contents().len(), object.validity().state()),
+            (4, Validity::Revoked)
+        );
+        let mut link = FileObject::new(NameBuf::new("l").unwrap());
+        link.set_inode_type(InodeType::Symlink);
+        link.contents = vec![ContentsObject::new(ContentsSource::Literal(b"target".to_vec()))];
+        let mut kept = link.clone();
+        kept.retain_features(Features::SYMLINK);
+        assert_eq!(kept, link);
+        let mut dropped = link.clone();
+        dropped.retain_features(Features::ALL.without(Features::SYMLINK));
+        let mut bare = FileObject::new(NameBuf::new("l").unwrap());
+        bare.set_inode_type(InodeType::Symlink);
+        assert_eq!(dropped, bare);
+        // The same contents objects are no target on any other file.
+        for inode_type in [InodeType::Regular, InodeType::Directory] {
+            let mut other = link.clone();
+            other.set_inode_type(inode_type);
+            let before = other.clone();
+            other.retain_features(Features::NONE);
+            assert_eq!(other, before, "{}", inode_type);
+        }
+        // A partition that was given no field has none to take away.
+        let mut object = FileObject::new(NameBuf::new("f").unwrap());
+        object.set_gpt(Some(GptPartition::default()));
+        object.retain_features(Features::NONE);
+        assert_eq!(object.gpt(), Some(&GptPartition::default()));
+    }
+
+    /// What a reader filled in goes with the feature of its field, as its
+    /// setter takes it away, and stays with it. The size and the hash a
+    /// reader filled in also go with the size, the hash or the target they
+    /// follow from, as they do where one of those is set.
+    #[test]
+    fn retains_what_a_reader_filled_in_for_a_feature() {
+        use crate::testing::{manifest, read_whole, record, sequence, EMPTY, HELLO, TRAILER};
+
+        let read = |record: &str| read_whole(&manifest(&[record])).unwrap().objects.pop().unwrap();
+        let none = FilledIn::default();
+        // readOnly, the flags and the extended attributes, which a reader
+        // fills in for the features of its manifest.
+        let root = concat!(
+            r#"{"features":["flag-hidden","flag-no-dump","read-only","user-xattr"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest"}"#
+        );
+        let recorded = Features::FLAG_HIDDEN | Features::FLAG_NO_DUMP | Features::READ_ONLY | Features::USER_XATTR;
+        let whole = read_whole(&sequence(&[root, r#"{"name":"a"}"#, TRAILER])).unwrap();
+        let filled = whole.objects.into_iter().next().unwrap();
+        assert_eq!(filled.filled_in().iter().count(), 4);
+        let mut same = filled.clone();
+        same.retain_features(recorded);
+        assert_eq!(same, filled);
+        let fields: [(Features, Give<FileObject>); 4] = [
+            (Features::FLAG_HIDDEN, |o| o.set_flag_hidden(None)),
+            (Features::FLAG_NO_DUMP, |o| o.inode_mut().set_flag_no_dump(None)),
+            (Features::READ_ONLY, |o| o.inode_mut().set_read_only(None)),
+            (Features::USER_XATTR, |o| o.inode_mut().set_user_xattrs(None)),
+        ];
+        for (feature, unset) in fields {
+            let mut object = filled.clone();
+            object.retain_features(recorded.without(feature));
+            let mut unset_alone = filled.clone();
+            unset(&mut unset_alone);
+            assert_eq!(object, unset_alone, "{:?}", feature);
+            assert_eq!(object.filled_in().iter().count(), 3, "{:?}", feature);
+        }
+        let mut object = filled.clone();
+        object.retain_features(Features::NONE);
+        assert_eq!(object, FileObject::new(NameBuf::new("a").unwrap()));
+        // The hash of no data, which a reader fills in for the size 0, and
+        // the size 0 for that hash: each goes with its own feature.
+        let empty = format!(r#"{{"name":"a","sha256":"{}"}}"#, EMPTY);
+        let filled = read(r#"{"name":"a","size":0}"#);
+        assert!(filled.filled_in().contains(Field::Sha256));
+        let mut object = filled.clone();
+        object.retain_features(Features::SIZE | Features::SHA256);
+        assert_eq!(object, filled);
+        object.retain_features(Features::SIZE);
+        assert_eq!(
+            (object.size(), object.sha256(), object.filled_in()),
+            (Some(0), None, none)
+        );
+        let mut object = read(&empty);
+        assert!(object.filled_in().contains(Field::Size));
+        object.retain_features(Features::SHA256);
+        assert_eq!(
+            (object.size(), object.sha256(), object.filled_in()),
+            (None, Some(Sha256::EMPTY), none)
+        );
+        // And each goes with the one it follows from.
+        for (given, features) in [
+            (r#"{"name":"a","size":0}"#, Features::SHA256),
+            (&*empty, Features::SIZE),
+        ] {
+            let mut object = read(given);
+            object.retain_features(features);
+            assert_eq!(
+                (object.size(), object.sha256(), object.filled_in()),
+                (None, None, none),
+                "{}",
+                given
+            );
+        }
+        // The size a contents object gives. There is no hash to take away
+        // with the feature `sha256`, so the size stays with its own feature
+        // and goes with it. The contents object keeps what it says.
+        let filled = read(r#"{"name":"a","contents":[{"file":"blob","originalSize":3}]}"#);
+        assert_eq!(
+            (filled.size(), filled.filled_in().contains(Field::Size)),
+            (Some(3), true)
+        );
+        let mut object = filled.clone();
+        object.retain_features(Features::SIZE);
+        assert_eq!(object, filled);
+        object.retain_features(Features::NONE);
+        assert_eq!((object.size(), object.filled_in()), (None, none));
+        assert_eq!(object.contents(), filled.contents());
+        // The size and the hash a contents object gives. One goes with the
+        // other, as it does where the other is set, and the next reader
+        // fills both in again.
+        let filled = read(&format!(
+            r#"{{"name":"a","contents":[{{"file":"blob","originalSize":5,"originalSha256":"{}"}}]}}"#,
+            HELLO
+        ));
+        assert_eq!((filled.size(), filled.sha256()), (Some(5), HELLO.parse().ok()));
+        for features in [Features::SIZE, Features::SHA256, Features::NONE] {
+            let mut object = filled.clone();
+            object.retain_features(features);
+            assert_eq!(
+                (object.size(), object.sha256(), object.filled_in()),
+                (None, None, none),
+                "{:?}",
+                features
+            );
+            assert_eq!(object.contents(), filled.contents());
+            assert_eq!(read(&record(&object)), filled);
+        }
+        // The size of the target of a symbolic link, which goes with the
+        // target and with its own feature.
+        let filled = read(r#"{"name":"l","type":"lnk","contents":[{"literal":"dGFyZ2V0"}]}"#);
+        assert_eq!(
+            (filled.size(), filled.filled_in().contains(Field::Size)),
+            (Some(6), true)
+        );
+        let mut object = filled.clone();
+        object.retain_features(Features::SIZE | Features::SYMLINK);
+        assert_eq!(object, filled);
+        object.retain_features(Features::SIZE);
+        assert_eq!(
+            (object.contents().len(), object.size(), object.filled_in()),
+            (0, None, none)
+        );
+        let mut object = filled.clone();
+        object.retain_features(Features::SYMLINK);
+        assert_eq!(
+            (object.contents(), object.size(), object.filled_in()),
+            (filled.contents(), None, none)
+        );
+    }
+
+    /// A writer refuses an object with a field of a feature its manifest
+    /// does not record, and takes the object once it retains the features
+    /// the manifest records.
+    #[test]
+    fn a_writer_takes_what_is_retained() {
+        use crate::testing::{directory, everything};
+        use crate::Writer;
+
+        let mut device = FileObject::new(NameBuf::new("device").unwrap());
+        device.set_inode_type(InodeType::CharDevice);
+        device.set_major(Some(1));
+        device.set_minor(Some(3));
+        let mut link = FileObject::new(NameBuf::new("link").unwrap());
+        link.set_inode_type(InodeType::Symlink);
+        link.set_contents(vec![ContentsObject::new(ContentsSource::Literal(b"target".to_vec()))]);
+        let objects = [directory("a"), everything(), device, link];
+        let single = Features::ALL.names().map(|name| name.parse::<Features>().unwrap());
+        let sets = single
+            .flat_map(|feature| [feature, Features::ALL.without(feature)])
+            .chain([Features::NONE, Features::DEFAULT, Features::ALL]);
+        for features in sets {
+            let mut root = RootObject::default();
+            root.set_features(Some(features));
+            let mut writer = Writer::begin(Vec::new(), &root).unwrap();
+            for object in &objects {
+                if !features.contains(object.stated_features()) {
+                    let e = writer.file(object).unwrap_err();
+                    assert_eq!(
+                        e.kind(),
+                        ErrorKind::Manifest(Problem::UnlistedFeature),
+                        "{:?}",
+                        features
+                    );
+                }
+                let mut retained = object.clone();
+                retained.retain_features(features);
+                writer
+                    .file(&retained)
+                    .unwrap_or_else(|e| panic!("{:?}: {}", features, e));
+            }
+            writer.finish().unwrap();
+        }
     }
 
     #[test]

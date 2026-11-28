@@ -2,16 +2,20 @@
 //! The names of file objects: [`Name`] borrows one, and [`NameBuf`] owns
 //! one.
 //!
-//! The crate denies unsafe code, with one exception that is here: the cast
-//! that makes a `&Name` of a `&str`, in `Name::from_str_unchecked()`.
+//! The crate denies unsafe code. One of the exceptions is here: the cast
+//! that makes a `&Name` of a `&str`, in `Name::from_str_unchecked()`. The
+//! others are the modules ioctl and nss, and the module capi where the
+//! feature of that name is on.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::iter;
 use std::ops::Deref;
-use std::str::FromStr;
+use std::os::unix::ffi::OsStrExt;
+use std::str::{self, FromStr};
 
 use crate::strict::StringRules;
 use crate::{InodeType, FILENAME, STRING_RULES};
@@ -29,6 +33,8 @@ const PARENT: &str = "..";
 /// What follows [`FILENAME`] in the name of a file that belongs to the
 /// manifest, such as its signature or a compressed copy.
 const SUFFIX_SEPARATOR: char = '.';
+/// The same as the one byte it is in UTF-8.
+const SUFFIX_SEPARATOR_BYTE: u8 = SUFFIX_SEPARATOR as u8;
 /// The control characters a name may not have are the bytes below the
 /// space, ASCII 0 to 31, and delete, ASCII 127.
 const SPACE: u8 = b' ';
@@ -98,10 +104,15 @@ pub struct Name(str);
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct NameBuf(String);
 
-/// Why a string is not the name of a file object, see [`Name`].
+/// Why a string or the name of a file is not the name of a file object, see
+/// [`Name`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum NameProblem {
+    /// The name of a file on the host is not UTF-8, which every name of a
+    /// manifest is, see [`Name::join_os`]. A name made from a string never
+    /// has this problem.
+    NotUtf8,
     /// The string is empty. No file object has that name: [`Name::ROOT`]
     /// only stands in for the root file object, which has no name.
     Empty,
@@ -129,6 +140,7 @@ pub enum NameProblem {
 impl fmt::Display for NameProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            NameProblem::NotUtf8 => f.write_str("name is not UTF-8"),
             NameProblem::Empty => f.write_str("name is empty"),
             NameProblem::TooLong => write!(f, "name is longer than {} bytes", Name::MAX_LEN),
             NameProblem::Reserved => f.write_str("name is reserved for the manifest"),
@@ -256,6 +268,16 @@ impl Name {
         Ok(NameBuf(name))
     }
 
+    /// The name of the entry `component` of the directory this name is
+    /// the name of, where `component` is the name of a file on the host,
+    /// which is bytes. One that is not UTF-8 fails with
+    /// [`NameProblem::NotUtf8`], and anything else is checked as
+    /// [`Name::join`] checks it.
+    pub fn join_os(&self, component: &OsStr) -> Result<NameBuf, NameProblem> {
+        let component = str::from_utf8(component.as_bytes()).map_err(|_| NameProblem::NotUtf8)?;
+        self.join(component)
+    }
+
     /// Checks that `text` can be in a name: it has no control characters,
     /// and nothing that the strings of a manifest may not hold.
     fn check_text(text: &str) -> Result<(), NameProblem> {
@@ -321,6 +343,15 @@ impl Name {
     pub fn is_reserved(name: &str) -> bool {
         name.strip_prefix(FILENAME)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(SUFFIX_SEPARATOR) || rest.starts_with(SEPARATOR))
+    }
+
+    /// Whether `component`, the name of a file at the top of a tree as its
+    /// directory has it, is one [`Name::is_reserved`] reserves. It need not
+    /// be UTF-8.
+    pub(crate) fn is_reserved_component(component: &[u8]) -> bool {
+        component
+            .strip_prefix(FILENAME.as_bytes())
+            .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&SUFFIX_SEPARATOR_BYTE))
     }
 
     /// Whether this is the name of the root file object.
@@ -731,6 +762,7 @@ mod tests {
     #[test]
     fn messages() {
         for (reason, text) in [
+            (NameProblem::NotUtf8, "name is not UTF-8"),
             (NameProblem::Empty, "name is empty"),
             (NameProblem::TooLong, "name is longer than 4095 bytes"),
             (NameProblem::Reserved, "name is reserved for the manifest"),
@@ -1077,6 +1109,38 @@ mod tests {
         }
     }
 
+    /// A component at the top of a tree is reserved as a name of it is, also
+    /// where it is not UTF-8.
+    #[test]
+    fn reserved_components() {
+        for component in [
+            &b"Uapi16Manifest"[..],
+            b"Uapi16Manifest.",
+            b"Uapi16Manifest.sig",
+            b"Uapi16Manifest.\xff",
+        ] {
+            assert!(Name::is_reserved_component(component), "{:?}", component);
+        }
+        for component in [
+            &b""[..],
+            b"Uapi16Manifest2",
+            b"Uapi16Manifes",
+            b"Uapi16Manifest\xff",
+            b"x.Uapi16Manifest",
+            b"\xffUapi16Manifest",
+        ] {
+            assert!(!Name::is_reserved_component(component), "{:?}", component);
+        }
+        for name in ["Uapi16Manifest", "Uapi16Manifest.sig", "Uapi16Manifest2", "x"] {
+            assert_eq!(
+                Name::is_reserved_component(name.as_bytes()),
+                Name::is_reserved(name),
+                "{}",
+                name
+            );
+        }
+    }
+
     /// Joining gives the name the whole path gives, and refuses what the
     /// whole path is refused for, for the same reason. A component with a
     /// separator is more than one and refused.
@@ -1384,5 +1448,35 @@ mod tests {
         send_and_sync::<&'static Name>();
         send_and_sync::<NameBuf>();
         send_and_sync::<NameError>();
+    }
+
+    /// The name of a file on the host joins as the string of its bytes
+    /// does. One that is not UTF-8 is refused for that before anything
+    /// else, also when it is too long or has a slash.
+    #[test]
+    fn joining_names_of_files() {
+        let parents = [Name::ROOT, Name::new("a").unwrap(), Name::new("a/b c").unwrap()];
+        let too_long: Vec<u8> = iter::repeat_n(b'x', Name::MAX_LEN).chain([0xff]).collect();
+        for parent in &parents {
+            for component in [
+                "c",
+                "...",
+                "\u{e9}",
+                "",
+                ".",
+                "..",
+                "a/b",
+                "a\tb",
+                "a\u{fffe}",
+                "Uapi16Manifest",
+            ] {
+                let joined = parent.join_os(OsStr::new(component));
+                assert_eq!(joined, parent.join(component), "{:?} {:?}", parent, component);
+            }
+            for bytes in [&b"\x80"[..], b"\xff", b"a\xe2\x82", b"a/\xff", &too_long] {
+                let joined = parent.join_os(OsStr::from_bytes(bytes));
+                assert_eq!(joined, Err(NameProblem::NotUtf8), "{:?} {:?}", parent, bytes);
+            }
+        }
     }
 }

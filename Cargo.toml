@@ -12,8 +12,9 @@ rust-version = "1.85"
 license = "LGPL-2.1-or-later"
 
 [workspace.dependencies]
+# Looks up the names of users and groups, which rustix has no call for.
 # Stay on 0.2 like pathrs, errno, getrandom and sha2's cpufeatures, so
-# that the tests never build two versions of libc.
+# that no build has two versions of libc.
 libc = "0.2.191"
 # Resolves the names of the files next to a manifest below their
 # directory, for PinnedDirectory. It builds on Linux only.
